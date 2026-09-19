@@ -17,7 +17,9 @@
   let data = { version: 1, orders: [] };
   let meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
   let editingId = null;
+  let prefillPlatform = "";   // 「再来一单」预填时暂存原单平台（表单里没有平台输入框）
   let payTargetId = null;
+  let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
   let currentFilter = "在途";
 
   // 报表
@@ -70,6 +72,33 @@
 
   function uid() {
     return crypto.randomUUID ? crypto.randomUUID() : "o" + Date.now() + Math.random().toString(16).slice(2);
+  }
+
+  // 金额换算成“分”（整数）：分摊一律在分的层面算，严禁浮点直加
+  function toCents(v) { return Math.round(numberValue(v) * 100); }
+
+  // 把 totalCents（整数分）按 weights 拆成整数份：
+  // 先 floor(total×w_i/Σw)，余数（必小于单数）逐分补给权重最大的单；Σw=0（全是 0 元购）按单数均分
+  function splitByWeight(totalCents, weights) {
+    const n = weights.length;
+    const shares = new Array(n).fill(0);
+    if (n === 0 || totalCents <= 0) return shares;
+    const sum = weights.reduce((a, b) => a + b, 0);
+    if (sum <= 0) {
+      const base = Math.floor(totalCents / n);
+      const rem = totalCents - base * n;
+      for (let i = 0; i < n; i++) shares[i] = base + (i < rem ? 1 : 0);
+      return shares;
+    }
+    let used = 0;
+    for (let i = 0; i < n; i++) {
+      shares[i] = Math.floor((totalCents * weights[i]) / sum);
+      used += shares[i];
+    }
+    const rem = totalCents - used;
+    const byWeight = weights.map((w, i) => i).sort((a, b) => weights[b] - weights[a] || a - b);
+    for (let r = 0; r < rem; r++) shares[byWeight[r]] += 1;
+    return shares;
   }
 
   // ---- 持久化 ----
@@ -517,17 +546,20 @@
   }
 
   // ---- 记单 / 编辑 ----
-  function openForm(order) {
+  // order：编辑既有单（editingId = 其 id）；prefill：「再来一单」预填（editingId 保持 null，保存即新建）
+  function openForm(order, prefill) {
+    const src = order || prefill || null;
     editingId = order ? order.id : null;
+    prefillPlatform = !order && prefill ? String(prefill.platform || "") : "";
     const f = $("#orderForm");
-    f.goods.value = order ? order.name : "";
-    f.cost.value = order ? (order.cost || "") : "";
-    f.qty.value = order ? order.qty : 1;
-    f.date.value = order ? order.date : todayStr();
-    f.channel.value = order ? (order.channel || "收货商") : "收货商";
-    f.fee.value = order ? (order.fee || "") : "";
-    f.status.value = order ? order.status : "在途";
-    f.note.value = order ? order.note : "";
+    f.goods.value = src ? src.name : "";
+    f.cost.value = src ? (src.cost || "") : "";
+    f.qty.value = src ? src.qty : 1;
+    f.date.value = order ? order.date : todayStr();     // 预填/新建一律用今天
+    f.channel.value = src ? (src.channel || "收货商") : "收货商";
+    f.fee.value = src ? (src.fee || "") : "";
+    f.status.value = order ? order.status : "在途";      // 预填固定在途
+    f.note.value = src ? src.note : "";
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
     $("#formMore").open = !!(order && order.status !== "在途");
     $("#formModal").classList.add("show");
@@ -552,7 +584,7 @@
       id: existing ? existing.id : uid(),
       date: f.date.value || todayStr(),
       name,
-      platform: existing ? existing.platform : "",
+      platform: existing ? existing.platform : prefillPlatform,
       qty: Math.max(1, Math.round(numberValue(f.qty.value)) || 1),
       cost,
       pay: existing ? existing.pay : "",
@@ -576,17 +608,7 @@
   function duplicateOrder(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
-    data.orders.push({
-      ...o,
-      id: uid(),
-      date: todayStr(),
-      income: null,
-      incomeDate: null,
-      status: "在途",
-      createdAt: new Date().toISOString(),
-    });
-    saveData();
-    toast("已复制一单，改个金额就能存");
+    openForm(null, o);   // 预填原单信息，保存即新建一单
   }
 
   function openPayForm(id) {
@@ -637,6 +659,76 @@
     data.orders = data.orders.filter((x) => x.id !== id);
     saveData();
     toast("已删除");
+  }
+
+  // ---- 批量结算（整批寄出 / 对方一笔总回款，按垫付占比分摊）----
+  function openBatchModal() {
+    const pending = data.orders.filter((o) => o.status === "在途");
+    if (pending.length === 0) { toast("没有在途单可结算"); return; }
+    pending.sort((a, b) => (a.date < b.date ? 1 : -1));   // 与账本列表同序（新单在上）
+    batchItems = pending.map((o) => ({ id: o.id, name: o.name, cost: o.cost, checked: true }));
+    $("#batchFee").value = "";
+    $("#batchIncome").value = "";
+    $("#batchDate").value = todayStr();
+    renderBatchList();
+    $("#batchModal").classList.add("show");
+  }
+
+  function closeBatchModal() {
+    $("#batchModal").classList.remove("show");
+    batchItems = [];
+  }
+
+  function renderBatchList() {
+    $("#batchList").innerHTML = batchItems.length === 0
+      ? `<div class="empty-mini">没有在途单可结算</div>`
+      : batchItems.map((it, i) => `
+        <label class="batch-item">
+          <input type="checkbox" data-idx="${i}" ${it.checked ? "checked" : ""}>
+          <span class="bi-name">${escapeHtml(it.name || "未命名")}</span>
+          <span class="bi-cost">${money(it.cost)}</span>
+        </label>`).join("");
+    updateBatchSummary();
+  }
+
+  // 只更新合计行，不触发 saveData
+  function updateBatchSummary() {
+    const sel = batchItems.filter((it) => it.checked);
+    const totalCents = sel.reduce((a, b) => a + toCents(b.cost), 0);
+    $("#batchSummary").textContent = sel.length === 0
+      ? "还没勾选任何单子"
+      : `已选 ${sel.length} 单 · 垫付合计 ${money(totalCents / 100)}`;
+  }
+
+  function submitBatch() {
+    const selected = batchItems.filter((it) => it.checked);
+    if (selected.length === 0) { toast("先勾选要结算的在途单"); return; }
+    const feeCents = Math.max(0, toCents($("#batchFee").value));
+    const incomeCents = Math.max(0, toCents($("#batchIncome").value));
+    const orders = selected
+      .map((it) => data.orders.find((o) => o.id === it.id))
+      .filter(Boolean);
+    if (orders.length === 0) { closeBatchModal(); return; }
+    const weights = orders.map((o) => Math.max(0, toCents(o.cost)));
+
+    // 邮费：累加到各单已有邮费上（单子可能自己寄出时已记过邮费）
+    const feeShares = splitByWeight(feeCents, weights);
+    orders.forEach((o, i) => { o.fee = (toCents(o.fee) + feeShares[i]) / 100; });
+
+    // 回款：直接赋值；总回款为 0/空 → 只分摊邮费，状态保持「在途」
+    if (incomeCents > 0) {
+      const incomeDate = $("#batchDate").value || todayStr();
+      const incomeShares = splitByWeight(incomeCents, weights);
+      orders.forEach((o, i) => {
+        o.income = incomeShares[i] / 100;
+        o.incomeDate = incomeDate;
+        o.status = "已回款";
+      });
+    }
+
+    closeBatchModal();
+    saveData();
+    toast(`已结算 ${orders.length} 单 · 回款 ${money(incomeCents / 100)} · 邮费 ${money(feeCents / 100)}`);
   }
 
   // ---- 云同步（改动防抖推送，启动拉取）----
@@ -827,6 +919,18 @@
       if (btn.dataset.add === "reset") input.value = o ? o.cost : "";
       else input.value = numberValue(input.value) + Number(btn.dataset.add);
       updatePayPreview();
+    });
+
+    // 批量结算
+    $("#batchBtn").addEventListener("click", openBatchModal);
+    $("#batchCancel").addEventListener("click", closeBatchModal);
+    $("#batchSubmit").addEventListener("click", submitBatch);
+    $("#batchList").addEventListener("change", (ev) => {
+      const cb = ev.target.closest("input[type=checkbox]");
+      if (!cb) return;
+      const it = batchItems[Number(cb.dataset.idx)];
+      if (it) it.checked = cb.checked;
+      updateBatchSummary();
     });
 
     $$(".modal").forEach((m) => m.addEventListener("click", (ev) => {
