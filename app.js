@@ -365,16 +365,16 @@
     let grid = "";
     [0, .5, 1].forEach((f) => {
       const gy = padT + innerH - f * innerH;
-      grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="var(--line)" stroke-dasharray="3 4"/>`;
+      grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" style="stroke:var(--line)" stroke-dasharray="3 4"/>`;
     });
-    grid += `<text x="${padL + 2}" y="${padT + 4}" font-size="9" fill="var(--muted)">至多 ${money(maxV)}</text>`;
+    grid += `<text x="${padL + 2}" y="${padT + 4}" font-size="9" style="fill:var(--muted)">至多 ${money(maxV)}</text>`;
     const path = (key) => stats.map((s, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(s[key]).toFixed(1)}`).join(" ");
     const area = (key, gid) => n === 1 ? "" :
       `<path d="${path(key)} L${x(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)} L${x(0).toFixed(1)},${(padT + innerH).toFixed(1)} Z" fill="url(#${gid})"/>`;
     const dots = (key, color) => n <= 14 ? stats.map((s, i) =>
       `<circle cx="${x(i).toFixed(1)}" cy="${y(s[key]).toFixed(1)}" r="2.6" fill="#fff" stroke="${color}" stroke-width="1.6"/>`).join("") : "";
     const ticks = sparseTicks(n).map((i) =>
-      `<text x="${x(i).toFixed(1)}" y="${H - 6}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
+      `<text x="${x(i).toFixed(1)}" y="${H - 6}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
     const idA = "gf" + (++gradSeq), idB = "gf" + (++gradSeq);
     return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
       <defs>
@@ -413,13 +413,13 @@
         fill="${s.profit >= 0 ? "#17b26a" : "#d05f45"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
       if (n <= 13 && s.profit !== 0) {
         const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
-        bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" fill="var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
+        bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
       }
     });
     const ticks = sparseTicks(n).map((i) =>
-      `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${H - 6}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
+      `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${H - 6}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
     return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
-      <line x1="${padL}" y1="${zero.toFixed(1)}" x2="${W - padR}" y2="${zero.toFixed(1)}" stroke="#c8d2cc" stroke-width="1"/>
+      <line x1="${padL}" y1="${zero.toFixed(1)}" x2="${W - padR}" y2="${zero.toFixed(1)}" style="stroke:var(--line)" stroke-width="1"/>
       ${bars}${ticks}
     </svg>`;
   }
@@ -439,8 +439,8 @@
     return `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}">
       <circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${sw}"/>
       ${slices}
-      <text x="${S / 2}" y="${S / 2 - 2}" font-size="15" font-weight="700" fill="var(--ink)" text-anchor="middle">${money(total)}</text>
-      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
+      <text x="${S / 2}" y="${S / 2 - 2}" font-size="15" font-weight="700" style="fill:var(--ink)" text-anchor="middle">${money(total)}</text>
+      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
     </svg>`;
   }
 
