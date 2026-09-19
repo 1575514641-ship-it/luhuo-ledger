@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#10241b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="撸货记账">
+  <title>撸货记账</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icon.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <h1>撸货记账</h1>
+      <span id="syncStatus" class="sync-badge offline">本地</span>
+    </div>
+    <button id="settingsBtn" class="icon-btn" aria-label="设置">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+  </header>
+
+  <main>
+    <!-- 看板 -->
+    <section id="view-dash" class="view">
+      <div class="hero card">
+        <span class="hero-label">垫付在外未回笼</span>
+        <span id="kpiOutstanding" class="hero-value">¥0</span>
+        <span id="kpiOutstandingHint" class="hero-hint">还没结算回来的钱</span>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi card">
+          <span class="kpi-label">已结算净盈亏</span>
+          <span id="kpiProfit" class="kpi-value">¥0</span>
+          <span class="kpi-hint">已回款＋自留</span>
+        </div>
+        <div class="kpi card">
+          <span class="kpi-label">本月垫出</span>
+          <span id="kpiMonthCost" class="kpi-value">¥0</span>
+        </div>
+        <div class="kpi card">
+          <span class="kpi-label">本月回款</span>
+          <span id="kpiMonthIncome" class="kpi-value">¥0</span>
+        </div>
+        <div class="kpi card">
+          <span class="kpi-label">累计垫付 / 回款</span>
+          <span id="kpiTotal" class="kpi-value small">¥0 / ¥0</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>订单状态 <small>单数 / 垫付</small></h2>
+        <div id="statusList"></div>
+      </div>
+
+      <div class="card">
+        <h2>近 6 个月 <small>垫出 / 回款 / 差</small></h2>
+        <div id="monthList"></div>
+        <p class="foot-note">「差」为现金流视角：正数＝这个月收回来的比垫出去的多。</p>
+      </div>
+    </section>
+
+    <!-- 账本 -->
+    <section id="view-list" class="view">
+      <div id="filterChips" class="chips"></div>
+      <div id="orderList"></div>
+    </section>
+
+    <!-- 报表 -->
+    <section id="view-report" class="view">
+      <div class="card rep-head">
+        <div id="repModes" class="chips static">
+          <button class="chip on" data-mode="month">月</button>
+          <button class="chip" data-mode="quarter">季</button>
+          <button class="chip" data-mode="year">年</button>
+        </div>
+        <div class="rep-nav">
+          <button id="repPrev" class="nav-btn" aria-label="上一期">‹</button>
+          <span id="repLabel" class="rep-label">-</span>
+          <button id="repNext" class="nav-btn" aria-label="下一期">›</button>
+        </div>
+      </div>
+      <div id="reportSummary" class="card summary"></div>
+      <div id="reportKpis" class="kpi-grid"></div>
+      <div class="card" id="reportBarsCard">
+        <h2>分月走势 <small>净盈亏</small></h2>
+        <div id="reportBars"></div>
+      </div>
+      <div class="card">
+        <h2>商品榜 <small>已结算利润 Top 5</small></h2>
+        <div id="reportProducts"></div>
+      </div>
+      <p class="foot-note center">口径：垫付按下单日期、回款和利润按回款日期归期。</p>
+    </section>
+  </main>
+
+  <button id="fab" aria-label="记一单"><span class="fab-plus">＋</span>记一单</button>
+
+  <nav class="tabbar">
+    <button data-view="dash">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+      看板
+    </button>
+    <button data-view="list">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+      账本
+    </button>
+    <button data-view="report">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+      报表
+    </button>
+  </nav>
+
+  <!-- 记单 / 编辑 -->
+  <div id="formModal" class="modal">
+    <form id="orderForm" class="sheet">
+      <h2 id="formTitle">记一单</h2>
+      <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
+      <div class="row2">
+        <label class="fld">垫付金额<input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
+        <label class="fld">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
+      </div>
+      <div class="row2">
+        <label class="fld">日期<input name="date" type="date" required></label>
+        <label class="fld">出掉渠道<select name="channel"></select></label>
+      </div>
+      <details class="more" id="formMore">
+        <summary>更多（杂费 / 状态）</summary>
+        <div class="row2">
+          <label class="fld">运费杂费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
+          <label class="fld">状态<select name="status"></select></label>
+        </div>
+      </details>
+      <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
+      <div class="sheet-actions">
+        <button type="button" id="formCancel" class="btn ghost">取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 回款 -->
+  <div id="payModal" class="modal">
+    <form id="payForm" class="sheet">
+      <h2 id="payTitle">回款</h2>
+      <label class="fld">回款金额<input name="income" type="number" inputmode="decimal" min="0" step="0.01" required></label>
+      <div class="quick-chips" id="payQuick">
+        <button type="button" data-add="reset">按垫付价</button>
+        <button type="button" data-add="10">+10</button>
+        <button type="button" data-add="20">+20</button>
+        <button type="button" data-add="50">+50</button>
+        <button type="button" data-add="100">+100</button>
+      </div>
+      <label class="fld">回款日期<input name="incomeDate" type="date" required></label>
+      <p class="profit-preview" id="payPreview"></p>
+      <div class="sheet-actions">
+        <button type="button" id="payCancel" class="btn ghost">取消</button>
+        <button type="submit" class="btn primary" id="paySubmit">确认回款</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 设置 -->
+  <div id="settingsModal" class="modal">
+    <div class="sheet">
+      <h2>设置</h2>
+      <div class="set-block">
+        <h3>云同步</h3>
+        <p class="set-line">接口：<span id="syncEndpoint">-</span></p>
+        <p class="set-line">上次同步：<span id="syncLast">-</span></p>
+        <p class="set-line err" id="syncErrLine"></p>
+        <p class="foot-note">手机和电脑各打开一次本页，把其中一台的同步码粘贴到另一台，两端即共用同一本账。</p>
+      </div>
+      <div class="set-block">
+        <h3>我的同步码</h3>
+        <textarea id="syncCodeText" readonly rows="3"></textarea>
+        <button type="button" id="copySyncCode" class="btn">复制同步码</button>
+      </div>
+      <div class="set-block">
+        <h3>导入另一台的同步码</h3>
+        <input id="applySyncInput" placeholder="粘贴 LUHUO1.… 开头的同步码">
+        <button type="button" id="applySyncBtn" class="btn">导入并配对</button>
+      </div>
+      <div class="set-block">
+        <h3>备份</h3>
+        <div class="row2">
+          <button type="button" id="exportBtn" class="btn">导出 JSON 备份</button>
+          <label class="btn btn-label">导入 JSON<input type="file" id="importFile" accept="application/json" hidden></label>
+        </div>
+      </div>
+      <div class="set-block">
+        <h3>危险操作</h3>
+        <button type="button" id="resetIdentityBtn" class="btn danger">重置为本机新账本</button>
+      </div>
+      <div class="sheet-actions">
+        <button type="button" id="closeSettings" class="btn primary">完成</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="./sync.js?v=4"></script>
+  <script src="./app.js?v=4"></script>
+</body>
+</html>
