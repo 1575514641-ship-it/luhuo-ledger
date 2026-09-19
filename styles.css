@@ -16,6 +16,11 @@
   --neg: #a4442f;
   --neg-soft: #f7e9e4;
   --glass: rgba(250, 253, 252, .92);
+  --hero-bg: linear-gradient(140deg, #dcf3ed, #c2e9e0);
+  --hero-ink: #11433c;
+  --hero-value: #0b7c72;
+  --hero-label: rgba(17, 67, 60, .62);
+  --hero-line: rgba(13, 148, 136, .32);
   --radius: 18px;
   --shadow: 0 1px 2px rgba(15, 40, 36, .04), 0 14px 34px -22px rgba(15, 40, 36, .3);
   --teal-line: rgba(20, 148, 136, .4);
@@ -36,6 +41,11 @@
     --neg: #e07a5f;
     --neg-soft: rgba(224, 122, 95, .13);
     --glass: rgba(12, 25, 24, .92);
+  --hero-bg: linear-gradient(140deg, #1a3b35, #0f2622);
+  --hero-ink: #d3ebe5;
+  --hero-value: #5eead4;
+  --hero-label: rgba(211, 235, 229, .6);
+  --hero-line: rgba(45, 212, 191, .3);
     --shadow: 0 1px 2px rgba(0, 0, 0, .2), 0 14px 34px -22px rgba(0, 0, 0, .55);
     --teal-line: rgba(45, 212, 191, .35);
   }
@@ -63,31 +73,31 @@ body {
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; justify-content: space-between;
   padding: calc(10px + env(safe-area-inset-top)) 16px 12px;
-  background: linear-gradient(180deg, #0e1f1c, var(--primary));
-  border-bottom: 1px solid var(--teal-line);
-  color: #f0e9da;
-  box-shadow: 0 6px 24px -12px rgba(15, 12, 8, .7);
+  background: var(--glass);
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  box-shadow: 0 4px 18px -10px rgba(15, 60, 54, .35);
 }
 .brand { display: flex; align-items: center; gap: 9px; }
 .brand-dot {
   width: 9px; height: 9px; border-radius: 3px;
   background: linear-gradient(135deg, #5eead4, #0d9488);
-  box-shadow: 0 0 10px rgba(94, 234, 212, .5);
+  box-shadow: 0 0 10px rgba(45, 212, 191, .45);
 }
 .brand h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: 2px; }
 .icon-btn {
-  background: rgba(230, 242, 240, .1); color: #e6f2f0; border: 1px solid rgba(230, 242, 240, .16); border-radius: 10px;
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 10px;
   width: 36px; height: 36px; display: grid; place-items: center; cursor: pointer;
   transition: background .15s;
 }
 .icon-btn:active { background: rgba(230, 242, 240, .22); }
 .sync-badge {
   font-size: 11px; padding: 2px 9px; border-radius: 99px; font-weight: 500;
-  background: rgba(230, 242, 240, .12); color: #cfe2df;
+  background: var(--bg); color: var(--muted);
 }
-.sync-badge.online { background: rgba(45, 212, 191, .16); color: #5eead4; }
-.sync-badge.syncing { background: rgba(125, 143, 161, .25); color: #cfdbe4; }
-.sync-badge.error { background: #7a3524; color: #f5ddd6; }
+.sync-badge.online { background: var(--accent-soft); color: var(--accent); }
+.sync-badge.syncing { background: rgba(125, 143, 161, .2); color: var(--muted); }
+.sync-badge.error { background: var(--neg-soft); color: var(--neg); }
 
 /* ---- 布局 ---- */
 main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
@@ -113,24 +123,24 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 /* ---- 看板：黑金卡 ---- */
 .hero {
   position: relative; overflow: hidden;
-  background: linear-gradient(140deg, #0f2e29 0%, #0a1a17 75%);
-  border: 1px solid var(--teal-line);
+  background: var(--hero-bg);
+  border: 1px solid var(--hero-line);
   border-radius: 20px;
-  color: #e6f2f0; padding: 19px 17px 17px; margin-bottom: 12px;
+  color: var(--hero-ink); padding: 19px 17px 17px; margin-bottom: 12px;
   display: flex; flex-direction: column; gap: 2px;
   box-shadow: 0 16px 36px -18px rgba(5, 20, 17, .65);
 }
 .hero::after {
   content: ""; position: absolute; right: -34px; top: -44px;
   width: 150px; height: 150px; border-radius: 50%;
-  background: radial-gradient(circle, rgba(45, 212, 191, .16), transparent 70%);
+  background: radial-gradient(circle, rgba(20, 184, 166, .14), transparent 70%);
 }
-.hero-label { font-size: 12px; color: rgba(230, 242, 240, .66); letter-spacing: .06em; }
+.hero-label { font-size: 12px; color: var(--hero-label); letter-spacing: .06em; }
 .hero-value {
   font-size: 36px; font-weight: 800; letter-spacing: .5px;
-  color: #5eead4; font-variant-numeric: tabular-nums;
+  color: var(--hero-value); font-variant-numeric: tabular-nums;
 }
-.hero-hint { font-size: 12px; color: rgba(230, 242, 240, .58); }
+.hero-hint { font-size: 12px; color: var(--hero-label); }
 .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
 .kpi { display: flex; flex-direction: column; gap: 2px; margin-bottom: 0; }
 .kpi-label { font-size: 12px; color: var(--muted); }
