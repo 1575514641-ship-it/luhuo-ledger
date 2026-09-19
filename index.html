@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#10241b">
+  <meta name="theme-color" content="#0c2b4a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="撸货记账">
@@ -144,9 +144,11 @@
       </div>
       <details class="more" id="formMore">
         <summary>更多（杂费 / 状态）</summary>
-        <div class="row2">
-          <label class="fld">运费杂费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
-          <label class="fld">状态<select name="status"></select></label>
+        <div class="more-body">
+          <div class="row2">
+            <label class="fld">运费杂费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
+            <label class="fld">状态<select name="status"></select></label>
+          </div>
         </div>
       </details>
       <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
@@ -218,7 +220,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=9"></script>
-  <script src="./app.js?v=9"></script>
+  <script src="./sync.js?v=10"></script>
+  <script src="./app.js?v=10"></script>
 </body>
 </html>

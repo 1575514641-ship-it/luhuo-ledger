@@ -195,7 +195,7 @@
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
     // 订单状态：垫付占比小环形 + 三态行
-    const stColors = { "在途": "#b97909", "已回款": "#17b26a", "自留": "#d05f45" };
+    const stColors = { "在途": "#b97909", "已回款": "#2b9fe0", "自留": "#d05f45" };
     const donutItems = STATUSES.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
     $("#statusDonut").innerHTML = s.totalCost > 0
       ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
@@ -320,7 +320,7 @@
   }
 
   // ---- 报表图表（手写 SVG，无外部依赖）----
-  const PALETTE = ["#0f8a51", "#2f9fc4", "#b97909", "#7a5fb5", "#d05f45", "#8c9a92"];
+  const PALETTE = ["#0f6cbd", "#2b9fe0", "#7fbce8", "#5b7f95", "#b97909", "#8c9a92"];
   let gradSeq = 0;
 
   // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
@@ -382,14 +382,14 @@
           <stop offset="0" stop-color="#b97909" stop-opacity=".28"/><stop offset="1" stop-color="#b97909" stop-opacity="0"/>
         </linearGradient>
         <linearGradient id="${idB}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#17b26a" stop-opacity=".30"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
+          <stop offset="0" stop-color="#2b9fe0" stop-opacity=".30"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
         </linearGradient>
       </defs>
       ${grid}
       ${area("cost", idA)}${area("income", idB)}
       <path d="${path("cost")}" fill="none" stroke="#b97909" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="${path("income")}" fill="none" stroke="#17b26a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      ${dots("cost", "#b97909")}${dots("income", "#17b26a")}
+      <path d="${path("income")}" fill="none" stroke="#2b9fe0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots("cost", "#b97909")}${dots("income", "#2b9fe0")}
       ${ticks}
     </svg>`;
   }
@@ -410,7 +410,7 @@
       const bx = (padL + i * slot + (slot - bw) / 2).toFixed(1);
       const by = s.profit >= 0 ? (zero - h).toFixed(1) : zero.toFixed(1);
       bars += `<rect x="${bx}" y="${by}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3, bw / 2).toFixed(1)}"
-        fill="${s.profit >= 0 ? "#17b26a" : "#d05f45"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
+        fill="${s.profit >= 0 ? "#2b9fe0" : "#d05f45"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
       if (n <= 13 && s.profit !== 0) {
         const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
         bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
-  <rect width="180" height="180" rx="38" fill="#132a1f"/>
-  <rect x="38" y="58" width="104" height="76" rx="12" fill="#1d7a4d"/>
-  <rect x="52" y="44" width="76" height="30" rx="8" fill="#2a9a68"/>
-  <rect x="78" y="38" width="24" height="14" rx="4" fill="#2a9a68"/>
+  <rect width="180" height="180" rx="38" fill="#0c2b4a"/>
+  <rect x="38" y="58" width="104" height="76" rx="12" fill="#0f6cbd"/>
+  <rect x="52" y="44" width="76" height="30" rx="8" fill="#2b9fe0"/>
+  <rect x="78" y="38" width="24" height="14" rx="4" fill="#2b9fe0"/>
   <text x="90" y="112" font-family="-apple-system,'PingFang SC',sans-serif" font-size="44" font-weight="700" fill="#ffffff" text-anchor="middle">¥</text>
 </svg>
