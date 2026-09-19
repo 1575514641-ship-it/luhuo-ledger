@@ -194,6 +194,12 @@
     $("#kpiMonthIncome").textContent = money(s.monthIncome);
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
+    // 订单状态：垫付占比小环形 + 三态行
+    const stColors = { "在途": "#b97909", "已回款": "#17b26a", "自留": "#d05f45" };
+    const donutItems = STATUSES.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
+    $("#statusDonut").innerHTML = s.totalCost > 0
+      ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
+      : `<div class="empty-mini">暂无垫付</div>`;
     $("#statusList").innerHTML = STATUSES.map((st) => {
       const b = s.byStatus[st];
       return `<div class="status-row">
@@ -201,6 +207,12 @@
         <span class="status-nums"><em>${b.count} 单</em><i>${money(b.cost)}</i></span>
       </div>`;
     }).join("");
+
+    // 近 6 个月迷你走势（垫出/回款）
+    $("#dashFlowLegend").innerHTML = `<i class="lg-dot" style="background:#b97909"></i>垫出　<i class="lg-dot" style="background:#17b26a"></i>回款`;
+    const flowBuckets = s.months.map((m) => ({ label: `${parseInt(m.month.slice(5), 10)}月` }));
+    const flowStats = s.months.map((m) => ({ cost: m.cost, income: m.income }));
+    $("#dashFlow").innerHTML = chartFlowSVG(flowBuckets, flowStats, 118);
 
     $("#monthList").innerHTML = s.months.map((m) => `
       <div class="month-row">
@@ -343,8 +355,8 @@
   }
 
   // 垫出 vs 回款：双序列面积图
-  function chartFlowSVG(buckets, stats) {
-    const W = 336, H = 158, padL = 6, padR = 6, padT = 14, padB = 22;
+  function chartFlowSVG(buckets, stats, H = 158) {
+    const W = 336, padL = 6, padR = 6, padT = 14, padB = 22;
     const n = buckets.length;
     const innerW = W - padL - padR, innerH = H - padT - padB;
     const maxV = Math.max(1, ...stats.map((s) => Math.max(s.cost, s.income)));
@@ -413,14 +425,14 @@
   }
 
   // 商品利润占比环形图
-  function chartDonutSVG(items, total) {
+  function chartDonutSVG(items, total, centerLabel = "已结算利润", colors = PALETTE) {
     const S = 128, r = 44, sw = 17, C = 2 * Math.PI * r;
     let offset = 0, slices = "";
     items.forEach((it, i) => {
       const frac = it.value / total;
       const gap = items.length > 1 ? 1.5 : 0;
       const dash = `${Math.max(0.5, frac * C - gap).toFixed(2)} ${(C - Math.max(0.5, frac * C - gap)).toFixed(2)}`;
-      slices += `<circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="${PALETTE[i % PALETTE.length]}"
+      slices += `<circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="${colors[i % colors.length]}"
         stroke-width="${sw}" stroke-dasharray="${dash}" transform="rotate(${(offset * 360 - 90).toFixed(2)} ${S / 2} ${S / 2})"/>`;
       offset += frac;
     });
@@ -428,7 +440,7 @@
       <circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${sw}"/>
       ${slices}
       <text x="${S / 2}" y="${S / 2 - 2}" font-size="15" font-weight="700" fill="var(--ink)" text-anchor="middle">${money(total)}</text>
-      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" fill="var(--muted)" text-anchor="middle">已结算利润</text>
+      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
     </svg>`;
   }
 

@@ -54,12 +54,16 @@
       </div>
 
       <div class="card">
-        <h2>订单状态 <small>单数 / 垫付</small></h2>
-        <div id="statusList"></div>
+        <h2>订单状态 <small>垫付占比</small></h2>
+        <div class="status-wrap">
+          <div id="statusDonut"></div>
+          <div id="statusList" class="status-rows"></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>近 6 个月 <small>垫出 / 回款 / 差</small></h2>
+        <h2>近 6 个月 <span class="legend" id="dashFlowLegend"></span></h2>
+        <div id="dashFlow"></div>
         <div id="monthList"></div>
         <p class="foot-note">「差」为现金流视角：正数＝这个月收回来的比垫出去的多。</p>
       </div>
@@ -213,7 +217,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=5"></script>
-  <script src="./app.js?v=5"></script>
+  <script src="./sync.js?v=6"></script>
+  <script src="./app.js?v=6"></script>
 </body>
 </html>

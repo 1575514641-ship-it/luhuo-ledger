@@ -94,6 +94,9 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .kpi-value.neg { color: var(--neg); }
 
 /* ---- 行 ---- */
+.status-wrap { display: flex; align-items: center; gap: 14px; }
+.status-wrap > div:first-child { flex: 0 0 auto; }
+.status-rows { flex: 1; min-width: 0; }
 .status-row, .month-row, .prod-row {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px;
