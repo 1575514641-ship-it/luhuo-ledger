@@ -250,7 +250,6 @@
       const showProfit = o.income !== null || settled;
       const actions = [];
       if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
-      if (!settled) actions.push(`<button class="act" data-act="keep" data-id="${o.id}">自留</button>`);
       actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
       actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
       actions.push(`<button class="act danger" data-act="del" data-id="${o.id}">删除</button>`);
@@ -530,7 +529,7 @@
     f.status.value = order ? order.status : "在途";
     f.note.value = order ? order.note : "";
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
-    $("#formMore").open = !!(order && (order.fee > 0 || order.status !== "在途"));
+    $("#formMore").open = !!(order && order.status !== "在途");
     $("#formModal").classList.add("show");
     setTimeout(() => f.goods.focus(), 120);
   }
@@ -590,15 +589,6 @@
     toast("已复制一单，改个金额就能存");
   }
 
-  function markKept(id) {
-    const o = data.orders.find((x) => x.id === id);
-    if (!o) return;
-    o.status = "自留";
-    if (o.income === null) o.income = 0;
-    saveData();
-    toast("已记自留，点编辑可以改回");
-  }
-
   function openPayForm(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
@@ -622,7 +612,7 @@
     if (!o) return;
     const income = numberValue($("#payForm").income.value);
     const profit = income - o.cost - o.fee;
-    $("#payPreview").innerHTML = `利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${profit >= 0 ? "+" : ""}${money(profit)}</b>（垫付 ${money(o.cost)}${o.fee ? "＋杂费 " + money(o.fee) : ""}）`;
+    $("#payPreview").innerHTML = `利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${profit >= 0 ? "+" : ""}${money(profit)}</b>（垫付 ${money(o.cost)}${o.fee ? "＋邮费 " + money(o.fee) : ""}）`;
     $("#paySubmit").textContent = `确认回款 ${money(income)}`;
   }
 
@@ -818,7 +808,6 @@
       if (!btn) return;
       const { act, id } = btn.dataset;
       if (act === "pay") openPayForm(id);
-      else if (act === "keep") markKept(id);
       else if (act === "dup") duplicateOrder(id);
       else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
       else if (act === "del") deleteOrder(id);

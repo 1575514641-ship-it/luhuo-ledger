@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=15">
+  <link rel="stylesheet" href="./styles.css?v=16">
 </head>
 <body>
   <header class="topbar">
@@ -136,19 +136,17 @@
       <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
       <div class="row2">
         <label class="fld">垫付金额<input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
-        <label class="fld">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
+        <label class="fld">邮费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
       </div>
       <div class="row2">
         <label class="fld">日期<input name="date" type="date" required></label>
-        <label class="fld">出掉渠道<select name="channel"></select></label>
+        <label class="fld">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
       </div>
+      <label class="fld">出掉渠道<select name="channel"></select></label>
       <details class="more" id="formMore">
-        <summary>更多（杂费 / 状态）</summary>
+        <summary>更多（状态）</summary>
         <div class="more-body">
-          <div class="row2">
-            <label class="fld">运费杂费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
-            <label class="fld">状态<select name="status"></select></label>
-          </div>
+          <label class="fld">状态<select name="status"></select></label>
         </div>
       </details>
       <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
@@ -220,7 +218,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=12"></script>
-  <script src="./app.js?v=15"></script>
+  <script src="./sync.js?v=16"></script>
+  <script src="./app.js?v=16"></script>
 </body>
 </html>
