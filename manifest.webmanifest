@@ -3,8 +3,8 @@
   "short_name": "撸货记账",
   "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#f2f4f3",
-  "theme_color": "#0c2b4a",
+  "background_color": "#f5f3ee",
+  "theme_color": "#171512",
   "icons": [
     {
       "src": "./icon.svg",
