@@ -546,7 +546,8 @@
     const name = String(f.goods.value || "").trim();
     const cost = numberValue(f.cost.value);
     if (!name) { toast("先填商品名称"); return; }
-    if (cost <= 0) { toast("垫付金额要大于 0"); return; }
+    if (cost < 0) { toast("垫付金额不能是负数"); return; }
+    if (cost === 0 && !confirm("垫付金额为 0？确认这是 0 元购/白嫖的单子吗？")) return;
     const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
     const order = {
       id: existing ? existing.id : uid(),
