@@ -307,6 +307,131 @@
     return reportStats(r.start, r.end);
   }
 
+  // ---- 报表图表（手写 SVG，无外部依赖）----
+  const PALETTE = ["#0f8a51", "#2f9fc4", "#b97909", "#7a5fb5", "#d05f45", "#8c9a92"];
+  let gradSeq = 0;
+
+  // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
+  function buildBuckets(mode, range) {
+    const buckets = [];
+    if (mode === "month") {
+      const d = new Date(range.start);
+      let i = 1;
+      while (d < range.end) {
+        const start = new Date(d), end = new Date(d); end.setDate(end.getDate() + 1);
+        buckets.push({ label: String(i), start, end });
+        d.setDate(d.getDate() + 1); i += 1;
+      }
+    } else {
+      const d = new Date(range.start);
+      while (d < range.end) {
+        const start = new Date(d), end = new Date(d); end.setMonth(end.getMonth() + 1);
+        buckets.push({ label: `${pad2(d.getMonth() + 1)}月`, start, end });
+        d.setMonth(d.getMonth() + 1);
+      }
+    }
+    return buckets;
+  }
+
+  function sparseTicks(n) {
+    if (n <= 8) return [...Array(n).keys()];
+    const step = Math.ceil(n / 6);
+    const idx = [];
+    for (let i = 0; i < n; i += step) idx.push(i);
+    if (idx[idx.length - 1] !== n - 1) idx.push(n - 1);
+    return idx;
+  }
+
+  // 垫出 vs 回款：双序列面积图
+  function chartFlowSVG(buckets, stats) {
+    const W = 336, H = 158, padL = 6, padR = 6, padT = 14, padB = 22;
+    const n = buckets.length;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxV = Math.max(1, ...stats.map((s) => Math.max(s.cost, s.income)));
+    const x = (i) => padL + (n === 1 ? innerW / 2 : i * innerW / (n - 1));
+    const y = (v) => padT + innerH - (v / maxV) * innerH;
+    let grid = "";
+    [0, .5, 1].forEach((f) => {
+      const gy = padT + innerH - f * innerH;
+      grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="var(--line)" stroke-dasharray="3 4"/>`;
+    });
+    grid += `<text x="${padL + 2}" y="${padT + 4}" font-size="9" fill="var(--muted)">至多 ${money(maxV)}</text>`;
+    const path = (key) => stats.map((s, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(s[key]).toFixed(1)}`).join(" ");
+    const area = (key, gid) => n === 1 ? "" :
+      `<path d="${path(key)} L${x(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)} L${x(0).toFixed(1)},${(padT + innerH).toFixed(1)} Z" fill="url(#${gid})"/>`;
+    const dots = (key, color) => n <= 14 ? stats.map((s, i) =>
+      `<circle cx="${x(i).toFixed(1)}" cy="${y(s[key]).toFixed(1)}" r="2.6" fill="#fff" stroke="${color}" stroke-width="1.6"/>`).join("") : "";
+    const ticks = sparseTicks(n).map((i) =>
+      `<text x="${x(i).toFixed(1)}" y="${H - 6}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
+    const idA = "gf" + (++gradSeq), idB = "gf" + (++gradSeq);
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <linearGradient id="${idA}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#b97909" stop-opacity=".28"/><stop offset="1" stop-color="#b97909" stop-opacity="0"/>
+        </linearGradient>
+        <linearGradient id="${idB}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#17b26a" stop-opacity=".30"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      ${grid}
+      ${area("cost", idA)}${area("income", idB)}
+      <path d="${path("cost")}" fill="none" stroke="#b97909" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="${path("income")}" fill="none" stroke="#17b26a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots("cost", "#b97909")}${dots("income", "#17b26a")}
+      ${ticks}
+    </svg>`;
+  }
+
+  // 净盈亏：零轴发散柱
+  function chartProfitSVG(buckets, stats) {
+    const W = 336, H = 148, padL = 6, padR = 6, padT = 12, padB = 22;
+    const n = buckets.length;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxAbs = Math.max(1, ...stats.map((s) => Math.abs(s.profit)));
+    const half = innerH / 2;
+    const zero = padT + half;
+    const slot = innerW / n;
+    const bw = Math.min(26, slot * 0.56);
+    let bars = "";
+    stats.forEach((s, i) => {
+      const h = Math.max(s.profit === 0 ? 0 : 2, Math.abs(s.profit) / maxAbs * (half - 2));
+      const bx = (padL + i * slot + (slot - bw) / 2).toFixed(1);
+      const by = s.profit >= 0 ? (zero - h).toFixed(1) : zero.toFixed(1);
+      bars += `<rect x="${bx}" y="${by}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3, bw / 2).toFixed(1)}"
+        fill="${s.profit >= 0 ? "#17b26a" : "#d05f45"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
+      if (n <= 13 && s.profit !== 0) {
+        const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
+        bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" fill="var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
+      }
+    });
+    const ticks = sparseTicks(n).map((i) =>
+      `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${H - 6}" font-size="9" fill="var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
+      <line x1="${padL}" y1="${zero.toFixed(1)}" x2="${W - padR}" y2="${zero.toFixed(1)}" stroke="#c8d2cc" stroke-width="1"/>
+      ${bars}${ticks}
+    </svg>`;
+  }
+
+  // 商品利润占比环形图
+  function chartDonutSVG(items, total) {
+    const S = 128, r = 44, sw = 17, C = 2 * Math.PI * r;
+    let offset = 0, slices = "";
+    items.forEach((it, i) => {
+      const frac = it.value / total;
+      const gap = items.length > 1 ? 1.5 : 0;
+      const dash = `${Math.max(0.5, frac * C - gap).toFixed(2)} ${(C - Math.max(0.5, frac * C - gap)).toFixed(2)}`;
+      slices += `<circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="${PALETTE[i % PALETTE.length]}"
+        stroke-width="${sw}" stroke-dasharray="${dash}" transform="rotate(${(offset * 360 - 90).toFixed(2)} ${S / 2} ${S / 2})"/>`;
+      offset += frac;
+    });
+    return `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}">
+      <circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${sw}"/>
+      ${slices}
+      <text x="${S / 2}" y="${S / 2 - 2}" font-size="15" font-weight="700" fill="var(--ink)" text-anchor="middle">${money(total)}</text>
+      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" fill="var(--muted)" text-anchor="middle">已结算利润</text>
+    </svg>`;
+  }
+
   function renderReport() {
     const range = repRange(reportMode, repCursor);
     $("#repLabel").textContent = range.label;
@@ -334,38 +459,49 @@
       <div class="kpi card"><span class="kpi-label">回款</span><span class="kpi-value">${money(s.income)}</span></div>
       <div class="kpi card"><span class="kpi-label">净盈亏</span><span class="kpi-value ${s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : ""}">${money(s.profit)}</span></div>`;
 
-    const barsCard = $("#reportBarsCard");
-    if (reportMode === "month") { barsCard.style.display = "none"; }
-    else {
-      barsCard.style.display = "";
-      const months = [];
-      const d = new Date(range.start);
-      while (d < range.end) {
-        months.push({ y: d.getFullYear(), m: d.getMonth() });
-        d.setMonth(d.getMonth() + 1);
-      }
-      const rows = months.map((mm) => {
-        const st = reportStats(new Date(mm.y, mm.m, 1), new Date(mm.y, mm.m + 1, 1));
-        return { label: `${pad2(mm.m + 1)}月`, profit: st.profit };
-      });
-      const maxAbs = Math.max(1, ...rows.map((r) => Math.abs(r.profit)));
-      $("#reportBars").innerHTML = rows.map((r) => `
-        <div class="bar-row">
-          <span class="bar-label">${r.label}</span>
-          <span class="bar-track"><span class="bar ${r.profit >= 0 ? "pos" : "neg"}" style="width:${Math.round(Math.abs(r.profit) / maxAbs * 100)}%"></span></span>
-          <span class="bar-num ${r.profit > 0 ? "pos" : r.profit < 0 ? "neg" : ""}">${money(r.profit)}</span>
+    // 图表
+    const buckets = buildBuckets(reportMode, range);
+    const bucketStats = buckets.map((b) => reportStats(b.start, b.end));
+
+    $("#flowLegend").innerHTML = `<i class="lg-dot" style="background:#b97909"></i>垫出　<i class="lg-dot" style="background:#17b26a"></i>回款`;
+    $("#chartFlow").innerHTML = chartFlowSVG(buckets, bucketStats);
+
+    $("#profitLegend").innerHTML = `<i class="lg-dot" style="background:#17b26a"></i>赚　<i class="lg-dot" style="background:#d05f45"></i>亏`;
+    $("#chartProfit").innerHTML = chartProfitSVG(buckets, bucketStats);
+
+    // 环形图：已结算利润为正的商品，Top5 + 其他
+    const ranked = Object.entries(s.byName).map(([name, g]) => ({ name, value: g.profit }))
+      .filter((x) => x.value > 0).sort((a, b) => b.value - a.value);
+    const top = ranked.slice(0, 5);
+    const restVal = ranked.slice(5).reduce((a, b) => a + b.value, 0);
+    if (restVal > 0) top.push({ name: "其他", value: restVal });
+    const total = top.reduce((a, b) => a + b.value, 0);
+    if (total <= 0) {
+      $("#chartDonut").innerHTML = `<div class="empty-mini">这个周期还没有已结算的利润可分</div>`;
+    } else {
+      const legend = top.map((it, i) => `
+        <div class="donut-legend-row">
+          <i class="lg-dot" style="background:${PALETTE[i % PALETTE.length]}"></i>
+          <span class="dl-name">${escapeHtml(it.name)}</span>
+          <span class="dl-val">${money(it.value)} · ${Math.round(it.value / total * 100)}%</span>
         </div>`).join("");
+      $("#chartDonut").innerHTML = `<div class="donut-wrap">${chartDonutSVG(top, total)}<div class="donut-legend">${legend}</div></div>`;
     }
 
+    // 商品榜 + 比例条
     const products = Object.entries(s.byName)
       .sort((a, b) => b[1].profit - a[1].profit)
       .slice(0, 5);
+    const maxP = Math.max(1, ...products.map(([, g]) => Math.abs(g.profit)));
     $("#reportProducts").innerHTML = products.length === 0
       ? `<div class="empty-mini">该周期没有商品</div>`
       : products.map(([name, g]) => `
         <div class="prod-row">
-          <span class="prod-name">${escapeHtml(name)}${g.pending ? ` <i class="pending-tag">在途${g.pending}</i>` : ""}</span>
-          <span class="prod-nums">${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
+          <div class="prod-line">
+            <span class="prod-name">${escapeHtml(name)}${g.pending ? ` <i class="pending-tag">在途${g.pending}</i>` : ""}</span>
+            <span class="prod-nums">${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
+          </div>
+          <div class="prod-bar-track"><span class="prod-bar ${g.profit >= 0 ? "pos" : "neg"}" style="width:${Math.round(Math.abs(g.profit) / maxP * 100)}%"></span></div>
         </div>`).join("");
   }
 
@@ -696,7 +832,7 @@
       const btn = ev.target.closest("button[data-mode]");
       if (!btn) return;
       reportMode = btn.dataset.mode;
-      $$("#repModes .chip").forEach((c) => c.classList.toggle("on", c.dataset.mode === reportMode));
+      $$("#repModes .seg").forEach((c) => c.classList.toggle("on", c.dataset.mode === reportMode));
       const now = new Date();
       repCursor = { y: now.getFullYear(), m: now.getMonth() };
       renderReport();

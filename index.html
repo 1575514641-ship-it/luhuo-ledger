@@ -74,10 +74,10 @@
     <!-- 报表 -->
     <section id="view-report" class="view">
       <div class="card rep-head">
-        <div id="repModes" class="chips static">
-          <button class="chip on" data-mode="month">月</button>
-          <button class="chip" data-mode="quarter">季</button>
-          <button class="chip" data-mode="year">年</button>
+        <div id="repModes" class="segment">
+          <button class="seg on" data-mode="month">月</button>
+          <button class="seg" data-mode="quarter">季</button>
+          <button class="seg" data-mode="year">年</button>
         </div>
         <div class="rep-nav">
           <button id="repPrev" class="nav-btn" aria-label="上一期">‹</button>
@@ -87,9 +87,17 @@
       </div>
       <div id="reportSummary" class="card summary"></div>
       <div id="reportKpis" class="kpi-grid"></div>
-      <div class="card" id="reportBarsCard">
-        <h2>分月走势 <small>净盈亏</small></h2>
-        <div id="reportBars"></div>
+      <div class="card">
+        <h2>现金流走势 <span class="legend" id="flowLegend"></span></h2>
+        <div id="chartFlow"></div>
+      </div>
+      <div class="card">
+        <h2>净盈亏分布 <span class="legend" id="profitLegend"></span></h2>
+        <div id="chartProfit"></div>
+      </div>
+      <div class="card">
+        <h2>商品利润占比 <small>已结算</small></h2>
+        <div id="chartDonut"></div>
       </div>
       <div class="card">
         <h2>商品榜 <small>已结算利润 Top 5</small></h2>
@@ -205,7 +213,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=4"></script>
-  <script src="./app.js?v=4"></script>
+  <script src="./sync.js?v=5"></script>
+  <script src="./app.js?v=5"></script>
 </body>
 </html>

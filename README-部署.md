@@ -4,14 +4,20 @@
 同步协议与「五行理财」（www0706.netlify.app）完全同源：复用其 Cloudflare Worker 存储，
 按独立身份隔离，撸货账本和理财数据互不可见。
 
-## 部署（一次性，约 1 分钟）
+## 现役网址（2026-09-19 已上线）
 
-1. 打开 https://app.netlify.com/drop （需要 Netlify 账号，免费；没有就注册一个）
-2. 把本文件夹（webapp）整个拖进网页里
-3. 得到一个 `xxx.netlify.app` 网址，手机浏览器打开 → 分享 → **添加到主屏幕**，
-   之后从桌面图标进，就是一个全屏"App"
+**https://1575514641-ship-it.github.io/luhuo-ledger/**
 
-不想自己动手的话，让 ZCode 用浏览器帮你在 Netlify 上操作也行。
+- 托管：GitHub Pages（仓库 `1575514641-ship-it/luhuo-ledger`，public，main 分支根目录）
+- 更新方式：改 `webapp/` 里的文件 → 同步到 `E:\杂活\撸货记账\site-repo\` → `git push`，Pages 自动重构建
+- 国内直连 github.io 时快时慢：打不开时挂一下代理再刷新；若想换 netlify.app 域名，
+  注册 Netlify 后让 ZCode 用浏览器帮部署一份即可（代码无需改动）
+
+## 首次使用（每台设备）
+
+1. 打开上面的网址
+2. iPhone：Safari 分享 → **添加到主屏幕**，之后从桌面图标进，就是全屏 App
+3. 手机和电脑各生成自己的同步码（设置页可见），把一端的码粘到另一端 → 两端共用同一本账
 
 ## 两台设备怎么共用一本账
 
