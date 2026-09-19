@@ -650,6 +650,7 @@
 
   // ---- 云同步（改动防抖推送，启动拉取）----
   let syncTimer = null, syncPending = false, syncInFlight = false;
+  let syncEpoch = 0;   // 导入同步码/重置身份时换代：旧身份数据的晚到同步直接作废
 
   function saveData() {
     meta.updatedAt = new Date().toISOString();
@@ -679,20 +680,23 @@
     if (!window.luhuoSync || !window.luhuoSync.isConfigured()) return;
     if (syncInFlight) { syncPending = true; return; }
     syncInFlight = true;
+    const epoch = syncEpoch;
     window.luhuoSync.setStatus("syncing");
     try {
       const record = await window.luhuoSync.saveData(data, meta.updatedAt || new Date().toISOString());
+      if (epoch !== syncEpoch) return;   // 身份已换代，丢弃本轮结果
       meta.lastSyncedAt = (record.updatedAt || new Date().toISOString()).replace("T", " ").slice(0, 16);
       meta.lastSyncError = "";
       persist();
       window.luhuoSync.setStatus("online", "上次同步：" + meta.lastSyncedAt);
     } catch (error) {
+      if (epoch !== syncEpoch) return;
       meta.lastSyncError = error && error.message ? error.message : String(error);
       persist();
       window.luhuoSync.setStatus("error", meta.lastSyncError);
     } finally {
       syncInFlight = false;
-      if (syncPending) { syncPending = false; syncToCloud(); }
+      if (syncPending && epoch === syncEpoch) { syncPending = false; syncToCloud(); }
     }
   }
 
@@ -864,13 +868,18 @@
       if (!code) { toast("先粘贴另一台设备的同步码"); return; }
       if (!confirm("导入同步码后，本机将与对方共用同一本账。\n首次同步以最新的一份数据为准，继续？")) return;
       try {
+        syncEpoch += 1;                       // 作废旧身份在途的同步
+        syncPending = false; clearTimeout(syncTimer);
         window.luhuoSync.applySyncCode(code);
         meta.updatedAt = null;
         meta.lastSyncedAt = null;
+        meta.lastSyncError = "";
         persist();
         await pullFromCloud();
+        syncEpoch += 1;
         render();
         renderSettings();
+        scheduleSync();                       // 把采纳到的数据推上去，盖掉可能落地的旧包
         toast("同步码已导入");
       } catch (error) {
         toast(error.message || "同步码无效");
@@ -884,6 +893,8 @@
     $("#resetIdentityBtn").addEventListener("click", async () => {
       if (!confirm("重置后本机将生成全新空账本（云端旧账不受影响，但没有同步码就再也连不上）。\n确定重置？")) return;
       if (!confirm("再次确认：旧账本数据将无法从本机再访问，确定？")) return;
+      syncEpoch += 1;
+      syncPending = false; clearTimeout(syncTimer);
       window.luhuoSync.resetIdentity();
       data = { version: 1, orders: [] };
       meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
