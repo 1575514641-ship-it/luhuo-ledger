@@ -195,7 +195,7 @@
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
     // 订单状态：垫付占比小环形 + 三态行
-    const stColors = { "在途": "#a3720d", "已回款": "#b99a54", "自留": "#c0724f" };
+    const stColors = { "在途": "#9a6b0a", "已回款": "#14b8a6", "自留": "#c0724f" };
     const donutItems = STATUSES.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
     $("#statusDonut").innerHTML = s.totalCost > 0
       ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
@@ -320,7 +320,7 @@
   }
 
   // ---- 报表图表（手写 SVG，无外部依赖）----
-  const PALETTE = ["#c9a86a", "#8a8378", "#7d8fa1", "#a3720d", "#7a5fb5"];
+  const PALETTE = ["#14b8a6", "#7d8fa1", "#a3720d", "#7a5fb5", "#8a8378"];
   let gradSeq = 0;
 
   // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
@@ -379,17 +379,17 @@
     return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
       <defs>
         <linearGradient id="${idA}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#b97909" stop-opacity=".28"/><stop offset="1" stop-color="#b97909" stop-opacity="0"/>
+          <stop offset="0" stop-color="#7d8fa1" stop-opacity=".28"/><stop offset="1" stop-color="#b97909" stop-opacity="0"/>
         </linearGradient>
         <linearGradient id="${idB}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#c9a86a" stop-opacity=".32"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
+          <stop offset="0" stop-color="#14b8a6" stop-opacity=".32"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
         </linearGradient>
       </defs>
       ${grid}
       ${area("cost", idA)}${area("income", idB)}
-      <path d="${path("cost")}" fill="none" stroke="#b97909" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="${path("income")}" fill="none" stroke="#c9a86a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      ${dots("cost", "#7d8fa1")}${dots("income", "#c9a86a")}
+      <path d="${path("cost")}" fill="none" stroke="#7d8fa1" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="${path("income")}" fill="none" stroke="#14b8a6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots("cost", "#7d8fa1")}${dots("income", "#14b8a6")}
       ${ticks}
     </svg>`;
   }
@@ -410,7 +410,7 @@
       const bx = (padL + i * slot + (slot - bw) / 2).toFixed(1);
       const by = s.profit >= 0 ? (zero - h).toFixed(1) : zero.toFixed(1);
       bars += `<rect x="${bx}" y="${by}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3, bw / 2).toFixed(1)}"
-        fill="${s.profit >= 0 ? "#c9a86a" : "#c0724f"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
+        fill="${s.profit >= 0 ? "#14b8a6" : "#c0724f"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
       if (n <= 13 && s.profit !== 0) {
         const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
         bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
