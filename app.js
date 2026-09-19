@@ -195,7 +195,7 @@
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
     // 订单状态：垫付占比小环形 + 三态行
-    const stColors = { "在途": "#9a6b0a", "已回款": "#14b8a6", "自留": "#c0724f" };
+    const stColors = { "在途": "#7d8fa1", "已回款": "#14b8a6", "自留": "#c0724f" };
     const donutItems = STATUSES.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
     $("#statusDonut").innerHTML = s.totalCost > 0
       ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
@@ -320,7 +320,7 @@
   }
 
   // ---- 报表图表（手写 SVG，无外部依赖）----
-  const PALETTE = ["#14b8a6", "#7d8fa1", "#a3720d", "#7a5fb5", "#8a8378"];
+  const PALETTE = ["#14b8a6", "#7d8fa1", "#c0724f", "#7a5fb5", "#8a8378"];
   let gradSeq = 0;
 
   // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月

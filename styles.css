@@ -1,7 +1,7 @@
 /* 撸货记账 v11 · 墨金主题（Ink & Champagne）
    设计参考：Revolut/Wise 的 balance-card 锚点 + 克制三色 + 发丝线描边 */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --bg: #f0f7f6;
   --card: #ffffff;
   --ink: #14201e;
@@ -11,8 +11,8 @@
   --accent: #0d9488;
   --accent-2: #14b8a6;
   --accent-soft: #dcf1ee;
-  --warn: #9a6b0a;
-  --warn-soft: #f7f0da;
+  --warn: #64748b;
+  --warn-soft: rgba(125, 143, 161, .14);
   --neg: #a4442f;
   --neg-soft: #f7e9e4;
   --glass: rgba(250, 253, 252, .92);
@@ -26,30 +26,6 @@
   --teal-line: rgba(20, 148, 136, .4);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0a1414;
-    --card: #11201f;
-    --ink: #e6f2f0;
-    --muted: #8aa5a0;
-    --line: #1e3330;
-    --accent: #2dd4bf;
-    --accent-2: #5eead4;
-    --accent-soft: rgba(45, 212, 191, .12);
-    --warn: #d9a648;
-    --warn-soft: rgba(217, 166, 72, .13);
-    --neg: #e07a5f;
-    --neg-soft: rgba(224, 122, 95, .13);
-    --glass: rgba(12, 25, 24, .92);
-  --hero-bg: linear-gradient(140deg, #1a3b35, #0f2622);
-  --hero-ink: #d3ebe5;
-  --hero-value: #5eead4;
-  --hero-label: rgba(211, 235, 229, .6);
-  --hero-line: rgba(45, 212, 191, .3);
-    --shadow: 0 1px 2px rgba(0, 0, 0, .2), 0 14px 34px -22px rgba(0, 0, 0, .55);
-    --teal-line: rgba(45, 212, 191, .35);
-  }
-}
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; padding: 0; }
