@@ -871,6 +871,7 @@
       try {
         syncEpoch += 1;                       // 作废旧身份在途的同步
         syncPending = false; clearTimeout(syncTimer);
+        const localOnly = data.orders.slice(); // 本机订单先留底，导入后按 id 并回，防覆盖丢失
         window.luhuoSync.applySyncCode(code);
         meta.updatedAt = null;
         meta.lastSyncedAt = null;
@@ -878,10 +879,16 @@
         persist();
         await pullFromCloud();
         syncEpoch += 1;
+        // 合并：本机有、云端没有的订单不丢
+        const ids = new Set(data.orders.map((o) => o.id));
+        let recovered = 0;
+        localOnly.forEach((o) => {
+          if (!ids.has(o.id)) { data.orders.push(o); recovered += 1; }
+        });
         render();
         renderSettings();
-        scheduleSync();                       // 把采纳到的数据推上去，盖掉可能落地的旧包
-        toast("同步码已导入");
+        if (recovered > 0) { saveData(); toast(`已配对，并找回本机 ${recovered} 单`); }
+        else { scheduleSync(); toast("同步码已导入"); }
       } catch (error) {
         toast(error.message || "同步码无效");
       }

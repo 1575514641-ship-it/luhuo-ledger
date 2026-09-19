@@ -63,14 +63,26 @@
   }
 
   function parseSyncCode(code) {
-    const clean = String(code || "").trim();
+    // 容错解析：从任意脏文本（URL 编码、换行、多余前后缀）中提取同步码
+    let clean = String(code || "").trim();
     if (!clean) throw new Error("同步码不能为空");
-    let payload = clean;
-    if (clean.startsWith("LUHUO1.")) {
-      const bytes = base64UrlToBytes(clean.slice("LUHUO1.".length));
-      payload = new TextDecoder().decode(bytes);
+    if (/%[0-9A-Fa-f]{2}/.test(clean)) {
+      try { clean = decodeURIComponent(clean.replace(/\s+/g, "")); } catch (e) { /* 保持原样 */ }
     }
-    const identity = normalizeIdentity(JSON.parse(payload));
+    const m = clean.match(/LUHUO1\.([A-Za-z0-9_-]+)/);
+    if (!m) throw new Error("没有找到有效同步码：应为 LUHUO1. 开头的一长串字符");
+    let payload;
+    try {
+      payload = new TextDecoder().decode(base64UrlToBytes(m[1]));
+    } catch (e) {
+      throw new Error("同步码内容不完整，请回到旧设备重新完整复制");
+    }
+    let identity;
+    try {
+      identity = normalizeIdentity(JSON.parse(payload));
+    } catch (e) {
+      throw new Error("同步码内容不完整，请回到旧设备重新完整复制");
+    }
     if (!identity) throw new Error("同步码格式不正确");
     return identity;
   }
