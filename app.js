@@ -1,5 +1,5 @@
-// 撸货记账 · 主逻辑（v4 简化版）
-// 状态只有三个：在途（垫了钱还没结清）/ 已回款 / 自留。
+// 撸货记账 · 主逻辑（v21）
+// 状态只有两个：在途（垫了钱还没结清）/ 已回款；旧的「自留」单保留原样只读显示，不再能新建。
 // 数据模型：单 JSON blob（orders 数组），经 sync.js 云同步（同设备组共用一个同步码）。
 (function () {
   "use strict";
@@ -8,9 +8,13 @@
   const DATA_KEY = "luhuo-ledger-data-v1";
   const META_KEY = "luhuo-ledger-meta-v1";
 
-  const STATUSES = ["在途", "已回款", "自留"];
-  const SETTLED = ["已回款", "自留"];
-  const FILTERS = ["在途", "全部", "已回款", "自留"];   // 账本页筛选；「全部」也要能记住
+  // v21 起「自留」退出模型：能创建的状态只有在途/已回款（货自己留着用就不算生意，用户宁可删单）。
+  // 但旧账本里已经存在的「自留」（含更老的「翻车自留」）**原样保留、绝不静默改写**：
+  // 它仍是合法的遗留值，照旧按「回款−垫付−邮费」计入已结算净盈亏，只是不再能新建。
+  const STATUSES = ["在途", "已回款"];
+  const LEGACY_STATUSES = ["自留"];              // 只读的遗留状态：认得、能显示，不能创建
+  const SETTLED = ["已回款", "自留"];             // 「已结算」= 不在途：含旧自留（那笔钱已经落地）
+  const FILTERS = ["在途", "全部", "已回款"];     // 账本页筛选；「全部」也要能记住
   const CHANNELS = ["收货商", "闲鱼", "转转", "朋友", "自用"];
   const STATUS_CLASS = { "在途": "st-out", "已回款": "st-done", "自留": "st-loss" };
 
@@ -108,11 +112,19 @@
     localStorage.setItem(META_KEY, JSON.stringify(meta));
   }
 
-  // 旧状态（待发货/待寄出/已寄出/退货中/翻车自留）→ 新三态
+  // 旧状态（待发货/待寄出/已寄出/退货中/翻车自留）→ 现役状态
+  // 重点：v21 起「自留」不可再创建，但旧的「自留/翻车自留」必须落到「自留」这个**遗留值**上——
+  // 既不能打回「在途」（那会把已经留着自用的货算成还垫在外面的钱），也不能改写成别的值。
+  // 换句话说这里只是「认得」，不是「改写」：老数据的 status 一个字节都不动。
   function migrateStatus(status) {
     if (status === "已回款") return "已回款";
-    if (status === "自留" || status === "翻车自留") return "自留";   // 「自留」是三态之一，别再被当成旧状态打回在途
+    if (status === "自留" || status === "翻车自留") return "自留";
     return "在途";
+  }
+
+  // 状态显示名：遗留在旧单上的「自留」标成「自留（旧）」，提醒它不是现在能新建的状态
+  function statusLabel(status) {
+    return LEGACY_STATUSES.includes(status) ? status + "（旧）" : status;
   }
 
   function normalizeData(source) {
@@ -133,12 +145,15 @@
         incomeDate: o.incomeDate ? String(o.incomeDate) : null,
         status: migrateStatus(o.status),
         fee: numberValue(o.fee),
-        // 批次（一起寄出的那一批）：id 为空 = 没成批的单寄单；后三个是整批口径，
+        // 批次（一起寄出的那一批）：id 为空 = 没成批的单寄单；后四个是整批口径，
         // 冗余存在每张单上，删单不会留下孤儿批次记录
         batchId: String(o.batchId || ""),
         batchDate: o.batchDate ? String(o.batchDate) : "",
         batchFee: numberValue(o.batchFee),
         batchIncome: numberValue(o.batchIncome),
+        // batchCount = 结算那一刻这一批的成员数；有人退出本批后不再改写它，
+        // 表头据此区分「有人退出」（预期内）与「金额被改过」（真漂移）。老数据没有 → 0
+        batchCount: Math.max(0, Math.round(numberValue(o.batchCount))),
         note: String(o.note || "").slice(0, 300),
         createdAt: String(o.createdAt || new Date().toISOString()),
       });
@@ -161,12 +176,24 @@
   function isSettled(order) { return SETTLED.includes(order.status); }
   function orderProfit(o) { return (o.income === null ? 0 : o.income) - o.cost - o.fee; }
 
+  // 展示/汇总用的状态集合 = 现役两态 + 数据里实际出现的遗留态（旧「自留」）。
+  // 必须带上遗留态，否则那些单子的垫付既不进环形图也不进状态行，
+  // 「垫付合计」就会大于各状态之和、占比凑不满 100%。
+  function statusKeys() {
+    const keys = STATUSES.slice();
+    LEGACY_STATUSES.forEach((s) => {
+      if (data.orders.some((o) => o.status === s) && !keys.includes(s)) keys.push(s);
+    });
+    return keys;
+  }
+
   function computeStats() {
     const orders = data.orders;
     let totalCost = 0, totalIncome = 0, outstanding = 0, outCount = 0, settledProfit = 0;
     let monthCost = 0, monthIncome = 0;
     const cm = currentMonth();
-    const byStatus = {}; STATUSES.forEach((s) => { byStatus[s] = { count: 0, cost: 0 }; });
+    const keys = statusKeys();
+    const byStatus = {}; keys.forEach((s) => { byStatus[s] = { count: 0, cost: 0 }; });
     const byMonth = {};
 
     orders.forEach((o) => {
@@ -198,7 +225,7 @@
       const row = byMonth[key] || { cost: 0, income: 0 };
       months.push({ month: key, cost: row.cost, income: row.income, diff: row.income - row.cost });
     }
-    return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, byStatus, months, count: orders.length };
+    return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, byStatus, statusKeys: keys, months, count: orders.length };
   }
 
   // ---- 批次（一起寄出的一批单子）----
@@ -213,7 +240,7 @@
         g = {
           id: o.batchId, date: o.batchDate || o.date,
           feeCents: 0, incomeCents: 0, costCents: 0,
-          count: 0, pending: 0, selfKeep: 0, names: [],
+          count: 0, pending: 0, names: [],
         };
         map.set(o.batchId, g);
       }
@@ -221,7 +248,6 @@
       g.costCents += toCents(o.cost);
       g.names.push(o.name || "未命名");
       if (!isSettled(o)) g.pending += 1;
-      if (o.status === "自留") g.selfKeep += 1;
       // 整批口径同值冗余，取最大可容忍半截写入的旧数据
       g.feeCents = Math.max(g.feeCents, toCents(o.batchFee));
       g.incomeCents = Math.max(g.incomeCents, toCents(o.batchIncome));
@@ -229,22 +255,33 @@
     return map;
   }
 
-  // 邮费归期：整批寄的按批次日期，单寄的按下单日期
+  // 邮费归期：整批寄的按批次日期，单寄的按下单日期。
+  // 统计口径 = 成员明细合计：成批的单子一律按各单自己记的 fee 汇总，批次只管分组与归期，
+  // 不再拿整批录入值当统计取值（v20 的 max(batchFee) 口径在「退出本批」时会把退出那单的
+  // 分摊额重复计一次；成员入批前自带邮费时又会少算）。这样恒有：
+  //   本期邮费合计 = Σ各批成员 fee + Σ单寄 fee = 本期归期的所有单子 fee 之和
   function reportFeeStats(startD, endD) {
     const batches = [];
     let totalCents = 0;
     batchGroups().forEach((g) => {
       const d = parseDate(g.date);
-      if (!d || d < startD || d >= endD || g.feeCents <= 0) return;
-      batches.push(g);
-      totalCents += g.feeCents;
+      if (!d || d < startD || d >= endD) return;
+      const members = data.orders.filter((o) => o.batchId === g.id);
+      const feeCents = members.reduce((a, o) => a + toCents(o.fee), 0);
+      if (feeCents <= 0) return;
+      const incomeCents = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
+      // entry* = 用户录入口径的整批数字，只用于「整批录入 ¥X」的备注，不参与统计
+      batches.push(Object.assign({}, g, {
+        feeCents, incomeCents, entryFeeCents: g.feeCents, entryIncomeCents: g.incomeCents,
+      }));
+      totalCents += feeCents;
     });
     batches.sort((a, b) => (a.date < b.date ? 1 : -1));
 
     let looseCents = 0, looseCount = 0;
     const looseNames = [];
     data.orders.forEach((o) => {
-      if (o.batchId) return;                       // 成批的已按整批计入，不重复
+      if (o.batchId) return;                       // 成批的已按成员明细计入，不重复
       const d = parseDate(o.date);
       if (!d || d < startD || d >= endD) return;
       const cents = toCents(o.fee);
@@ -291,15 +328,17 @@
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
     // 订单状态：垫付占比小环形 + 三态行
+    // 环形图 + 状态行都按 statusKeys（现役两态 + 数据里真有的遗留态），
+    // 这样各块垫付之和恒等于分母「垫付合计」，占比加起来正好 100%
     const stColors = { "在途": "#7d8fa1", "已回款": "#14b8a6", "自留": "#c0724f" };
-    const donutItems = STATUSES.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
+    const donutItems = s.statusKeys.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
     $("#statusDonut").innerHTML = s.totalCost > 0
       ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
       : `<div class="empty-mini">暂无垫付</div>`;
-    $("#statusList").innerHTML = STATUSES.map((st) => {
+    $("#statusList").innerHTML = s.statusKeys.map((st) => {
       const b = s.byStatus[st];
       return `<div class="status-row">
-        <span class="status-tag ${STATUS_CLASS[st]}">${st}</span>
+        <span class="status-tag ${STATUS_CLASS[st]}">${escapeHtml(statusLabel(st))}</span>
         <span class="status-nums"><em>${b.count} 单</em><i>${money(b.cost)}</i></span>
       </div>`;
     }).join("");
@@ -328,7 +367,8 @@
   }
 
   function renderList() {
-    const chips = ["在途", "全部", "已回款", "自留"];
+    // v21 起没有「自留」筛选（那个状态不能再新建）；旧自留单在「全部」里看得到、可手动删除
+    const chips = ["在途", "全部", "已回款"];
     $("#filterChips").innerHTML = chips.map((c) => {
       const n = c === "全部" ? data.orders.length
         : data.orders.filter((o) => o.status === c).length;
@@ -357,15 +397,21 @@
     blocks.forEach((b) => {
       const g = b.id ? groups.get(b.id) : null;
       const grouped = g && g.count > 1;      // 只剩一单的批次不再撑表头，免得「一起寄出 · 1 单」
+      const solo = !!g && g.count === 1;     // 单成员批次：没表头，卡片上补一句它的批次归属
       if (grouped) parts.push(batchHeadHtml(g, orders));
-      b.orders.forEach((o) => parts.push(orderCardHtml(o, grouped ? "in-batch" : "")));
+      b.orders.forEach((o) => parts.push(orderCardHtml(o, grouped ? "in-batch" : "", solo)));
     });
     $("#orderList").innerHTML = parts.join("");
   }
 
   // 整批口径 vs 成员明细：结算那一刻两者本来就相等（邮费按分摊落到各单、回款按分摊写到各单），
-  // 之后手工改某单邮费、或单给某单回款就会分叉。只对表头真显示出来的那两项对账，只报数不动钱
-  function batchDrift(g, members) {
+  // 之后手工改某单邮费、或单给某单回款就会分叉。只对表头真显示出来的那两项对账，只报数不动钱。
+  // 但「有人退出本批」必然合不上（退出那单把分摊到它头上的那份带走了），那是预期内的：
+  // 据 batchCount（结算时的成员数）分开措辞——退出是陈述，金额分叉才是告警。
+  function batchDrift(g, members, batchCount) {
+    if (batchCount > 0 && members.length < batchCount) {
+      return { warn: false, text: `已有 ${batchCount - members.length} 单退出本批，整批口径仍含它们` };
+    }
     const diff = [];
     if (g.feeCents > 0) {
       const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
@@ -375,18 +421,20 @@
       const incSum = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
       if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
     }
-    return diff.length === 0 ? "" : `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同`;
+    return diff.length === 0 ? null
+      : { warn: true, text: `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同` };
   }
 
   function batchHeadHtml(g, visible) {
     const shownCount = visible.filter((o) => o.batchId === g.id).length;
     const members = data.orders.filter((o) => o.batchId === g.id);
+    // 结算时的成员数冗余在每张单上（取最大，容忍半截写入的旧数据）；老数据没有这个字段就是 0
+    const batchCount = members.reduce((a, o) => Math.max(a, Math.round(numberValue(o.batchCount))), 0);
     const bits = [`垫付 ${money(g.costCents / 100)}`];
     if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
     if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
     if (g.pending > 0) bits.push(`${g.pending} 单在途`);
-    if (g.selfKeep > 0) bits.push(`含 ${g.selfKeep} 单自留`);
-    const drift = batchDrift(g, members);
+    const drift = batchDrift(g, members, batchCount);
     return `<div class="batch-head">
       <div class="bh-top">
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
@@ -394,11 +442,13 @@
       </div>
       <div class="bh-meta">整批：${bits.join(" · ")}</div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
-      ${drift ? `<div class="bh-note warn">${drift}</div>` : ""}
+      ${drift ? `<div class="bh-note${drift.warn ? " warn" : ""}">${drift.text}</div>` : ""}
     </div>`;
   }
 
-  function orderCardHtml(o, extraClass) {
+  // soloBatch：这一单的批次只剩它自己（页面上不显示「一起寄出」表头），卡片里补一句归属，
+  // 免得「退出本批」这个按钮看起来没有来由
+  function orderCardHtml(o, extraClass, soloBatch) {
     const settled = isSettled(o);
     const profit = orderProfit(o);
     const showProfit = o.income !== null || settled;
@@ -411,9 +461,9 @@
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
-        <span class="status-tag ${STATUS_CLASS[o.status]}">${o.status}</span>
+        <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
       </div>
-      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}</div>
+      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
       <div class="order-money">
         <span>垫付 <b>${money(o.cost)}</b></span>
         <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
@@ -641,6 +691,10 @@
       const nums = [`${b.count} 单`, `邮费 ${money(b.feeCents / 100)}`];
       if (b.incomeCents > 0) nums.push(`回款 ${money(b.incomeCents / 100)}`);
       if (b.pending > 0) nums.push(`${b.pending} 单在途`);
+      // 明细合计与用户录入的整批数字不同时（有人退出、成员入批前自带邮费、手工改过）点一句，
+      // 免得对照账本页表头的「整批：…」以为算错了；统计值永远是成员明细那一列
+      if (b.entryFeeCents > 0 && b.entryFeeCents !== b.feeCents) nums.push(`整批录入 邮费 ${money(b.entryFeeCents / 100)}`);
+      if (b.entryIncomeCents > 0 && b.entryIncomeCents !== b.incomeCents) nums.push(`整批录入 回款 ${money(b.entryIncomeCents / 100)}`);
       return `<div class="fee-row">
         <div class="fee-line">
           <span class="fee-name">一起寄 · ${escapeHtml(b.date)}</span>
@@ -711,7 +765,11 @@
     f.date.value = order ? order.date : todayStr();     // 预填/新建一律用今天
     f.channel.value = src ? (src.channel || "收货商") : "收货商";
     f.fee.value = src ? (src.fee || "") : "";
-    f.status.value = order ? order.status : "在途";      // 预填固定在途
+    // 状态下拉：现役两态；编辑遗留「自留」单时把该单自己的旧状态补进去（只读项），
+    // 否则下拉会因没有匹配项而回空、保存时把状态静默改写掉——v21 的红线就是不许改写旧状态
+    const statusOpts = STATUSES.slice();
+    if (order && !statusOpts.includes(order.status)) statusOpts.push(order.status);
+    fillSelect(f.status, statusOpts.map((s) => [s, statusLabel(s)]), order ? order.status : "在途");
     f.note.value = src ? src.note : "";
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
     $("#formMore").open = !!(order && order.status !== "在途");
@@ -751,6 +809,7 @@
       batchDate: existing ? existing.batchDate : "",
       batchFee: existing ? existing.batchFee : 0,
       batchIncome: existing ? existing.batchIncome : 0,
+      batchCount: existing ? existing.batchCount : 0,
       note: String(f.note.value || "").trim(),
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
@@ -837,8 +896,11 @@
       : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款照旧记在它们身上）。`}`;
     if (!confirm(`「${o.name}」退出「${title}」这一批？\n${tail}\n`
       + `已经分摊到它头上的邮费 ${money(o.fee)}${o.income === null ? "" : "、回款 " + money(o.income)} 不改动，留在这一单上继续算利润。`)) return;
+    // 退出者（以及「只剩它自己」时一并退出那一单）清空全部批次字段；留着的成员**不动 batchCount**——
+    // 它记的是「结算那一刻有几个人」，正是表头区分「有人退出」与「金额被改过」的依据。
+    // 剩下的人之后若原班人马再结一次，batchCount 会被重写成当时的人数，提示随之消失。
     [o, ...(others.length === 1 ? others : [])].forEach((x) => {
-      x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0;
+      x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0; x.batchCount = 0;
     });
     saveData();
     toast(others.length === 1 ? "已退出，那一批也解散了" : "已退出本批，这一单变成单寄");
@@ -966,6 +1028,8 @@
       o.batchDate = batchDate;
       o.batchFee = batchFeeCents / 100;
       o.batchIncome = batchIncomeCents / 100;
+      // 本次结算时的成员数：之后有人「退出本批」就靠它区分「退出」（预期内）与「金额被改过」
+      o.batchCount = orders.length;
     });
 
     // 回款：直接赋值；总回款为 0/空 → 只分摊邮费，状态保持「在途」
@@ -1127,11 +1191,10 @@
       `<option value="${escapeHtml(o[0])}" ${o[0] === def ? "selected" : ""}>${escapeHtml(o[1])}</option>`).join("");
   }
 
+  // 只填渠道：状态下拉由 openForm 每次按「现役两态 +（编辑遗留单时）该单的旧状态」重建
   function populateSelects() {
     fillSelect(document.querySelector("#orderForm [name=channel]"),
       CHANNELS.map((c) => [c, c]), "收货商");
-    fillSelect(document.querySelector("#orderForm [name=status]"),
-      STATUSES.map((s) => [s, s]), "在途");
   }
 
   // ---- 事件绑定 ----
