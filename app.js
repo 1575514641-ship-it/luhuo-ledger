@@ -127,6 +127,14 @@
     return LEGACY_STATUSES.includes(status) ? status + "（旧）" : status;
   }
 
+  // 金额字段的**负值收敛**（v22）：cost / fee / batchFee / batchIncome 只在 < 0 时收敛为 0，
+  // 其它一律不碰（0 与正数原样保留、小数保持两位以内原值）。
+  // 为什么必须收敛：表单本来就拦负数（min="0"），能带进负数的只有**导入 JSON / 云端拉取**两条路，
+  // 而负的 fee 会让两处自相矛盾——报表「本期邮费合计」只累加 > 0 的 fee（显示 ¥0），
+  // 卡片上却照原样显示「邮费 −¥3」。收敛后全应用只有一个口径。
+  // 注意：income 不在此列（负数回款在各处口径一致，没有这种自相矛盾），故不动。
+  function nonNegative(v) { const n = numberValue(v); return n < 0 ? 0 : n; }
+
   function normalizeData(source) {
     const out = { version: 1, orders: [] };
     const orders = source && Array.isArray(source.orders) ? source.orders : [];
@@ -138,19 +146,19 @@
         name: String(o.name || "").slice(0, 120),
         platform: String(o.platform || ""),
         qty: Math.max(1, Math.round(numberValue(o.qty)) || 1),
-        cost: numberValue(o.cost),
+        cost: nonNegative(o.cost),
         pay: String(o.pay || ""),          // 已废弃字段，留着兼容旧数据
         channel: String(o.channel || ""),
         income: o.income === null || o.income === undefined || o.income === "" ? null : numberValue(o.income),
         incomeDate: o.incomeDate ? String(o.incomeDate) : null,
         status: migrateStatus(o.status),
-        fee: numberValue(o.fee),
+        fee: nonNegative(o.fee),
         // 批次（一起寄出的那一批）：id 为空 = 没成批的单寄单；后四个是整批口径，
         // 冗余存在每张单上，删单不会留下孤儿批次记录
         batchId: String(o.batchId || ""),
         batchDate: o.batchDate ? String(o.batchDate) : "",
-        batchFee: numberValue(o.batchFee),
-        batchIncome: numberValue(o.batchIncome),
+        batchFee: nonNegative(o.batchFee),
+        batchIncome: nonNegative(o.batchIncome),
         // batchCount = 结算那一刻这一批的成员数；有人退出本批后不再改写它，
         // 表头据此区分「有人退出」（预期内）与「金额被改过」（真漂移）。老数据没有 → 0
         batchCount: Math.max(0, Math.round(numberValue(o.batchCount))),
@@ -406,11 +414,18 @@
 
   // 整批口径 vs 成员明细：结算那一刻两者本来就相等（邮费按分摊落到各单、回款按分摊写到各单），
   // 之后手工改某单邮费、或单给某单回款就会分叉。只对表头真显示出来的那两项对账，只报数不动钱。
-  // 但「有人退出本批」必然合不上（退出那单把分摊到它头上的那份带走了），那是预期内的：
-  // 据 batchCount（结算时的成员数）分开措辞——退出是陈述，金额分叉才是告警。
+  // v22 修的两件事：
+  //   ① 金额对账**永远要跑**。v21 在「当前成员数 < batchCount」时直接 return 陈述句、跳过对账——
+  //      于是 3 单同批（整批邮费 ¥12）删掉一单后再把另一单邮费改成 ¥99（整批 12 vs 明细 103，
+  //      差 91 元）时，表头只剩那句陈述、不再告警：专门抓静默漂移的机制自己静默失效了。
+  //      现在两条腿各走各的、结论并存：有人退出（陈述，非告警）＋ 金额合不上（告警）。
+  //   ② 措辞中性化：batchCount 只记得到人数，分不出「退出本批」与「删除该单」，
+  //      所以陈述句说「不在其中（退出或删除）」而不是断言「退出本批」。
+  // 返回一个数组（0/1/2 条），warn=true 的那条用红棕色显示。
   function batchDrift(g, members, batchCount) {
+    const notes = [];
     if (batchCount > 0 && members.length < batchCount) {
-      return { warn: false, text: `已有 ${batchCount - members.length} 单退出本批，整批口径仍含它们` };
+      notes.push({ warn: false, text: `本批已有 ${batchCount - members.length} 单不在其中（退出或删除），整批口径仍含它们` });
     }
     const diff = [];
     if (g.feeCents > 0) {
@@ -421,8 +436,10 @@
       const incSum = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
       if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
     }
-    return diff.length === 0 ? null
-      : { warn: true, text: `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同` };
+    if (diff.length > 0) {
+      notes.push({ warn: true, text: `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同` });
+    }
+    return notes;
   }
 
   function batchHeadHtml(g, visible) {
@@ -442,7 +459,7 @@
       </div>
       <div class="bh-meta">整批：${bits.join(" · ")}</div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
-      ${drift ? `<div class="bh-note${drift.warn ? " warn" : ""}">${drift.text}</div>` : ""}
+      ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
     </div>`;
   }
 

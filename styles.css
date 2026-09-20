@@ -415,7 +415,11 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   display: inline-block; width: 8px; height: 8px; border-radius: 50%;
   margin-right: 3px; vertical-align: -1px;
 }
-#chartFlow svg, #chartProfit svg { display: block; }
+/* 手写 SVG 图：默认 overflow:hidden 会把贴着画布边缘的刻度文字与数据点裁掉
+   （年视图首尾那两颗 r=2.6 的圆点、以及「4月/9月」这类边缘标签各被切掉约 2px，v22 由横向裁切探测发现）。
+   画布外的这一点点（≤3px）落在 .card 的内边距里，放开裁切即可，观感不变。
+   注意看板页的走势图容器是 #dashFlow、报表页是 #chartFlow，两张图用的是同一个渲染函数。 */
+#chartFlow svg, #chartProfit svg, #dashFlow svg { display: block; overflow: visible; }
 
 .donut-wrap { display: flex; align-items: center; gap: 16px; }
 .donut-wrap svg { flex: 0 0 auto; }
@@ -443,6 +447,12 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .fee-names { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.5; word-break: break-word; }
 
 .prod-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* 商品榜每行＝「名字/单数/利润」一行 + 下面一条满宽比例条。
+   注意 .prod-row 在共享规则里是 display:flex（和 .status-row/.month-row 写在一起），
+   那样 .prod-bar-track 就成了同一行的 flex 项、被内容挤成 1–3px 宽——比例条等于没画
+   （v22 由横向裁切探测发现：track 3px、bar 3px，5 行全一样）。这里改回 block，
+   比例条回到行下方、占满整行宽度。 */
+.prod-row { display: block; padding: 8px 0; border-top: 1px solid var(--line); }
 .prod-name { font-weight: 500; }
 .pending-tag {
   font-style: normal; font-size: 10px; color: var(--warn); background: var(--warn-soft);
@@ -452,7 +462,6 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .prod-nums b { font-size: 13px; margin-left: 4px; }
 .prod-nums b.pos { color: var(--accent); }
 .prod-nums b.neg { color: var(--neg); }
-.prod-row { padding: 8px 0; border-top: 1px solid var(--line); }
 .prod-row:first-child { border-top: 0; }
 .prod-bar-track {
   height: 6px; background: var(--bg); border-radius: 99px; overflow: hidden;
