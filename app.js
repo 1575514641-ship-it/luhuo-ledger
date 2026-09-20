@@ -10,6 +10,7 @@
 
   const STATUSES = ["在途", "已回款", "自留"];
   const SETTLED = ["已回款", "自留"];
+  const FILTERS = ["在途", "全部", "已回款", "自留"];   // 账本页筛选；「全部」也要能记住
   const CHANNELS = ["收货商", "闲鱼", "转转", "朋友", "自用"];
   const STATUS_CLASS = { "在途": "st-out", "已回款": "st-done", "自留": "st-loss" };
 
@@ -110,7 +111,7 @@
   // 旧状态（待发货/待寄出/已寄出/退货中/翻车自留）→ 新三态
   function migrateStatus(status) {
     if (status === "已回款") return "已回款";
-    if (status === "翻车自留") return "自留";
+    if (status === "自留" || status === "翻车自留") return "自留";   // 「自留」是三态之一，别再被当成旧状态打回在途
     return "在途";
   }
 
@@ -151,7 +152,7 @@
       if (raw) data = normalizeData(raw);
       const rawMeta = JSON.parse(localStorage.getItem(META_KEY) || "null");
       if (rawMeta) meta = Object.assign(meta, rawMeta);
-      if (!STATUSES.includes(meta.filter)) meta.filter = "在途";
+      if (!FILTERS.includes(meta.filter)) meta.filter = "在途";
       currentFilter = meta.filter;
     } catch { /* 损坏则从空账本开始 */ }
   }
@@ -212,7 +213,7 @@
         g = {
           id: o.batchId, date: o.batchDate || o.date,
           feeCents: 0, incomeCents: 0, costCents: 0,
-          count: 0, pending: 0, names: [],
+          count: 0, pending: 0, selfKeep: 0, names: [],
         };
         map.set(o.batchId, g);
       }
@@ -220,6 +221,7 @@
       g.costCents += toCents(o.cost);
       g.names.push(o.name || "未命名");
       if (!isSettled(o)) g.pending += 1;
+      if (o.status === "自留") g.selfKeep += 1;
       // 整批口径同值冗余，取最大可容忍半截写入的旧数据
       g.feeCents = Math.max(g.feeCents, toCents(o.batchFee));
       g.incomeCents = Math.max(g.incomeCents, toCents(o.batchIncome));
@@ -281,6 +283,10 @@
     profitEl.textContent = money(s.settledProfit);
     profitEl.className = "kpi-value " + (s.settledProfit > 0 ? "pos" : s.settledProfit < 0 ? "neg" : "");
     $("#kpiMonthCost").textContent = money(s.monthCost);
+    // 本月邮费：归期同报表页（整批按批次日期、单寄按下单日期），挂在「本月垫出」下面当补充口径
+    const cmParts = currentMonth().split("-").map(Number);
+    const monthFee = reportFeeStats(new Date(cmParts[0], cmParts[1] - 1, 1), new Date(cmParts[0], cmParts[1], 1));
+    $("#kpiMonthFee").textContent = `另有邮费 ${money(monthFee.totalCents / 100)}`;
     $("#kpiMonthIncome").textContent = money(s.monthIncome);
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
@@ -334,34 +340,61 @@
       $("#orderList").innerHTML = `<div class="empty">没有${currentFilter === "全部" ? "" : "「" + currentFilter + "」的"}单子<br><small>点右下角「记一单」开始</small></div>`;
       return;
     }
-    // 同批一起寄出的单子并成一组：先出批次表头（整批口径），后面跟成员卡片
+    // 同批的单子收成一块：成员各自的下单日期可能夹着别的单，但显示上必须挨在一起，
+    // 否则散单会插进批次表头和成员之间、看起来像这一批的。块按下单日期倒序定位（也就是原来表头的位置）
     const groups = batchGroups();
-    const headShown = new Set();
-    const parts = [];
+    const blocks = [];
+    const blockOf = new Map();
     orders.forEach((o) => {
-      const g = o.batchId ? groups.get(o.batchId) : null;
-      if (g && !headShown.has(g.id)) {
-        headShown.add(g.id);
-        parts.push(batchHeadHtml(g, orders));
-      }
-      parts.push(orderCardHtml(o, g ? "in-batch" : ""));
+      if (!o.batchId) { blocks.push({ id: "", date: o.date, orders: [o] }); return; }
+      let b = blockOf.get(o.batchId);
+      if (!b) { b = { id: o.batchId, date: o.date, orders: [] }; blockOf.set(o.batchId, b); blocks.push(b); }
+      b.orders.push(o);
+      if (o.date > b.date) b.date = o.date;
+    });
+    blocks.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
+    const parts = [];
+    blocks.forEach((b) => {
+      const g = b.id ? groups.get(b.id) : null;
+      const grouped = g && g.count > 1;      // 只剩一单的批次不再撑表头，免得「一起寄出 · 1 单」
+      if (grouped) parts.push(batchHeadHtml(g, orders));
+      b.orders.forEach((o) => parts.push(orderCardHtml(o, grouped ? "in-batch" : "")));
     });
     $("#orderList").innerHTML = parts.join("");
   }
 
+  // 整批口径 vs 成员明细：结算那一刻两者本来就相等（邮费按分摊落到各单、回款按分摊写到各单），
+  // 之后手工改某单邮费、或单给某单回款就会分叉。只对表头真显示出来的那两项对账，只报数不动钱
+  function batchDrift(g, members) {
+    const diff = [];
+    if (g.feeCents > 0) {
+      const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
+      if (feeSum !== g.feeCents) diff.push(`邮费 ${money(feeSum / 100)}`);
+    }
+    if (g.incomeCents > 0) {
+      const incSum = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
+      if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
+    }
+    return diff.length === 0 ? "" : `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同`;
+  }
+
   function batchHeadHtml(g, visible) {
     const shownCount = visible.filter((o) => o.batchId === g.id).length;
+    const members = data.orders.filter((o) => o.batchId === g.id);
     const bits = [`垫付 ${money(g.costCents / 100)}`];
     if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
     if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
     if (g.pending > 0) bits.push(`${g.pending} 单在途`);
-    if (shownCount < g.count) bits.push(`本页显示 ${shownCount} 单`);
+    if (g.selfKeep > 0) bits.push(`含 ${g.selfKeep} 单自留`);
+    const drift = batchDrift(g, members);
     return `<div class="batch-head">
       <div class="bh-top">
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
         <span class="bh-count">${g.count} 单</span>
       </div>
-      <div class="bh-meta">${bits.join(" · ")}</div>
+      <div class="bh-meta">整批：${bits.join(" · ")}</div>
+      ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
+      ${drift ? `<div class="bh-note warn">${drift}</div>` : ""}
     </div>`;
   }
 
@@ -373,6 +406,7 @@
     if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
     actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
     actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
+    if (o.batchId) actions.push(`<button class="act" data-act="unbatch" data-id="${o.id}">退出本批</button>`);
     actions.push(`<button class="act danger" data-act="del" data-id="${o.id}">删除</button>`);
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
@@ -779,10 +813,35 @@
   function deleteOrder(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
-    if (!confirm(`删除「${o.name}」这一单？\n删除后无法恢复（云端也会删）。`)) return;
+    const mates = o.batchId ? data.orders.filter((x) => x.batchId === o.batchId) : [];
+    const n = mates.length;
+    const batchLine = n > 1
+      ? `它属于一起寄出的 ${n} 单之一，删掉后该批还剩 ${n - 1} 单${n - 1 === 1 ? "（只剩它自己，「一起寄出」那一栏就没了）" : ""}。\n整批邮费/回款照旧记在剩下的单子上。\n`
+      : n === 1 ? "它是「一起寄出」那批的最后一单，删掉这一批就没了。\n" : "";
+    if (!confirm(`删除「${o.name}」这一单？\n${batchLine}删除后无法恢复（云端也会删）。`)) return;
     data.orders = data.orders.filter((x) => x.id !== id);
     saveData();
     toast("已删除");
+  }
+
+  // 退出本批：结错批时的救回口子。只解开这一单的批次归属、不动钱——
+  // 整批分摊到它头上的邮费/回款留在它自己的 fee/income 里，照旧算利润
+  function leaveBatch(id) {
+    const o = data.orders.find((x) => x.id === id);
+    if (!o || !o.batchId) return;
+    const mates = data.orders.filter((x) => x.batchId === o.batchId);
+    const others = mates.filter((x) => x.id !== id);
+    const title = `一起寄出 · ${o.batchDate || o.date}`;
+    const tail = others.length === 0
+      ? "它本来就是这一批里唯一的一单，退出后这一批就没了。"
+      : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款照旧记在它们身上）。`}`;
+    if (!confirm(`「${o.name}」退出「${title}」这一批？\n${tail}\n`
+      + `已经分摊到它头上的邮费 ${money(o.fee)}${o.income === null ? "" : "、回款 " + money(o.income)} 不改动，留在这一单上继续算利润。`)) return;
+    [o, ...(others.length === 1 ? others : [])].forEach((x) => {
+      x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0;
+    });
+    saveData();
+    toast(others.length === 1 ? "已退出，那一批也解散了" : "已退出本批，这一单变成单寄");
   }
 
   // ---- 批量结算（整批寄出 / 对方一笔总回款，按垫付占比分摊）----
@@ -1097,6 +1156,7 @@
       if (act === "pay") openPayForm(id);
       else if (act === "dup") duplicateOrder(id);
       else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
+      else if (act === "unbatch") leaveBatch(id);
       else if (act === "del") deleteOrder(id);
     });
 
