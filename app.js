@@ -1,4 +1,4 @@
-// 撸货记账 · 主逻辑（v25）
+// 撸货记账 · 主逻辑（v26）
 // 状态只有两个：在途（垫了钱还没结清）/ 已回款；旧的「自留」单保留原样只读显示，不再能新建。
 // 数据模型：单 JSON blob（orders 数组），经 sync.js 云同步（同设备组共用一个同步码）。
 // v23：整批邮费/回款**可改可删**。每单多记 batchFeeShare/batchIncomeShare（本次真正摊到它头上的分额），
@@ -25,6 +25,17 @@
 //      于是这笔钱天然并进现有的总收入/净利润，报表不需要任何分块、列或图例。
 //      编辑既有记录一律按货单形态回显（垫付/邮费/数量/状态照常显示，值就是 0/0/1/已回款），
 //      编辑表单不给类型切换；「0 元购」确认只服务货单（正反两个方向都保住）。
+// v26：补两处小改动，都是一次定点修正——
+//      ① **已回款的单也能改回款金额**（真实能力缺口）：卡片上的「回款」按钮以前只在未结算时渲染，
+//         一旦「已回款」就没有任何入口能改金额/日期，只能删了重记；v25 的收入单天生已回款，
+//         对这个缺口 100% 命中。改法＝复用同一个 #payModal：已回款的单把按钮显示为「改回款」
+//         （同一个 data-act、位置与样式一字不动），打开时预填它现在记着的 income/incomeDate，
+//         提交只写回这两个字段（状态保持已回款、不产生第二条记录、不动 cost/fee/qty/批次字段）。
+//         旧「自留（旧）」单不给这个入口（不是回款语义，保持原样只读）。
+//         批内单改回款后表头会如实提示「≠ 成员明细合计」——**预期**，批次口径属于另一个入口。
+//      ② 「垫付金额为 0」的确认框改成中性措辞（同时覆盖白嫖单与纯收入单）：v25 起**编辑一条
+//         纯收入单**也必然走到它（编辑一律按货单路径、垫付恒为 0），老文案在那条路上读不通。
+//         刻意保留这次点击、只改措辞——为了免掉它去判「是不是收入单」正是 v25 定为禁止的脆弱代码。
 (function () {
   "use strict";
 
@@ -57,6 +68,9 @@
   let nameAuto = false;
   let channelTouched = false;
   let payTargetId = null;
+  // v26：这一次打开 #payModal 是「回款」（在途单 → 写金额+日期并置已回款）还是「改回款」
+  // （已回款的单 → 只改 income/incomeDate）。由 openPayForm 按记录当前 status 决定，closePayForm 复位。
+  let payEditMode = false;
   let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
   let currentFilter = "在途";
 
@@ -538,7 +552,14 @@
     const profit = orderProfit(o);
     const showProfit = o.income !== null || settled;
     const actions = [];
+    // v26：已回款的单也要能改回款金额——那个按钮以前只在未结算时渲染，一旦「已回款」，
+    // 回款金额与回款日期就**没有任何入口**可改，只能删了重记；v25 的收入单天生就是已回款，
+    // 对这类记录这个缺口 100% 命中。这里只是把同一个按钮在已回款的单上换个文案（同一个 data-act，
+    // 走同一个 #payModal），位置/样式一字不动。
+    // 旧「自留（旧）」单不给这个入口：它不是「回款」语义（那笔钱已经落地、只是没走回款流程），
+    // 保持原样只读——**只有真的已回款**才认。
     if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
+    else if (o.status === "已回款") actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">改回款</button>`);
     actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
     actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
     if (o.batchId) {
@@ -978,8 +999,12 @@
 
     const cost = numberValue(f.cost.value);
     if (cost < 0) { toast("垫付金额不能是负数"); return; }
-    // 0 元购确认只服务货单；收入单天然 cost=0，绝不能走到这里来
-    if (cost === 0 && !confirm("垫付金额为 0？确认这是 0 元购/白嫖的单子吗？")) return;
+    // 垫付 0 的确认框（v26 起文案同时覆盖两种情形）：它服务货单的「0 元购/白嫖」，也是
+    // **编辑一条纯收入单**时必然走到的那一格（编辑一律按货单路径回显、垫付恒为 0），
+    // 老文案「确认这是 0 元购/白嫖的单子吗？」在后一条路上读起来不通，所以改成中性措辞。
+    // 刻意**不做**「这条是不是收入单」的判断：任何靠 cost===0 / 字段缺省去识别的写法都会把
+    // 「垫付 0 的已回款老货单」误判成收入单（v25 已定为禁止项），这次点击原样保留。
+    if (cost === 0 && !confirm("这一单垫付金额为 0（白嫖单或纯收入单），确认保存吗？")) return;
     const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
     const order = {
       id: existing ? existing.id : uid(),
@@ -1027,10 +1052,17 @@
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
     payTargetId = id;
+    // v26：「已回款的单」从这里进来是**改回款**——预填它现在记着的金额与回款日期（而不是
+    // 「垫付价 + 今天」），提交时也只写回这两个字段（见 submitPay）。判据就是这一条记录自己的
+    // status，与「它是不是收入单」无关（收入单不落任何类型字段，也不许去猜）。
+    payEditMode = o.status === "已回款";
     const f = $("#payForm");
-    f.income.value = o.cost || "";
-    f.incomeDate.value = todayStr();
-    $("#payTitle").textContent = `回款 · ${o.name}`;
+    // 已回款却没有回款金额的老单（状态是用户在编辑表单里手选成「已回款」的）：填 0 而不是留空，
+    // 「留空」会被那个 required 框拦下，点确认像卡住（v24 记过的坑）。0 也正是它在利润口径里的值。
+    const curIncome = o.income === null || o.income === undefined ? 0 : o.income;
+    f.income.value = payEditMode ? curIncome : (o.cost || "");
+    f.incomeDate.value = payEditMode ? (o.incomeDate || todayStr()) : todayStr();
+    $("#payTitle").textContent = `${payEditMode ? "改回款" : "回款"} · ${o.name}`;
     updatePayPreview();
     $("#payModal").classList.add("show");
     setTimeout(() => f.income.focus(), 120);
@@ -1039,6 +1071,7 @@
   function closePayForm() {
     $("#payModal").classList.remove("show");
     payTargetId = null;
+    payEditMode = false;
   }
 
   function updatePayPreview() {
@@ -1047,7 +1080,7 @@
     const income = numberValue($("#payForm").income.value);
     const profit = income - o.cost - o.fee;
     $("#payPreview").innerHTML = `利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${profit >= 0 ? "+" : ""}${money(profit)}</b>（垫付 ${money(o.cost)}${o.fee ? "＋邮费 " + money(o.fee) : ""}）`;
-    $("#paySubmit").textContent = `确认回款 ${money(income)}`;
+    $("#paySubmit").textContent = `${payEditMode ? "确认改回款" : "确认回款"} ${money(income)}`;
   }
 
   function submitPay(ev) {
@@ -1056,12 +1089,18 @@
     const o = data.orders.find((x) => x.id === payTargetId);
     if (!o) return closePayForm();
     const income = numberValue(f.income.value);
+    // v26：改回款 = 只改这一条记录自己的 income 与 incomeDate 两个字段，
+    // 状态保持「已回款」（**不产生第二条记录**、不动 cost/fee/qty/批次字段/其它任何一格）。
+    // 批内单改回款后批次表头会如实提示「≠ 成员明细合计」——那是预期的：批次口径属于另一个入口
+    // （「改本批邮费/回款」），这里绝不顺手去改它。
+    // 「回款」（未结算单）仍是老行为：写上金额与日期并置为已回款。
+    const wasEdit = payEditMode && o.status === "已回款";
     o.income = income;
     o.incomeDate = f.incomeDate.value || todayStr();
-    o.status = "已回款";
+    if (!wasEdit) o.status = "已回款";
     closePayForm();
     saveData();
-    toast(`已回款 ${money(income)}，利润 ${money(orderProfit(o))}`);
+    toast(wasEdit ? `已改回款 ${money(income)}，利润 ${money(orderProfit(o))}` : `已回款 ${money(income)}，利润 ${money(orderProfit(o))}`);
   }
 
   // v24：表单里的「清空」小动作（记单/编辑的邮费栏、回款弹窗的回款金额栏）。
