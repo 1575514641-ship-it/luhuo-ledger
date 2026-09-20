@@ -4,7 +4,7 @@
 同步协议与「五行理财」（www0706.netlify.app）完全同源：复用其 Cloudflare Worker 存储，
 按独立身份隔离，撸货账本和理财数据互不可见。
 
-## 现役网址（2026-09-19 已上线）
+## 现役网址（2026-09-19 上线，当前 v27）
 
 **https://1575514641-ship-it.github.io/luhuo-ledger/**
 
