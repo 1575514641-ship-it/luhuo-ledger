@@ -792,15 +792,20 @@
     const pending = data.orders.filter((o) => o.status === "在途");
     if (pending.length === 0) { toast("没有在途单可结算"); return; }
     const groups = batchGroups();
-    // 同批次的单排在一起：成批的按批次日期倒序在前（先摊了邮费的那批最好找），没成批的殿后
+    // 同批次的单排在一起、批次日期新的在前（先摊了邮费的那批最好找），没成批的殿后
     const rank = new Map();
     pending.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((o) => {
-      if (o.batchId && !rank.has(o.batchId)) rank.set(o.batchId, rank.size);
+      if (!o.batchId || rank.has(o.batchId)) return;
+      const g = groups.get(o.batchId);
+      rank.set(o.batchId, g ? g.date : "");
     });
     pending.sort((a, b) => {
-      const ra = a.batchId && rank.has(a.batchId) ? rank.get(a.batchId) : 9999;
-      const rb = b.batchId && rank.has(b.batchId) ? rank.get(b.batchId) : 9999;
-      if (ra !== rb) return ra - rb;
+      const ra = a.batchId ? rank.get(a.batchId) : undefined;
+      const rb = b.batchId ? rank.get(b.batchId) : undefined;
+      if (ra === undefined && rb === undefined) return a.date < b.date ? 1 : -1;
+      if (ra === undefined) return 1;
+      if (rb === undefined) return -1;
+      if (ra !== rb) return ra < rb ? 1 : -1;
       return a.date < b.date ? 1 : -1;
     });
     batchItems = pending.map((o) => ({
