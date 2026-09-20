@@ -132,6 +132,12 @@
         incomeDate: o.incomeDate ? String(o.incomeDate) : null,
         status: migrateStatus(o.status),
         fee: numberValue(o.fee),
+        // 批次（一起寄出的那一批）：id 为空 = 没成批的单寄单；后三个是整批口径，
+        // 冗余存在每张单上，删单不会留下孤儿批次记录
+        batchId: String(o.batchId || ""),
+        batchDate: o.batchDate ? String(o.batchDate) : "",
+        batchFee: numberValue(o.batchFee),
+        batchIncome: numberValue(o.batchIncome),
         note: String(o.note || "").slice(0, 300),
         createdAt: String(o.createdAt || new Date().toISOString()),
       });
@@ -192,6 +198,61 @@
       months.push({ month: key, cost: row.cost, income: row.income, diff: row.income - row.cost });
     }
     return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, byStatus, months, count: orders.length };
+  }
+
+  // ---- 批次（一起寄出的一批单子）----
+  // 一批一起寄出的单子共用一个 batchId，整批邮费/回款冗余存在每张单上：
+  // 删单不会留下孤儿批次，也不需要额外维护一张批次表。
+  function batchGroups() {
+    const map = new Map();
+    data.orders.forEach((o) => {
+      if (!o.batchId) return;
+      let g = map.get(o.batchId);
+      if (!g) {
+        g = {
+          id: o.batchId, date: o.batchDate || o.date,
+          feeCents: 0, incomeCents: 0, costCents: 0,
+          count: 0, pending: 0, names: [],
+        };
+        map.set(o.batchId, g);
+      }
+      g.count += 1;
+      g.costCents += toCents(o.cost);
+      g.names.push(o.name || "未命名");
+      if (!isSettled(o)) g.pending += 1;
+      // 整批口径同值冗余，取最大可容忍半截写入的旧数据
+      g.feeCents = Math.max(g.feeCents, toCents(o.batchFee));
+      g.incomeCents = Math.max(g.incomeCents, toCents(o.batchIncome));
+    });
+    return map;
+  }
+
+  // 邮费归期：整批寄的按批次日期，单寄的按下单日期
+  function reportFeeStats(startD, endD) {
+    const batches = [];
+    let totalCents = 0;
+    batchGroups().forEach((g) => {
+      const d = parseDate(g.date);
+      if (!d || d < startD || d >= endD || g.feeCents <= 0) return;
+      batches.push(g);
+      totalCents += g.feeCents;
+    });
+    batches.sort((a, b) => (a.date < b.date ? 1 : -1));
+
+    let looseCents = 0, looseCount = 0;
+    const looseNames = [];
+    data.orders.forEach((o) => {
+      if (o.batchId) return;                       // 成批的已按整批计入，不重复
+      const d = parseDate(o.date);
+      if (!d || d < startD || d >= endD) return;
+      const cents = toCents(o.fee);
+      if (cents <= 0) return;
+      looseCents += cents;
+      looseCount += 1;
+      looseNames.push(o.name || "未命名");
+    });
+    totalCents += looseCents;
+    return { totalCents, batches, looseCents, looseCount, looseNames };
   }
 
   // ---- 渲染 ----
@@ -273,30 +334,61 @@
       $("#orderList").innerHTML = `<div class="empty">没有${currentFilter === "全部" ? "" : "「" + currentFilter + "」的"}单子<br><small>点右下角「记一单」开始</small></div>`;
       return;
     }
-    $("#orderList").innerHTML = orders.map((o) => {
-      const settled = isSettled(o);
-      const profit = orderProfit(o);
-      const showProfit = o.income !== null || settled;
-      const actions = [];
-      if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
-      actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
-      actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
-      actions.push(`<button class="act danger" data-act="del" data-id="${o.id}">删除</button>`);
-      return `<div class="order-card">
-        <div class="order-top">
-          <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
-          <span class="status-tag ${STATUS_CLASS[o.status]}">${o.status}</span>
-        </div>
-        <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}</div>
-        <div class="order-money">
-          <span>垫付 <b>${money(o.cost)}</b></span>
-          <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
-          ${showProfit ? `<span>利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></span>` : ""}
-        </div>
-        ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
-        <div class="order-actions">${actions.join("")}</div>
-      </div>`;
-    }).join("");
+    // 同批一起寄出的单子并成一组：先出批次表头（整批口径），后面跟成员卡片
+    const groups = batchGroups();
+    const headShown = new Set();
+    const parts = [];
+    orders.forEach((o) => {
+      const g = o.batchId ? groups.get(o.batchId) : null;
+      if (g && !headShown.has(g.id)) {
+        headShown.add(g.id);
+        parts.push(batchHeadHtml(g, orders));
+      }
+      parts.push(orderCardHtml(o, g ? "in-batch" : ""));
+    });
+    $("#orderList").innerHTML = parts.join("");
+  }
+
+  function batchHeadHtml(g, visible) {
+    const shownCount = visible.filter((o) => o.batchId === g.id).length;
+    const bits = [`垫付 ${money(g.costCents / 100)}`];
+    if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
+    if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
+    if (g.pending > 0) bits.push(`${g.pending} 单在途`);
+    if (shownCount < g.count) bits.push(`本页显示 ${shownCount} 单`);
+    return `<div class="batch-head">
+      <div class="bh-top">
+        <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
+        <span class="bh-count">${g.count} 单</span>
+      </div>
+      <div class="bh-meta">${bits.join(" · ")}</div>
+    </div>`;
+  }
+
+  function orderCardHtml(o, extraClass) {
+    const settled = isSettled(o);
+    const profit = orderProfit(o);
+    const showProfit = o.income !== null || settled;
+    const actions = [];
+    if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
+    actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
+    actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
+    actions.push(`<button class="act danger" data-act="del" data-id="${o.id}">删除</button>`);
+    return `<div class="order-card ${extraClass || ""}">
+      <div class="order-top">
+        <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
+        <span class="status-tag ${STATUS_CLASS[o.status]}">${o.status}</span>
+      </div>
+      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}</div>
+      <div class="order-money">
+        <span>垫付 <b>${money(o.cost)}</b></span>
+        <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
+        <span>邮费 <b>${money(o.fee)}</b></span>
+        ${showProfit ? `<span>利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></span>` : ""}
+      </div>
+      ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
+      <div class="order-actions">${actions.join("")}</div>
+    </div>`;
   }
 
   // ---- 报表 ----
@@ -479,10 +571,11 @@
     const prev = prevReportStats();
 
     const lines = [];
+    const feeStats = reportFeeStats(range.start, range.end);
     if (s.n === 0 && s.income === 0) {
       lines.push(`<b>${escapeHtml(range.label)}</b> 没有记录。`);
     } else {
-      lines.push(`<b>${escapeHtml(range.label)}</b> 共 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，收回 <b>${money(s.income)}</b>，净${s.profit >= 0 ? "赚" : "亏"} <b class="${s.profit >= 0 ? "pos" : "neg"}">${money(s.profit)}</b>。`);
+      lines.push(`<b>${escapeHtml(range.label)}</b> 共 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，邮费 <b>${money(feeStats.totalCents / 100)}</b>，收回 <b>${money(s.income)}</b>，净${s.profit >= 0 ? "赚" : "亏"} <b class="${s.profit >= 0 ? "pos" : "neg"}">${money(s.profit)}</b>。`);
       const st = computeStats();
       if (st.outCount > 0) lines.push(`现在还有 ${st.outCount} 单 / ${money(st.outstanding)} 在途，回款了记得来销账。`);
       if (prev.n > 0 || prev.income > 0) {
@@ -508,6 +601,32 @@
 
     $("#profitLegend").innerHTML = `<i class="lg-dot" style="background:#17b26a"></i>赚　<i class="lg-dot" style="background:#d05f45"></i>亏`;
     $("#chartProfit").innerHTML = chartProfitSVG(buckets, bucketStats);
+
+    // 邮费统计：整批一起寄的合成一行（含这一批都是哪些货），单寄的合并成一行
+    const feeRows = feeStats.batches.map((b) => {
+      const nums = [`${b.count} 单`, `邮费 ${money(b.feeCents / 100)}`];
+      if (b.incomeCents > 0) nums.push(`回款 ${money(b.incomeCents / 100)}`);
+      if (b.pending > 0) nums.push(`${b.pending} 单在途`);
+      return `<div class="fee-row">
+        <div class="fee-line">
+          <span class="fee-name">一起寄 · ${escapeHtml(b.date)}</span>
+          <span class="fee-nums">${nums.join(" · ")}</span>
+        </div>
+        <div class="fee-names">${escapeHtml(b.names.join("、"))}</div>
+      </div>`;
+    });
+    if (feeStats.looseCount > 0) {
+      feeRows.push(`<div class="fee-row">
+        <div class="fee-line">
+          <span class="fee-name">单寄（未成批）</span>
+          <span class="fee-nums">${feeStats.looseCount} 单 · 邮费 ${money(feeStats.looseCents / 100)}</span>
+        </div>
+        <div class="fee-names">${escapeHtml(feeStats.looseNames.join("、"))}</div>
+      </div>`);
+    }
+    $("#reportFees").innerHTML = feeRows.length === 0
+      ? `<div class="empty-mini">本期没有邮费记录</div>`
+      : `<div class="fee-total"><span>本期邮费合计</span><b>${money(feeStats.totalCents / 100)}</b></div>${feeRows.join("")}`;
 
     // 环形图：已结算利润为正的商品，Top5 + 其他
     const ranked = Object.entries(s.byName).map(([name, g]) => ({ name, value: g.profit }))
@@ -593,6 +712,11 @@
       incomeDate: existing ? existing.incomeDate : null,
       status: f.status.value,
       fee: numberValue(f.fee.value),
+      // 编辑不改变批次归属（改的是这一单自己的字段，整批口径仍以批量结算时为准）
+      batchId: existing ? existing.batchId : "",
+      batchDate: existing ? existing.batchDate : "",
+      batchFee: existing ? existing.batchFee : 0,
+      batchIncome: existing ? existing.batchIncome : 0,
       note: String(f.note.value || "").trim(),
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
@@ -662,11 +786,26 @@
   }
 
   // ---- 批量结算（整批寄出 / 对方一笔总回款，按垫付占比分摊）----
+  // 结算过的单子记下批次：一批一起寄出去的货从此绑在一起，回头补回款时整批一键勾选，
+  // 账本和报表里也按「一起寄出」合并显示，看得到这一批到底是哪些货。
   function openBatchModal() {
     const pending = data.orders.filter((o) => o.status === "在途");
     if (pending.length === 0) { toast("没有在途单可结算"); return; }
-    pending.sort((a, b) => (a.date < b.date ? 1 : -1));   // 与账本列表同序（新单在上）
-    batchItems = pending.map((o) => ({ id: o.id, name: o.name, cost: o.cost, checked: true }));
+    const groups = batchGroups();
+    // 同批次的单排在一起：成批的按批次日期倒序在前（先摊了邮费的那批最好找），没成批的殿后
+    const rank = new Map();
+    pending.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((o) => {
+      if (o.batchId && !rank.has(o.batchId)) rank.set(o.batchId, rank.size);
+    });
+    pending.sort((a, b) => {
+      const ra = a.batchId && rank.has(a.batchId) ? rank.get(a.batchId) : 9999;
+      const rb = b.batchId && rank.has(b.batchId) ? rank.get(b.batchId) : 9999;
+      if (ra !== rb) return ra - rb;
+      return a.date < b.date ? 1 : -1;
+    });
+    batchItems = pending.map((o) => ({
+      id: o.id, name: o.name, cost: o.cost, batchId: o.batchId, checked: true,
+    }));
     $("#batchFee").value = "";
     $("#batchIncome").value = "";
     $("#batchDate").value = todayStr();
@@ -680,14 +819,43 @@
   }
 
   function renderBatchList() {
-    $("#batchList").innerHTML = batchItems.length === 0
-      ? `<div class="empty-mini">没有在途单可结算</div>`
-      : batchItems.map((it, i) => `
-        <label class="batch-item">
-          <input type="checkbox" data-idx="${i}" ${it.checked ? "checked" : ""}>
-          <span class="bi-name">${escapeHtml(it.name || "未命名")}</span>
-          <span class="bi-cost">${money(it.cost)}</span>
-        </label>`).join("");
+    if (batchItems.length === 0) {
+      $("#batchList").innerHTML = `<div class="empty-mini">没有在途单可结算</div>`;
+      updateBatchSummary();
+      return;
+    }
+    const groups = batchGroups();
+    const parts = [];
+    const seen = new Set();
+    let sepShown = false;
+    batchItems.forEach((it, i) => {
+      if (it.batchId && !seen.has(it.batchId)) {
+        seen.add(it.batchId);
+        const idxs = [];
+        batchItems.forEach((x, j) => { if (x.batchId === it.batchId) idxs.push(j); });
+        const onCount = idxs.filter((j) => batchItems[j].checked).length;
+        const g = groups.get(it.batchId);
+        const tags = [];
+        if (g && g.feeCents > 0) tags.push(`已分摊邮费 ${money(g.feeCents / 100)}`);
+        if (g && g.incomeCents > 0) tags.push(`已回款 ${money(g.incomeCents / 100)}`);
+        parts.push(`<label class="batch-item bg-row">
+          <input type="checkbox" data-group="${escapeHtml(it.batchId)}"${onCount === idxs.length ? " checked" : ""}${onCount > 0 && onCount < idxs.length ? ` data-partial="1"` : ""}>
+          <span class="bg-title">一起寄 · ${escapeHtml(g ? g.date : "")}</span>
+          <span class="bi-cost">${idxs.length} 单</span>
+        </label>`);
+        if (tags.length > 0) parts.push(`<div class="bg-tags">${tags.join(" · ")}${onCount === idxs.length ? `　再填邮费会累加到这批上` : ""}</div>`);
+      } else if (!it.batchId && !sepShown && seen.size > 0) {
+        sepShown = true;
+        parts.push(`<div class="bg-sep">未成批（单寄的单子）</div>`);
+      }
+      parts.push(`<label class="batch-item${it.batchId ? " in-group" : ""}">
+        <input type="checkbox" data-idx="${i}"${it.checked ? " checked" : ""}>
+        <span class="bi-name">${escapeHtml(it.name || "未命名")}</span>
+        <span class="bi-cost">${money(it.cost)}</span>
+      </label>`);
+    });
+    $("#batchList").innerHTML = parts.join("");
+    $$("#batchList input[data-partial='1']").forEach((cb) => { cb.indeterminate = true; });
     updateBatchSummary();
   }
 
@@ -711,9 +879,30 @@
     if (orders.length === 0) { closeBatchModal(); return; }
     const weights = orders.map((o) => Math.max(0, toCents(o.cost)));
 
+    // 批次：整批原班人马都勾上了 → 续用原批次号（先摊邮费、回款到了再补一趟）；
+    // 只勾了一半或混着别的单 → 另起一批，免得同一批的单子整批口径对不上
+    const batchIds = new Set(orders.map((o) => o.batchId).filter(Boolean));
+    let reuseId = "";
+    if (orders.every((o) => o.batchId) && batchIds.size === 1) {
+      const cand = [...batchIds][0];
+      const selectedIds = new Set(orders.map((o) => o.id));
+      if (data.orders.every((o) => o.batchId !== cand || selectedIds.has(o.id))) reuseId = cand;
+    }
+    const batchId = reuseId || uid();
+    const prev = reuseId ? batchGroups().get(reuseId) : null;
+    const batchDate = (prev && prev.date) || $("#batchDate").value || todayStr();
+    const batchFeeCents = (prev ? prev.feeCents : 0) + feeCents;
+    const batchIncomeCents = (prev ? prev.incomeCents : 0) + incomeCents;
+
     // 邮费：累加到各单已有邮费上（单子可能自己寄出时已记过邮费）
     const feeShares = splitByWeight(feeCents, weights);
-    orders.forEach((o, i) => { o.fee = (toCents(o.fee) + feeShares[i]) / 100; });
+    orders.forEach((o, i) => {
+      o.fee = (toCents(o.fee) + feeShares[i]) / 100;
+      o.batchId = batchId;
+      o.batchDate = batchDate;
+      o.batchFee = batchFeeCents / 100;
+      o.batchIncome = batchIncomeCents / 100;
+    });
 
     // 回款：直接赋值；总回款为 0/空 → 只分摊邮费，状态保持「在途」
     if (incomeCents > 0) {
@@ -728,7 +917,8 @@
 
     closeBatchModal();
     saveData();
-    toast(`已结算 ${orders.length} 单 · 回款 ${money(incomeCents / 100)} · 邮费 ${money(feeCents / 100)}`);
+    const batchNote = orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : "";
+    toast(`已结算 ${orders.length} 单${batchNote} · 回款 ${money(incomeCents / 100)} · 邮费 ${money(feeCents / 100)}`);
   }
 
   // ---- 云同步（改动防抖推送，启动拉取）----
@@ -928,9 +1118,14 @@
     $("#batchList").addEventListener("change", (ev) => {
       const cb = ev.target.closest("input[type=checkbox]");
       if (!cb) return;
+      if (cb.dataset.group) {                 // 整批一键勾选/取消
+        batchItems.forEach((it) => { if (it.batchId === cb.dataset.group) it.checked = cb.checked; });
+        renderBatchList();
+        return;
+      }
       const it = batchItems[Number(cb.dataset.idx)];
       if (it) it.checked = cb.checked;
-      updateBatchSummary();
+      renderBatchList();                      // 批次表头的全选/半选态跟着变
     });
 
     $$(".modal").forEach((m) => m.addEventListener("click", (ev) => {
