@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=24">
+  <link rel="stylesheet" href="./styles.css?v=25">
 </head>
 <body>
   <header class="topbar">
@@ -141,22 +141,28 @@
   <div id="formModal" class="modal">
     <form id="orderForm" class="sheet">
       <h2 id="formTitle">记一单</h2>
+      <!-- v25：类型切换（只改表单形态，不落库、不是类型字段）。编辑既有记录时整条隐藏 -->
+      <div id="formKind" class="segment">
+        <button type="button" class="seg on" data-kind="order">货单</button>
+        <button type="button" class="seg" data-kind="income">收入</button>
+      </div>
       <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
-      <div class="row2">
-        <label class="fld">垫付金额<input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
+      <div class="row2" id="formCostRow">
+        <!-- 收入模式下这一格就是「金额」（回款金额），label 文案由 applyKindUi 换 -->
+        <label class="fld"><span id="formCostLabel">垫付金额</span><input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
         <!-- v24：小「清空」＝把邮费置空（留空按 0 算，老口径）。按钮必须排在 input **之后**：
              <label> 的关联控件是它第一个可关联后代，而 button 也是可关联元素 -->
-        <label class="fld">邮费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"><button type="button" class="fld-clear" data-clear="fee">清空</button></label>
+        <label class="fld kind-order">邮费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"><button type="button" class="fld-clear" data-clear="fee">清空</button></label>
       </div>
       <!-- v24：批内单的「邮费该在哪改」提示（一起寄的一批只有一笔邮费，统一改在批次上）。
            文案与显隐由 openForm 逐次决定；未成批的单不显示 -->
-      <p id="formBatchHint" class="foot-note" hidden></p>
+      <p id="formBatchHint" class="foot-note kind-order" hidden></p>
       <div class="row2">
         <label class="fld">日期<input name="date" type="date" required></label>
-        <label class="fld">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
+        <label class="fld kind-order">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
       </div>
-      <label class="fld">出掉渠道<select name="channel"></select></label>
-      <details class="more" id="formMore">
+      <label class="fld"><span id="formChannelLabel">出掉渠道</span><select name="channel"></select></label>
+      <details class="more kind-order" id="formMore">
         <summary>更多（状态）</summary>
         <div class="more-body">
           <label class="fld">状态<select name="status"></select></label>
@@ -254,7 +260,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=24"></script>
-  <script src="./app.js?v=24"></script>
+  <script src="./sync.js?v=25"></script>
+  <script src="./app.js?v=25"></script>
 </body>
 </html>

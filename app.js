@@ -1,4 +1,4 @@
-// 撸货记账 · 主逻辑（v24）
+// 撸货记账 · 主逻辑（v25）
 // 状态只有两个：在途（垫了钱还没结清）/ 已回款；旧的「自留」单保留原样只读显示，不再能新建。
 // 数据模型：单 JSON blob（orders 数组），经 sync.js 云同步（同设备组共用一个同步码）。
 // v23：整批邮费/回款**可改可删**。每单多记 batchFeeShare/batchIncomeShare（本次真正摊到它头上的分额），
@@ -15,6 +15,16 @@
 //         （用户实测「8 单各 ¥4、整批只录了 ¥1，填 0 后总额还是 ≈¥31.8」就是它）。
 //         纯赋值天然幂等，也顺带把「清零留残值」整个消掉。
 //      ③ 编辑批内单时在邮费下面提示「这一单的邮费在批次上统一改」，免得他继续去单据里找。
+// v25：记一笔**纯收入**（"给别人开发票收到的钱"这类只有收入、没有成本的业务）。
+//      做法刻意最省：**只在记单表单顶部加一个类型切换**（货单 / 收入），选收入时表单只留
+//      名称/金额/日期/渠道/备注，保存时把收入语义写进**现有字段**（cost=0、fee=0、qty=1、
+//      status=已回款、income=金额、incomeDate=date=用户只填的那一个日期）。
+//      **绝不新增类型字段**：老账本零迁移，任何靠「新字段缺省」或「cost===0」这类宽松判断去
+//      识别收入单的写法，都会把「垫付 0 + 已回款」的老货单误判成收入单、静默改写它的语义——
+//      这是零迁移承诺下最脆弱的一行代码。类型只是**表单模式**，落库后与货单同形，
+//      于是这笔钱天然并进现有的总收入/净利润，报表不需要任何分块、列或图例。
+//      编辑既有记录一律按货单形态回显（垫付/邮费/数量/状态照常显示，值就是 0/0/1/已回款），
+//      编辑表单不给类型切换；「0 元购」确认只服务货单（正反两个方向都保住）。
 (function () {
   "use strict";
 
@@ -29,14 +39,23 @@
   const LEGACY_STATUSES = ["自留"];              // 只读的遗留状态：认得、能显示，不能创建
   const SETTLED = ["已回款", "自留"];             // 「已结算」= 不在途：含旧自留（那笔钱已经落地）
   const FILTERS = ["在途", "全部", "已回款"];     // 账本页筛选；「全部」也要能记住
-  const CHANNELS = ["收货商", "闲鱼", "转转", "朋友", "自用"];
+  const CHANNELS = ["收货商", "闲鱼", "转转", "朋友", "自用", "开发票"];
   const STATUS_CLASS = { "在途": "st-out", "已回款": "st-done", "自留": "st-loss" };
+  // v25：「收入」表单模式的默认值（只在新建表单、且用户没碰过那格时才补）
+  const INCOME_NAME = "开发票";
+  const INCOME_CHANNEL = "开发票";
 
   // ---- 状态 ----
   let data = { version: 1, orders: [] };
   let meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
   let editingId = null;
   let prefillPlatform = "";   // 「再来一单」预填时暂存原单平台（表单里没有平台输入框）
+  // v25：记单表单的模式（"order" 货单 / "income" 收入）。**只是表单形态**，不落库、不是类型字段。
+  // nameAuto / channelTouched 记录「那一格是我们替他补的默认值、还是用户自己碰过」——
+  // 切类型时照旧保留共有值，只补用户没碰过的格子。
+  let formKind = "order";
+  let nameAuto = false;
+  let channelTouched = false;
   let payTargetId = null;
   let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
   let currentFilter = "在途";
@@ -834,18 +853,53 @@
   }
 
   // ---- 记单 / 编辑 ----
+  // v25：类型切换只是**表单的显隐形态**（见文件头）。这里与落库无关，一个字都不写进数据。
+  function applyKindUi() {
+    const income = formKind === "income";
+    const f = $("#orderForm");
+    f.classList.toggle("kind-income", income);
+    $$("#formKind .seg").forEach((b) => b.classList.toggle("on", b.dataset.kind === formKind));
+    $("#formCostLabel").textContent = income ? "金额" : "垫付金额";
+    $("#formChannelLabel").textContent = income ? "渠道" : "出掉渠道";
+    f.goods.placeholder = income ? "这笔钱是什么？" : "卖什么？";
+  }
+
+  // 切类型：隐藏的字段**不清空**（切回来值还在），共有字段（名称/金额/日期/渠道/备注）保留。
+  // 只有「用户没碰过」的格子才补默认值：名称补「开发票」、渠道补「开发票」/「收货商」。
+  function setFormKind(kind) {
+    formKind = kind === "income" ? "income" : "order";
+    const f = $("#orderForm");
+    const income = formKind === "income";
+    if (!channelTouched) f.channel.value = income ? INCOME_CHANNEL : "收货商";
+    if (income) {
+      if (!String(f.goods.value || "").trim()) { f.goods.value = INCOME_NAME; nameAuto = true; }
+    } else if (nameAuto && String(f.goods.value || "").trim() === INCOME_NAME) {
+      f.goods.value = "";        // 收回我们替他填的默认名：货单表单不该自带商品名
+      nameAuto = false;
+    }
+    applyKindUi();
+  }
+
   // order：编辑既有单（editingId = 其 id）；prefill：「再来一单」预填（editingId 保持 null，保存即新建）
   function openForm(order, prefill) {
     const src = order || prefill || null;
     editingId = order ? order.id : null;
     prefillPlatform = !order && prefill ? String(prefill.platform || "") : "";
+    // v25：编辑既有记录一律按货单形态回显（不判别它"是不是收入单"——没有类型字段可判）；
+    // 打开时把模式与两个"默认值"标记复位，渠道带过来就算用户已经定过，切类型不该把它改掉
+    formKind = "order";
+    nameAuto = false;
+    channelTouched = !!src;
     const f = $("#orderForm");
     f.goods.value = src ? src.name : "";
-    f.cost.value = src ? (src.cost || "") : "";
+    // v25：金额两项按**数值**回填（0 就写 0），不再用 `|| ""` 把 0 变成空串。
+    // 原因：垫付那一格带 required，回填成空串会让「编辑一条 0 元单、什么都不改直接保存」被浏览器
+    // 的原生校验拦死（点保存像没反应）；而收入单的 cost 恒为 0，这条编辑路径天天要走。
+    f.cost.value = src ? numberValue(src.cost) : "";
     f.qty.value = src ? src.qty : 1;
     f.date.value = order ? order.date : todayStr();     // 预填/新建一律用今天
     f.channel.value = src ? (src.channel || "收货商") : "收货商";
-    f.fee.value = src ? (src.fee || "") : "";
+    f.fee.value = src ? numberValue(src.fee) : "";      // 同上：0 写成 0（邮费可不填，留空仍按 0 算）
     // 状态下拉：现役两态；编辑遗留「自留」单时把该单自己的旧状态补进去（只读项），
     // 否则下拉会因没有匹配项而回空、保存时把状态静默改写掉——v21 的红线就是不许改写旧状态
     const statusOpts = STATUSES.slice();
@@ -867,6 +921,9 @@
     }
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
     $("#formMore").open = !!(order && order.status !== "在途");
+    // v25：编辑表单**不加**类型切换（一律按货单形态回显，用户在该形态下自由改）
+    $("#formKind").hidden = !!order;
+    applyKindUi();
     $("#formModal").classList.add("show");
     setTimeout(() => f.goods.focus(), 120);
   }
@@ -879,15 +936,54 @@
   function submitForm(ev) {
     ev.preventDefault();
     const f = ev.target;
+    // v25：保存后表单已经关了（连点保存的第二次、或事件晚到的那一下）一律丢弃，
+    // 保证「一次保存 → 恰好一条」。真实用户连点第二下时按钮已随弹窗隐藏，这里兜住程序化连点。
+    if (!$("#formModal").classList.contains("show")) return;
+    const isIncome = formKind === "income" && !editingId;   // 编辑一律走货单路径
     const name = String(f.goods.value || "").trim();
+    const date = f.date.value || todayStr();
+    if (!name) { toast(isIncome ? "先填名称" : "先填商品名称"); return; }
+
+    // —— v25 收入单：只填一个金额，没有垫付/邮费/数量，落库全部用**现有字段** ——
+    if (isIncome) {
+      const raw = String(f.cost.value || "").trim();
+      if (!raw) { toast("先填金额"); return; }        // 留空 ≠ 0：填 0 是合法的 0 元收入
+      const amount = numberValue(raw);
+      if (amount < 0) { toast("金额不能是负数"); return; }
+      const order = {
+        id: uid(),
+        date,                                        // 用户只填一个日期：它既是发生日也是到账日
+        name,
+        platform: prefillPlatform,
+        qty: 1,
+        cost: 0,
+        pay: "",
+        channel: String(f.channel.value || "").trim(),   // 收入单渠道非必填
+        income: amount,
+        incomeDate: date,
+        status: "已回款",
+        fee: 0,
+        batchId: "", batchDate: "", batchFee: 0, batchIncome: 0, batchCount: 0,
+        batchFeeShare: 0, batchIncomeShare: 0,
+        note: String(f.note.value || "").trim(),
+        createdAt: new Date().toISOString(),
+      };
+      data.orders.push(order);
+      closeForm();
+      saveData();
+      toast("已记账");
+      switchView("list");
+      return;
+    }
+
     const cost = numberValue(f.cost.value);
-    if (!name) { toast("先填商品名称"); return; }
     if (cost < 0) { toast("垫付金额不能是负数"); return; }
+    // 0 元购确认只服务货单；收入单天然 cost=0，绝不能走到这里来
     if (cost === 0 && !confirm("垫付金额为 0？确认这是 0 元购/白嫖的单子吗？")) return;
     const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
     const order = {
       id: existing ? existing.id : uid(),
-      date: f.date.value || todayStr(),
+      date,
       name,
       platform: existing ? existing.platform : prefillPlatform,
       qty: Math.max(1, Math.round(numberValue(f.qty.value)) || 1),
@@ -1455,6 +1551,14 @@
 
     $("#orderForm").addEventListener("submit", submitForm);
     $("#formCancel").addEventListener("click", closeForm);
+    // v25：记单表单顶部的类型切换（货单 / 收入）。切换只动显隐与默认值，不写任何数据。
+    $("#formKind").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-kind]");
+      if (btn) setFormKind(btn.dataset.kind);
+    });
+    // 用户自己动过这两格之后，切类型不再覆盖它们（"切回来还在"@ 名称/渠道）
+    $("#orderForm").goods.addEventListener("input", () => { nameAuto = false; });
+    $("#orderForm").channel.addEventListener("change", () => { channelTouched = true; });
 
     $("#payForm").addEventListener("submit", submitPay);
     $("#payCancel").addEventListener("click", closePayForm);

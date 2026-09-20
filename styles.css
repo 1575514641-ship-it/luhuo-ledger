@@ -417,6 +417,14 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .segment {
   display: flex; background: var(--bg); border-radius: 12px; padding: 3px; margin-bottom: 12px;
 }
+/* v25：类型切换 / 报表周期切换都用了 .segment，而编辑既有记录时整条要隐藏——
+   .segment 的 display:flex 是作者样式，会盖掉 UA 的 [hidden]{display:none}，所以必须显式写一条 */
+.segment[hidden] { display: none; }
+/* v25：记单表单的「收入」模式（见 app.js 文件头）。只留 名称/金额/日期/渠道/备注：
+   垫付/邮费/数量/状态（.kind-order）整格 display:none —— 隐藏字段**不清空其值**、也不参与校验与提交；
+   剩下可见的那一格（金额、日期）由两列收成一列，免得半张空栅格。 */
+#orderForm.kind-income .kind-order { display: none; }
+#orderForm.kind-income .row2 { grid-template-columns: 1fr; }
 .seg {
   flex: 1; border: 0; background: transparent; border-radius: 9px;
   padding: 8px 0; font-size: 13px; color: var(--muted); cursor: pointer;
