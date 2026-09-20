@@ -240,6 +240,16 @@
   function isSettled(order) { return SETTLED.includes(order.status); }
   function orderProfit(o) { return (o.income === null ? 0 : o.income) - o.cost - o.fee; }
 
+  // 收入口径（v27 起**唯一**一条规则，看板与报表共用这一个函数）：
+  //   ① 算不算收入只看「**回款非空**」（income !== null）——与状态无关：
+  //      「已回款」的单被编辑改成「在途」而回款字段留着，那笔钱**照旧是收入**；
+  //   ② 归期只看「**回款日期**」（incomeDate）：有日期就落进那个月/那一期；
+  //      没有回款日期时计入**总收入**（看板「累计回款」），但不落进任何具体月份（月/季/年报表都不算它）。
+  // v27 修的真 bug：改之前看板按①（income !== null）、报表按「已结算且回款日期在期内」，
+  // 于是「已回款 → 改成在途（回款保留）」这条记录被看板算进累计回款、报表却不算，两页对不上。
+  // 以后凡是要判「这笔钱算不算收入」的新代码，一律走这个函数，别再各写一份判据。
+  function hasIncome(o) { return o.income !== null && o.income !== undefined && o.income !== ""; }
+
   // 展示/汇总用的状态集合 = 现役两态 + 数据里实际出现的遗留态（旧「自留」）。
   // 必须带上遗留态，否则那些单子的垫付既不进环形图也不进状态行，
   // 「垫付合计」就会大于各状态之和、占比凑不满 100%。
@@ -262,11 +272,11 @@
 
     orders.forEach((o) => {
       totalCost += o.cost;
-      if (o.income !== null) totalIncome += o.income;
+      if (hasIncome(o)) totalIncome += o.income;      // v27：收入判据统一走 hasIncome（回款非空即收入）
       if (!isSettled(o)) { outstanding += o.cost; outCount += 1; }
       else settledProfit += orderProfit(o);
       if (monthStr(o.date) === cm) monthCost += o.cost;
-      if (o.incomeDate && monthStr(o.incomeDate) === cm && o.income !== null) monthIncome += o.income;
+      if (o.incomeDate && hasIncome(o) && monthStr(o.incomeDate) === cm) monthIncome += o.income;
       if (byStatus[o.status]) {
         byStatus[o.status].count += 1;
         byStatus[o.status].cost += o.cost;
@@ -274,7 +284,8 @@
       const m = monthStr(o.date);
       byMonth[m] = byMonth[m] || { cost: 0, income: 0 };
       byMonth[m].cost += o.cost;
-      if (o.income !== null) {
+      if (hasIncome(o)) {
+        // 归期按回款日期；没有回款日期时落在 "" 这格（近 6 个月列表里没有它 → 只进总收入、不进某个月）
         const mi = monthStr(o.incomeDate);
         byMonth[mi] = byMonth[mi] || { cost: 0, income: 0 };
         byMonth[mi].income += o.income;
@@ -392,8 +403,13 @@
   function renderDash() {
     const s = computeStats();
     $("#kpiOutstanding").textContent = money(s.outstanding);
+    // v27：在途单自己记的邮费**不在**「垫付在外未回笼」里（那格只累加 cost，统计口径不动），
+    // 但用户心算「还有多少钱在外面」会把邮费一起算上——所以在这里如实补一句，
+    // 做法与「本月垫出 · 另有邮费」完全一致（按各单自己记的 fee 汇总＝成员明细口径）。
+    // 在途单邮费合计为 0 时这半句不显示（不写「另有邮费 ¥0」这种废话）。
+    const pendingFeeCents = data.orders.reduce((a, o) => a + (isSettled(o) ? 0 : toCents(o.fee)), 0);
     $("#kpiOutstandingHint").textContent = s.outCount > 0
-      ? `${s.outCount} 单在途，回款了记得销账`
+      ? `${s.outCount} 单在途，回款了记得销账${pendingFeeCents > 0 ? ` · 另有邮费 ${money(pendingFeeCents / 100)}` : ""}`
       : "还没有在途的单子";
     const profitEl = $("#kpiProfit");
     profitEl.textContent = money(s.settledProfit);
@@ -512,7 +528,10 @@
       if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
     }
     if (diff.length > 0) {
-      notes.push({ warn: true, text: `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同` });
+      // v27：把下一步点哪里写进同一行——删掉批内一单后整批口径**不会**自动扣（刻意的边界），
+      // 只报数字的话用户会以为账坏了。指引就是那句自助修法：点「改本批邮费」按当前成员重摊一次
+      // （填同一个整批数字即可，纯重摊后成员明细之和恒等于整批口径）。
+      notes.push({ warn: true, text: `≠ 成员明细合计 ${diff.join(" · ")}，与整批口径不同　要对齐就点「改本批邮费」按当前成员重摊一次` });
     }
     // v24 说明：曾有一支「整批为 0 而成员上还有钱」的中性说明，用来兜「清零留下残值」——
     // 那笔残值本身随 v24 的**纯重摊**一起消失了（填数字 = 成员 fee 直接等于按权重摊到的新份额，
@@ -621,7 +640,11 @@
         if (isSettled(o)) g.profit += orderProfit(o);
         else g.pending += 1;
       }
-      if (isSettled(o) && o.incomeDate) {
+      // v27：收入判据与看板**同一条**（hasIncome：回款非空即收入，按回款日期归期）。
+      // 改之前这里是 `isSettled(o) && o.incomeDate`，比看板多要一个「已结算」条件——
+      // 「已回款 → 改成在途（回款保留）」的单于是看板算、报表不算，两页对不上。
+      // 利润跟着收入一起认（同一个分支）：认了这笔收入，就该认这笔生意的盈亏。
+      if (hasIncome(o)) {
         const id = parseDate(o.incomeDate);
         if (id && id >= startD && id < endD) {
           income += o.income;
@@ -940,6 +963,18 @@
       batchHint.hidden = true;
       batchHint.textContent = "";
     }
+    // v27：编辑一条**自己填着回款**的单时，把那笔钱写在表单里（只读一行，纯展示、不加输入框）。
+    // 起因：编辑表单里没有回款栏，用户点「编辑」想改金额时最容易把数字填进「垫付金额」那一格，
+    // 一填就把这条单的垫付改坏。判据就是这条记录自己的两个字段（状态已是「已回款」且 income 非空），
+    // **不判断它是不是收入单**；改金额的入口仍是卡片上的「改回款」。
+    const incomeHint = $("#formIncomeHint");
+    if (order && order.status === "已回款" && order.income !== null) {
+      incomeHint.hidden = false;
+      incomeHint.textContent = `本单回款 ${money(order.income)} · 改金额请用卡片上的「改回款」`;
+    } else {
+      incomeHint.hidden = true;
+      incomeHint.textContent = "";
+    }
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
     $("#formMore").open = !!(order && order.status !== "在途");
     // v25：编辑表单**不加**类型切换（一律按货单形态回显，用户在该形态下自由改）
@@ -1006,6 +1041,16 @@
     // 「垫付 0 的已回款老货单」误判成收入单（v25 已定为禁止项），这次点击原样保留。
     if (cost === 0 && !confirm("这一单垫付金额为 0（白嫖单或纯收入单），确认保存吗？")) return;
     const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
+    // v27：把状态存成「在途」而这一条自己还留着回款 → 先问一声（v27 起两处口径统一为
+    // 「回款非空即收入」，所以这条记录存成在途后**回款照旧计入收入统计**——文案必须讲这条实话）。
+    // 判据只有两个：这一条记录自己的 status 选择 + 它自己的 income 字段，
+    // **不做**任何「这是不是收入单」的判断（v25 定的红线：靠 cost===0 / 字段缺省去识别必然误伤）。
+    const keepIncome = existing ? existing.income : null;
+    if (f.status.value === "在途" && keepIncome !== null) {
+      if (!confirm(`这一单填着回款 ${money(keepIncome)}，却要存成「在途」？\n`
+        + "存成「在途」后，它的垫付会重新算进「垫付在外未回笼」、也不再计入「已结算净盈亏」；"
+        + "那笔回款照旧按回款日期计入收入统计。")) return;
+    }
     const order = {
       id: existing ? existing.id : uid(),
       date,
@@ -1415,6 +1460,10 @@
   // ---- 云同步（改动防抖推送，启动拉取）----
   let syncTimer = null, syncPending = false, syncInFlight = false;
   let syncEpoch = 0;   // 导入同步码/重置身份时换代：旧身份数据的晚到同步直接作废
+  // v27：**只有**「导入同步码」那条路会把它置 true——那条路自己已经按 id 把本机独有的单并回去了
+  // （applySyncBtn 里那段 localOnly 合并，且前面已经问过用户「首次同步以最新的一份数据为准」），
+  // 所以它触发的这次拉取不再弹「并入还是放弃」的确认框（两个确认框会互相矛盾）。
+  let suppressPullMerge = false;
 
   function saveData() {
     meta.updatedAt = new Date().toISOString();
@@ -1475,11 +1524,32 @@
       }
       const remoteAt = remote.updatedAt || "";
       if (!meta.updatedAt || remoteAt > meta.updatedAt) {
-        data = normalizeData(remote.data);
+        // v27：远端更新时**先看一眼会不会丢东西**再整体覆盖——本机存在「云端没有的订单」（按 id 比对）
+        // 就弹一次确认，让用户选「并入（默认）还是放弃并采用云端版本」。
+        // 场景：手机信号差、几单没推上去，期间电脑端改完同步成功 → 手机下次打开，那几单会被静默抹掉。
+        // 不做时间戳/版本比较（那套在弱网下更容易出错）：只比 id 集合。
+        // 正常情况下本机的单云端都有（localOnly 为空），启动时一次都不会弹；
+        // 「另一台真删了单」也不会自动复活——用户在那里选「取消（放弃）」即可。
+        const incoming = normalizeData(remote.data);
+        const incomingIds = new Set(incoming.orders.map((o) => o.id));
+        const localOnly = data.orders.filter((o) => !incomingIds.has(o.id));
+        let merged = 0, declined = 0;
+        if (localOnly.length > 0 && !suppressPullMerge) {
+          const names = localOnly.slice(0, 3).map((o) => o.name || "未命名").join("、");
+          const keep = confirm(`云端有更新的账本，本机还有 ${localOnly.length} 单是云端没有的：\n`
+            + `${names}${localOnly.length > 3 ? "…" : ""}\n\n`
+            + "点「确定」＝把它们并进账本（推荐）；点「取消」＝放弃这几单，改用云端版本。");
+          if (keep) { incoming.orders = incoming.orders.concat(localOnly); merged = localOnly.length; }
+          else declined = localOnly.length;
+        }
+        data = incoming;
         meta.updatedAt = remoteAt;
         persist();
         render();
-        toast("已从云端取回最新账本");
+        // 并入后**不**立刻把整本推上去：下次启动那次拉取的 else 分支会自然把它推上去（干净、少一次写）
+        if (merged > 0) toast(`已并入本机 ${merged} 单`);
+        else if (declined > 0) toast(`已采用云端版本（本机 ${declined} 单未并入）`);
+        else toast("已从云端取回最新账本");
       } else {
         syncToCloud();
       }
@@ -1671,7 +1741,10 @@
         meta.lastSyncedAt = null;
         meta.lastSyncError = "";
         persist();
-        await pullFromCloud();
+        // v27：这条路的合并语义由下面那段 localOnly 负责（而且上面已经问过用户了），
+        // 所以这次拉取不弹「并入还是放弃」（suppressPullMerge，见它的声明）
+        suppressPullMerge = true;
+        try { await pullFromCloud(); } finally { suppressPullMerge = false; }
         syncEpoch += 1;
         // 合并：本机有、云端没有的订单不丢
         const ids = new Set(data.orders.map((o) => o.id));

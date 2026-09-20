@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=26">
+  <link rel="stylesheet" href="./styles.css?v=27">
 </head>
 <body>
   <header class="topbar">
@@ -157,6 +157,10 @@
       <!-- v24：批内单的「邮费该在哪改」提示（一起寄的一批只有一笔邮费，统一改在批次上）。
            文案与显隐由 openForm 逐次决定；未成批的单不显示 -->
       <p id="formBatchHint" class="foot-note kind-order" hidden></p>
+      <!-- v27：编辑一条已回款且有回款的单时，这里只读地写出它的回款金额（纯展示行，没有输入框——
+           编辑表单里没有回款栏，用户想改金额最容易错填到「垫付金额」；改金额的入口是卡片上的「改回款」）。
+           文案与显隐由 openForm 逐次决定 -->
+      <p id="formIncomeHint" class="foot-note" hidden></p>
       <div class="row2">
         <label class="fld">日期<input name="date" type="date" required></label>
         <label class="fld kind-order">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
@@ -260,7 +264,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=26"></script>
-  <script src="./app.js?v=26"></script>
+  <script src="./sync.js?v=27"></script>
+  <script src="./app.js?v=27"></script>
 </body>
 </html>
