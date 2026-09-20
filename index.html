@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=22">
+  <link rel="stylesheet" href="./styles.css?v=23">
 </head>
 <body>
   <header class="topbar">
@@ -197,6 +197,8 @@
         <label class="fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
         <label class="fld">对方总回款 <small>留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
       </div>
+      <!-- 整批原班人马再结一次时的口径选择（留空＝不动 / 覆盖 / 追加），由 app.js 决定显不显示 -->
+      <div id="batchMode" class="batch-mode" hidden></div>
       <label class="fld">回款日期<input id="batchDate" type="date"></label>
       <div class="sheet-actions">
         <button type="button" id="batchCancel" class="btn ghost">取消</button>
@@ -245,7 +247,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=22"></script>
-  <script src="./app.js?v=22"></script>
+  <script src="./sync.js?v=23"></script>
+  <script src="./app.js?v=23"></script>
 </body>
 </html>

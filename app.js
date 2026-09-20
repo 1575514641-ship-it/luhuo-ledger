@@ -1,6 +1,9 @@
-// 撸货记账 · 主逻辑（v21）
+// 撸货记账 · 主逻辑（v23）
 // 状态只有两个：在途（垫了钱还没结清）/ 已回款；旧的「自留」单保留原样只读显示，不再能新建。
 // 数据模型：单 JSON blob（orders 数组），经 sync.js 云同步（同设备组共用一个同步码）。
+// v23：整批邮费/回款**可改可删**。每单多记 batchFeeShare/batchIncomeShare（本次真正摊到它头上的分额），
+//      「自带部分 = fee − batchFeeShare/100」就成了覆盖/清零/退出扣减的地基；
+//      批次表头加了「改本批邮费」入口（点开弹窗并预选该批全部成员）。
 (function () {
   "use strict";
 
@@ -25,6 +28,7 @@
   let prefillPlatform = "";   // 「再来一单」预填时暂存原单平台（表单里没有平台输入框）
   let payTargetId = null;
   let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
+  let batchMode = "overwrite"; // 弹窗里已有的整批再填金额时的语义：overwrite=改成新值 / append=追加到原有
   let currentFilter = "在途";
 
   // 报表
@@ -133,7 +137,10 @@
   // 而负的 fee 会让两处自相矛盾——报表「本期邮费合计」只累加 > 0 的 fee（显示 ¥0），
   // 卡片上却照原样显示「邮费 −¥3」。收敛后全应用只有一个口径。
   // 注意：income 不在此列（负数回款在各处口径一致，没有这种自相矛盾），故不动。
+  // v23 的 batchFeeShare / batchIncomeShare 也走同一规则（负值归 0），另加取整——它们的单位是**分**。
   function nonNegative(v) { const n = numberValue(v); return n < 0 ? 0 : n; }
+  // 份额字段（分，整数）：负值归 0 + 取整，保证「分摊在分的层面算」这条不变量
+  function shareCents(v) { return Math.max(0, Math.round(numberValue(v))); }
 
   function normalizeData(source) {
     const out = { version: 1, orders: [] };
@@ -162,6 +169,11 @@
         // batchCount = 结算那一刻这一批的成员数；有人退出本批后不再改写它，
         // 表头据此区分「有人退出」（预期内）与「金额被改过」（真漂移）。老数据没有 → 0
         batchCount: Math.max(0, Math.round(numberValue(o.batchCount))),
+        // v23：这一单在「整批邮费/回款」里**实际摊到多少**（分，整数）。整批录入值只管分组与对账，
+        // 有了它才算得出「这一单自带的邮费」= fee − batchFeeShare/100（回款同理）；覆盖/清零/
+        // 退出扣减全靠它。老数据没有 → 0，此时老批次的份额在覆盖/退出时按权重反推一次（见 batchShares）
+        batchFeeShare: shareCents(o.batchFeeShare),
+        batchIncomeShare: shareCents(o.batchIncomeShare),
         note: String(o.note || "").slice(0, 300),
         createdAt: String(o.createdAt || new Date().toISOString()),
       });
@@ -302,6 +314,37 @@
     return { totalCents, batches, looseCents, looseCount, looseNames };
   }
 
+  // 这一批里**每张单各摊到多少分**（整批邮费 / 整批回款各一份表）。
+  // 权威来源是结算时写下的 batchFeeShare / batchIncomeShare；唯一的例外是 v23 之前的老批次——
+  // 整批数字 > 0 而各单份额全为 0（那时还没这两个字段），就按当时的分摊规则（权重＝各单垫付、
+  // 在分层面取整）用整批数字反推一次。不反推的话，「覆盖」会把成员入批前的自带邮费当成 0、
+  // 把整批数字再叠一遍（fee 会越改越大），「退出扣减」也无从扣起。
+  // 反推只在**份额全为 0**时发生：份额有值但合计对不上，说明那一批后来被手工改过或删过单，
+  // 这时必须相信单上的记录，不能拿整批数字重算（那会把别人改过的钱抹平）。
+  function batchShares(members, shareKey, totalCents) {
+    const recorded = members.map((o) => shareCents(o[shareKey]));
+    if (totalCents <= 0 || recorded.some((v) => v > 0)) return recorded;
+    return splitByWeight(totalCents, members.map((o) => Math.max(0, toCents(o.cost))));
+  }
+  // 这一批各成员当前的份额表（Map: 单 id → 分），老批次按权重反推。
+  // 覆盖时要拿它算「自带部分」，所以必须按 id 取——弹窗里的顺序和 data.orders 的顺序不一定一样
+  function batchShareMap(batchId, shareKey, totalCents) {
+    const members = data.orders.filter((o) => o.batchId === batchId);
+    const table = batchShares(members, shareKey, totalCents);
+    const map = new Map();
+    members.forEach((m, i) => map.set(m.id, table[i]));
+    return map;
+  }
+  // 一张单「自带的部分」（分）＝ 它现在的金额 − 它在本批分摊到的份额（份额由调用方给：
+  // 覆盖时来自 batchShareMap，因为老批次单上没有份额字段、得按整批数字反推）。
+  // 成员入批前自己记过邮费、或它带着上一批的摊额挪进新批次时，全靠这个减法把原值摘出来。
+  function ownCentsOf(order, amountKey, shareValue) {
+    const total = amountKey === "income"
+      ? (order.income === null || order.income === undefined ? 0 : toCents(order.income))
+      : toCents(order[amountKey]);
+    return total - shareValue;
+  }
+
   // ---- 渲染 ----
   function render() {
     renderDash();
@@ -425,7 +468,11 @@
   function batchDrift(g, members, batchCount) {
     const notes = [];
     if (batchCount > 0 && members.length < batchCount) {
-      notes.push({ warn: false, text: `本批已有 ${batchCount - members.length} 单不在其中（退出或删除），整批口径仍含它们` });
+      // v23 起不再断言「整批口径仍含它们」：退出本批的人带走的份额会从剩余成员的整批口径里
+      // **扣掉**（见 leaveBatch），录入值因此恒等于当前成员的份额合计。措辞保持中性——
+      // batchCount 分不出「退出本批」与「删除该单」，而删单走的是另一条路（份额不扣，由下面的
+      // 金额告警如实报出来）。那句话留着已经不准，删掉。
+      notes.push({ warn: false, text: `本批已有 ${batchCount - members.length} 单不在其中（退出或删除）` });
     }
     const diff = [];
     if (g.feeCents > 0) {
@@ -457,7 +504,10 @@
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
         <span class="bh-count">${g.count} 单</span>
       </div>
-      <div class="bh-meta">整批：${bits.join(" · ")}</div>
+      <div class="bh-meta-row">
+        <div class="bh-meta">整批：${bits.join(" · ")}</div>
+        <button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批邮费</button>
+      </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
     </div>`;
@@ -821,12 +871,16 @@
       incomeDate: existing ? existing.incomeDate : null,
       status: f.status.value,
       fee: numberValue(f.fee.value),
-      // 编辑不改变批次归属（改的是这一单自己的字段，整批口径仍以批量结算时为准）
+      // 编辑不改变批次归属（改的是这一单自己的字段，整批口径仍以批量结算时为准）；
+      // v23 的份额同样原样带过——它们记的是「本批摊到这一单多少」，编辑这一单的邮费时不能丢，
+      // 丢了「自带部分」就算错了（下次覆盖会把整批数字再叠一遍）
       batchId: existing ? existing.batchId : "",
       batchDate: existing ? existing.batchDate : "",
       batchFee: existing ? existing.batchFee : 0,
       batchIncome: existing ? existing.batchIncome : 0,
       batchCount: existing ? existing.batchCount : 0,
+      batchFeeShare: existing ? existing.batchFeeShare : 0,
+      batchIncomeShare: existing ? existing.batchIncomeShare : 0,
       note: String(f.note.value || "").trim(),
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
@@ -900,8 +954,11 @@
     toast("已删除");
   }
 
-  // 退出本批：结错批时的救回口子。只解开这一单的批次归属、不动钱——
-  // 整批分摊到它头上的邮费/回款留在它自己的 fee/income 里，照旧算利润
+  // 退出本批：结错批时的救回口子。解开这一单的批次归属，**不动它自己的钱**——
+  // 整批分摊到它头上的邮费/回款留在它自己的 fee/income 里，照旧算利润（v20 定的规矩）。
+  // v23 补的那一半：它带走的份额要**从剩余成员的整批口径里扣掉**，整批录入值才恒等于
+  // 「当前成员实际分摊之和」。v22 之前不扣，于是退出后表头永远报一句「整批口径仍含它们」式的
+  // 假漂移（D-3），而这句陈述又把同一批的金额告警顶掉，用户分不清是退出还是钱被改坏了。
   function leaveBatch(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o || !o.batchId) return;
@@ -910,14 +967,25 @@
     const title = `一起寄出 · ${o.batchDate || o.date}`;
     const tail = others.length === 0
       ? "它本来就是这一批里唯一的一单，退出后这一批就没了。"
-      : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款照旧记在它们身上）。`}`;
+      : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款会按份额扣掉它那部分）。`}`;
     if (!confirm(`「${o.name}」退出「${title}」这一批？\n${tail}\n`
       + `已经分摊到它头上的邮费 ${money(o.fee)}${o.income === null ? "" : "、回款 " + money(o.income)} 不改动，留在这一单上继续算利润。`)) return;
     // 退出者（以及「只剩它自己」时一并退出那一单）清空全部批次字段；留着的成员**不动 batchCount**——
     // 它记的是「结算那一刻有几个人」，正是表头区分「有人退出」与「金额被改过」的依据。
     // 剩下的人之后若原班人马再结一次，batchCount 会被重写成当时的人数，提示随之消失。
-    [o, ...(others.length === 1 ? others : [])].forEach((x) => {
+    const g = batchGroups().get(o.batchId);
+    const idx = mates.findIndex((x) => x.id === id);
+    const outFee = idx < 0 ? 0 : batchShares(mates, "batchFeeShare", g ? g.feeCents : 0)[idx];
+    const outIncome = idx < 0 ? 0 : batchShares(mates, "batchIncomeShare", g ? g.incomeCents : 0)[idx];
+    const leavers = [o].concat(others.length === 1 ? others : []);
+    const leaverIds = new Set(leavers.map((x) => x.id));
+    mates.filter((x) => !leaverIds.has(x.id)).forEach((x) => {
+      x.batchFee = Math.max(0, toCents(x.batchFee) - outFee) / 100;
+      x.batchIncome = Math.max(0, toCents(x.batchIncome) - outIncome) / 100;
+    });
+    leavers.forEach((x) => {
       x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0; x.batchCount = 0;
+      x.batchFeeShare = 0; x.batchIncomeShare = 0;
     });
     saveData();
     toast(others.length === 1 ? "已退出，那一批也解散了" : "已退出本批，这一单变成单寄");
@@ -926,18 +994,31 @@
   // ---- 批量结算（整批寄出 / 对方一笔总回款，按垫付占比分摊）----
   // 结算过的单子记下批次：一批一起寄出去的货从此绑在一起，回头补回款时整批一键勾选，
   // 账本和报表里也按「一起寄出」合并显示，看得到这一批到底是哪些货。
-  function openBatchModal() {
-    const pending = data.orders.filter((o) => o.status === "在途");
-    if (pending.length === 0) { toast("没有在途单可结算"); return; }
+  // v23：所勾选单**恰好是某个已存在批次的整批原班人马**时，这次填的金额可以选
+  // 「改成新值（覆盖）」还是「追加到原有」——覆盖用于「寄出去后发现邮费变了」，填 0 就是
+  // 删掉这一批的这笔钱（成员回到各自的自带部分）；两个框都留空 = 一个字都不动。
+  // 从批次表头「改本批邮费」进来时预选该批全部成员（含已回款的），于是「改错的钱」变成
+  // 点一下 → 填新值 → 覆盖。
+  function openBatchModal(preselectBatchId) {
+    const pool = data.orders.filter((o) => o.status === "在途");
+    if (preselectBatchId) {
+      // 这一批的**全部成员**都要列进来：弹窗平时只列在途单，已经收过款的那批一进来就空了，
+      // 「邮费记错了」却正好常常是在回款之后才发现的
+      const seen = new Set(pool.map((o) => o.id));
+      data.orders.forEach((o) => {
+        if (o.batchId === preselectBatchId && !seen.has(o.id)) { pool.push(o); seen.add(o.id); }
+      });
+    }
+    if (pool.length === 0) { toast("没有在途单可结算"); return; }
     const groups = batchGroups();
     // 同批次的单排在一起、批次日期新的在前（先摊了邮费的那批最好找），没成批的殿后
     const rank = new Map();
-    pending.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((o) => {
+    pool.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((o) => {
       if (!o.batchId || rank.has(o.batchId)) return;
       const g = groups.get(o.batchId);
       rank.set(o.batchId, g ? g.date : "");
     });
-    pending.sort((a, b) => {
+    pool.sort((a, b) => {
       const ra = a.batchId ? rank.get(a.batchId) : undefined;
       const rb = b.batchId ? rank.get(b.batchId) : undefined;
       if (ra === undefined && rb === undefined) return a.date < b.date ? 1 : -1;
@@ -946,14 +1027,54 @@
       if (ra !== rb) return ra < rb ? 1 : -1;
       return a.date < b.date ? 1 : -1;
     });
-    batchItems = pending.map((o) => ({
-      id: o.id, name: o.name, cost: o.cost, batchId: o.batchId, checked: true,
+    batchItems = pool.map((o) => ({
+      id: o.id, name: o.name, cost: o.cost, batchId: o.batchId,
+      checked: preselectBatchId ? o.batchId === preselectBatchId : true,
     }));
+    batchMode = "overwrite";      // 默认覆盖：改错的钱本来就该用新值盖掉
     $("#batchFee").value = "";
     $("#batchIncome").value = "";
     $("#batchDate").value = todayStr();
     renderBatchList();
     $("#batchModal").classList.add("show");
+  }
+
+  // 所勾选的单恰好是某个已存在批次的整批原班人马吗？→ 提交时复用该批次号（v19 的既有规则），
+  // 弹窗里也用它决定要不要问「覆盖 / 追加」。prev=null ＝ 这次是新批次，没有歧义、不显示选择。
+  function selectedBatchInfo() {
+    const orders = batchItems.filter((it) => it.checked)
+      .map((it) => data.orders.find((o) => o.id === it.id)).filter(Boolean);
+    let reuseId = "";
+    if (orders.length > 0 && orders.every((o) => o.batchId)) {
+      const ids = new Set(orders.map((o) => o.batchId));
+      if (ids.size === 1) {
+        const cand = [...ids][0];
+        const selectedIds = new Set(orders.map((o) => o.id));
+        if (data.orders.every((o) => o.batchId !== cand || selectedIds.has(o.id))) reuseId = cand;
+      }
+    }
+    return { orders, reuseId, prev: reuseId ? (batchGroups().get(reuseId) || null) : null };
+  }
+
+  // 「改成新值（覆盖）/ 追加到原有」这一行：只在所勾选单恰好是某个**已有邮费或回款**的整批
+  // 原班人马时出现（新建批次没有歧义，不打扰）。「留空＝不动」要写在明面上：先只摊邮费、
+  // 回款到了再补一趟是常用的两趟打法，不能因为默认是覆盖就把已经记好的邮费清掉。
+  function updateBatchMode() {
+    const box = $("#batchMode");
+    if (!box) return;
+    const prev = selectedBatchInfo().prev;
+    const show = !!(prev && (prev.feeCents > 0 || prev.incomeCents > 0));
+    if (!show) { box.hidden = true; box.innerHTML = ""; return; }
+    const bits = [];
+    if (prev.feeCents > 0) bits.push(`邮费 <b>${money(prev.feeCents / 100)}</b>`);
+    if (prev.incomeCents > 0) bits.push(`回款 <b>${money(prev.incomeCents / 100)}</b>`);
+    box.hidden = false;
+    box.innerHTML = `<div class="bm-hint">这一批现有 ${bits.join(" · ")}。两个框<b>留空＝不动</b>；`
+      + `填数字按下面选的方式处理，填 0 就是删掉这一批的这笔钱。</div>`
+      + `<div class="bm-chips">`
+      + `<button type="button" class="bm-chip${batchMode === "overwrite" ? " on" : ""}" data-mode="overwrite">改成新值（覆盖）</button>`
+      + `<button type="button" class="bm-chip${batchMode === "append" ? " on" : ""}" data-mode="append">追加到原有</button>`
+      + `</div>`;
   }
 
   function closeBatchModal() {
@@ -986,7 +1107,7 @@
           <span class="bg-title">一起寄 · ${escapeHtml(g ? g.date : "")}</span>
           <span class="bi-cost">${idxs.length} 单</span>
         </label>`);
-        if (tags.length > 0) parts.push(`<div class="bg-tags">${tags.join(" · ")}${onCount === idxs.length ? `　再填邮费会累加到这批上` : ""}</div>`);
+        if (tags.length > 0) parts.push(`<div class="bg-tags">${tags.join(" · ")}${onCount === idxs.length ? `　整批再填金额可按「覆盖 / 追加」处理` : ""}</div>`);
       } else if (!it.batchId && !sepShown && seen.size > 0) {
         sepShown = true;
         parts.push(`<div class="bg-sep">未成批（单寄的单子）</div>`);
@@ -999,6 +1120,7 @@
     });
     $("#batchList").innerHTML = parts.join("");
     $$("#batchList input[data-partial='1']").forEach((cb) => { cb.indeterminate = true; });
+    updateBatchMode();
     updateBatchSummary();
   }
 
@@ -1012,35 +1134,93 @@
   }
 
   function submitBatch() {
-    const selected = batchItems.filter((it) => it.checked);
-    if (selected.length === 0) { toast("先勾选要结算的在途单"); return; }
-    const feeCents = Math.max(0, toCents($("#batchFee").value));
-    const incomeCents = Math.max(0, toCents($("#batchIncome").value));
-    const orders = selected
-      .map((it) => data.orders.find((o) => o.id === it.id))
-      .filter(Boolean);
-    if (orders.length === 0) { closeBatchModal(); return; }
+    const sel = selectedBatchInfo();
+    const orders = sel.orders;
+    if (orders.length === 0) { toast("先勾选要结算的在途单"); return; }
+    // 留空＝这一项不动（保住「先只摊邮费、回款到了再补一趟」的两趟打法：默认是覆盖，
+    // 但覆盖只对**填了数字**的那一项生效，不会顺手把已有邮费清掉）
+    const feeGiven = String($("#batchFee").value || "").trim() !== "";
+    const incomeGiven = String($("#batchIncome").value || "").trim() !== "";
+    const feeCents = feeGiven ? Math.max(0, toCents($("#batchFee").value)) : 0;
+    const incomeCents = incomeGiven ? Math.max(0, toCents($("#batchIncome").value)) : 0;
     const weights = orders.map((o) => Math.max(0, toCents(o.cost)));
-
-    // 批次：整批原班人马都勾上了 → 续用原批次号（先摊邮费、回款到了再补一趟）；
-    // 只勾了一半或混着别的单 → 另起一批，免得同一批的单子整批口径对不上
-    const batchIds = new Set(orders.map((o) => o.batchId).filter(Boolean));
-    let reuseId = "";
-    if (orders.every((o) => o.batchId) && batchIds.size === 1) {
-      const cand = [...batchIds][0];
-      const selectedIds = new Set(orders.map((o) => o.id));
-      if (data.orders.every((o) => o.batchId !== cand || selectedIds.has(o.id))) reuseId = cand;
-    }
-    const batchId = reuseId || uid();
-    const prev = reuseId ? batchGroups().get(reuseId) : null;
+    const prev = sel.prev;
+    const batchId = sel.reuseId || uid();
     const batchDate = (prev && prev.date) || $("#batchDate").value || todayStr();
-    const batchFeeCents = (prev ? prev.feeCents : 0) + feeCents;
-    const batchIncomeCents = (prev ? prev.incomeCents : 0) + incomeCents;
+    // 覆盖 = 按这次填的整批总额**重新分摊**（幂等：同样的输入跑两遍结果一样，见 ownCentsOf）；
+    // 追加 = 沿用 v22 的累加语义；新批次没有歧义，一律按新批次写入。
+    const overwrite = !!prev && batchMode !== "append";
+    // 覆盖要拿这一批**当前**的份额表（按 id 取；老批次单上没有份额字段 → 按整批数字×权重反推），
+    // 因为它决定「自带部分」是多少：份额读成 0 的话，覆盖会把整笔 fee 当自带部分、金额越改越大
+    const oldFeeShares = overwrite ? batchShareMap(sel.reuseId, "batchFeeShare", prev.feeCents) : null;
+    const oldIncomeShares = overwrite ? batchShareMap(sel.reuseId, "batchIncomeShare", prev.incomeCents) : null;
 
-    // 邮费：累加到各单已有邮费上（单子可能自己寄出时已记过邮费）
-    const feeShares = splitByWeight(feeCents, weights);
-    orders.forEach((o, i) => {
-      o.fee = (toCents(o.fee) + feeShares[i]) / 100;
+    // 原批次被带走的份额：必须在改动任何单之前算完（改完再算读到的就是已经写过的值）。
+    // 只勾了某一批的一部分人、或几个批混着一起结 → 这些单会进新批次，它们从原批次带走的份额
+    // 同样要从原批次**剩余成员**的整批口径里扣掉（v23·D-3 的另一半：重组成批）
+    if (!sel.reuseId) {
+      const takenIds = new Set(orders.map((o) => o.id));
+      const groups = batchGroups();
+      const deduct = new Map();
+      new Set(orders.map((o) => o.batchId).filter(Boolean)).forEach((sid) => {
+        const g = groups.get(sid);
+        if (!g) return;
+        const members = data.orders.filter((o) => o.batchId === sid);
+        const feeShares = batchShares(members, "batchFeeShare", g.feeCents);
+        const incomeShares = batchShares(members, "batchIncomeShare", g.incomeCents);
+        let fee = 0, income = 0;
+        members.forEach((m, i) => {
+          if (!takenIds.has(m.id)) return;
+          fee += feeShares[i];
+          income += incomeShares[i];
+        });
+        if (fee > 0 || income > 0) deduct.set(sid, { fee, income });
+      });
+      deduct.forEach((d, sid) => {
+        data.orders.forEach((m) => {
+          if (m.batchId !== sid || takenIds.has(m.id)) return;
+          m.batchFee = Math.max(0, toCents(m.batchFee) - d.fee) / 100;
+          m.batchIncome = Math.max(0, toCents(m.batchIncome) - d.income) / 100;
+        });
+      });
+    }
+
+    // 邮费：覆盖＝「自带部分 + 本次新份额」（自带部分 = 现在的 fee − 本批份额，所以重复跑结果不变）；
+    // 追加＝直接在现有 fee 上累加（单子可能自己寄出时已记过邮费，这是 v22 起的有意设计）。
+    // 份额字段：新批次从零起算（上一批的份额并进自带部分），同批追加才累加。
+    if (feeGiven) {
+      const feeShares = splitByWeight(feeCents, weights);
+      orders.forEach((o, i) => {
+        const base = prev ? shareCents(o.batchFeeShare) : 0;
+        const next = overwrite ? ownCentsOf(o, "fee", oldFeeShares.get(o.id) || 0) + feeShares[i] : toCents(o.fee) + feeShares[i];
+        // 覆盖时兜一下底：自带部分可能是负数（有人手工把这一单的邮费改到比它摊到的还低，
+        // 或这份是「删过成员的旧批次」反推出来的份额），加起来若为负就按 0 收——负数只可能来自
+        // 脏数据，一旦写进账本又会变成「卡片显示 −¥3、报表 ¥0」那种自相矛盾（v22 修的就是这个）
+        o.fee = Math.max(0, next) / 100;
+        o.batchFeeShare = (overwrite ? 0 : base) + feeShares[i];
+      });
+    }
+
+    // 回款：同理（回款是「收到的钱」，所以追加＝在已收到的金额上继续累加）。
+    // 总回款 > 0 才把单子置为已回款；填 0 是「清零」——金额退回自带部分，状态不因此回退。
+    if (incomeGiven) {
+      const incomeShares = splitByWeight(incomeCents, weights);
+      orders.forEach((o, i) => {
+        const base = prev ? shareCents(o.batchIncomeShare) : 0;
+        const have = o.income === null || o.income === undefined ? 0 : toCents(o.income);
+        o.income = (overwrite ? ownCentsOf(o, "income", oldIncomeShares.get(o.id) || 0) + incomeShares[i] : have + incomeShares[i]) / 100;
+        o.batchIncomeShare = (overwrite ? 0 : base) + incomeShares[i];
+        if (incomeCents > 0) {
+          o.incomeDate = $("#batchDate").value || todayStr();
+          o.status = "已回款";
+        }
+      });
+    }
+
+    // 整批口径：覆盖时 = 这次填的总额；追加/留空 = 原值 + 本次（留空时加的是 0，等于一个字不动）
+    const batchFeeCents = (overwrite && feeGiven) ? feeCents : (prev ? prev.feeCents : 0) + feeCents;
+    const batchIncomeCents = (overwrite && incomeGiven) ? incomeCents : (prev ? prev.incomeCents : 0) + incomeCents;
+    orders.forEach((o) => {
       o.batchId = batchId;
       o.batchDate = batchDate;
       o.batchFee = batchFeeCents / 100;
@@ -1049,21 +1229,16 @@
       o.batchCount = orders.length;
     });
 
-    // 回款：直接赋值；总回款为 0/空 → 只分摊邮费，状态保持「在途」
-    if (incomeCents > 0) {
-      const incomeDate = $("#batchDate").value || todayStr();
-      const incomeShares = splitByWeight(incomeCents, weights);
-      orders.forEach((o, i) => {
-        o.income = incomeShares[i] / 100;
-        o.incomeDate = incomeDate;
-        o.status = "已回款";
-      });
-    }
-
     closeBatchModal();
     saveData();
-    const batchNote = orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : "";
-    toast(`已结算 ${orders.length} 单${batchNote} · 回款 ${money(incomeCents / 100)} · 邮费 ${money(feeCents / 100)}`);
+    const amounts = [];
+    if (feeGiven) amounts.push(`邮费 ${money(feeCents / 100)}`);
+    if (incomeGiven) amounts.push(`回款 ${money(incomeCents / 100)}`);
+    let msg;
+    if (!feeGiven && !incomeGiven) msg = "这一批的成员与日期已记下，金额没动";
+    else if (prev) msg = `已${overwrite ? "覆盖" : "追加"}本批 · ${amounts.join(" · ")}`;
+    else msg = `已结算 ${orders.length} 单${orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : ""} · ${amounts.join(" · ")}`;
+    toast(msg);
   }
 
   // ---- 云同步（改动防抖推送，启动拉取）----
@@ -1237,6 +1412,8 @@
       else if (act === "dup") duplicateOrder(id);
       else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
       else if (act === "unbatch") leaveBatch(id);
+      // 批次表头上的「改本批邮费」：直接开批量结算并预选这一批的全部成员（含已回款的）
+      else if (act === "batchfee") openBatchModal(btn.dataset.batch || "");
       else if (act === "del") deleteOrder(id);
     });
 
@@ -1256,10 +1433,17 @@
       updatePayPreview();
     });
 
-    // 批量结算
-    $("#batchBtn").addEventListener("click", openBatchModal);
+    // 批量结算（注意别把 click 事件本身当参数传进去：openBatchModal 的第一个参数是「预选哪一批」）
+    $("#batchBtn").addEventListener("click", () => openBatchModal());
     $("#batchCancel").addEventListener("click", closeBatchModal);
     $("#batchSubmit").addEventListener("click", submitBatch);
+    // 「改成新值（覆盖）/ 追加到原有」：容器是稳定的，按钮每次重渲染，所以用事件委托
+    $("#batchMode").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-mode]");
+      if (!btn) return;
+      batchMode = btn.dataset.mode === "append" ? "append" : "overwrite";
+      updateBatchMode();
+    });
     $("#batchList").addEventListener("change", (ev) => {
       const cb = ev.target.closest("input[type=checkbox]");
       if (!cb) return;
