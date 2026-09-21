@@ -776,8 +776,35 @@
   }
 
   // 商品利润占比环形图
+  // 环形图中心那行金额：可用宽度就是**内圆直径**（2×(r − sw/2)），而金额位数是会长的。
+  // 用户截图的问题：垫付合计 ¥13,159.81 在 15px 字号下约 89px 宽，而内圆只有 71px——数字直接压在圆环上。
+  // 这里按字宽估算自动缩号；缩到下限还放不下就依次退让（先去小数 → 再上万/亿紧凑写法），保证永不压环。
+  // 字宽系数是相对字号的**偏保守**估值（数字 0.62、逗号/点 0.33、负号 0.4、¥ 与汉字按 1 算），
+  // 再只肯用内圆直径的 92%（留 8% 给字体度量误差）——宁可把字缩小一点，也不许压到环上。
+  // 判据侧有几何断言兜底（verify-webapp.mjs 34.x：把字的包围盒四角拿去和内圆半径比）。
+  function fitDonutValue(amount, innerPx) {
+    const MAX = 15, MIN = 9.5, BUDGET = 0.92;
+    const units = (s) => Array.from(s).reduce((a, ch) =>
+      a + (/[0-9]/.test(ch) ? 0.62 : /[.,]/.test(ch) ? 0.33 : ch === "-" ? 0.4 : 1), 0);
+    const n = numberValue(amount);
+    const abs = Math.abs(n);
+    const sign = n < 0 ? "-" : "";
+    const cands = [money(n)];
+    if (!Number.isInteger(abs)) cands.push(money(Math.round(n)));          // 退一步：去掉分位
+    if (abs >= 1e8) cands.push(`${sign}¥${(abs / 1e8).toFixed(1)}亿`);      // 再退：紧凑写法
+    else if (abs >= 1e4) cands.push(`${sign}¥${(abs / 1e4).toFixed(1)}万`);
+    const budget = innerPx * BUDGET;
+    for (const text of cands) {
+      const size = budget / units(text);
+      if (size >= MIN) return { text, size: Math.min(MAX, size) };
+    }
+    return { text: cands[cands.length - 1], size: MIN };
+  }
+
   function chartDonutSVG(items, total, centerLabel = "已结算利润", colors = PALETTE) {
-    const S = 128, r = 44, sw = 17, C = 2 * Math.PI * r;
+    // v30：环细一点（17→13）、半径大一点（44→45）——内圆从 71px 放到 77px，中心那行金额才有地方落脚，
+    // 观感也轻一些（原来那圈 17px 的厚环是「有点丑」的来源之一）
+    const S = 128, r = 45, sw = 13, C = 2 * Math.PI * r;
     let offset = 0, slices = "";
     items.forEach((it, i) => {
       const frac = it.value / total;
@@ -787,11 +814,13 @@
         stroke-width="${sw}" stroke-dasharray="${dash}" transform="rotate(${(offset * 360 - 90).toFixed(2)} ${S / 2} ${S / 2})"/>`;
       offset += frac;
     });
+    const cv = fitDonutValue(total, 2 * (r - sw / 2) - 4);
+    const labelY = (S / 2 + 5 + cv.size * 0.62).toFixed(1);
     return `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}">
       <circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${sw}"/>
       ${slices}
-      <text x="${S / 2}" y="${S / 2 - 2}" font-size="15" font-weight="700" style="fill:var(--ink)" text-anchor="middle">${money(total)}</text>
-      <text x="${S / 2}" y="${S / 2 + 14}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
+      <text x="${S / 2}" y="${S / 2 - 2}" font-size="${cv.size.toFixed(1)}" font-weight="700" style="fill:var(--ink);font-variant-numeric:tabular-nums" text-anchor="middle">${cv.text}</text>
+      <text x="${S / 2}" y="${labelY}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
     </svg>`;
   }
 
