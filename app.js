@@ -77,6 +77,10 @@
   let baodanScope = null;     // { type:"batch"|"filter", batchId, title }
   let baodanCandidates = [];  // 这一次范围里的全部候选单（快照）
   let baodanSel = new Set();  // 勾选中的单 id
+  // v31：用户**真的动过**快递单号那一格没有（change / 「清空」置位，开面板与关面板复位）。
+  // 它是「写账本」的**必要条件**——预填值是范围里的众数，少数派单与它必然不同，
+  // 只比字符串会让「点一下复制、什么都没改」顺手改掉那些单的正确单号（静默串单）。
+  let baodanTrackingTouched = false;
   let currentFilter = "在途";
 
   // 报表
@@ -224,6 +228,12 @@
         batchFeeShare: shareCents(o.batchFeeShare),
         batchIncomeShare: shareCents(o.batchIncomeShare),
         note: String(o.note || "").slice(0, 300),
+        // v31：快递单号（可空）。**这一行必须留在白名单里**——本函数是加载与云端拉取的唯一入口，
+        // 没列在这里的字段会被它**静默丢掉**（记了单号、一刷新就没了，且全程不报错）。
+        // 值走 cleanTracking（折空白 + 去首尾空格 + 截 40 字），与界面侧**同一个口径**：
+        // 一份带换行的脏账本（只能从导入 JSON / 云端旧数据进来）原先会「存 A\nB、显示 A B」——
+        // 账本、卡片、报单文本三处对不上。现在账本里存的就是那一格会显示的那个规范值。
+        tracking: cleanTracking(o.tracking),
         createdAt: String(o.createdAt || new Date().toISOString()),
       });
     });
@@ -570,6 +580,17 @@
     </div>`;
   }
 
+  // v31：快递单号（可空）**全局唯一**的一支规范化——换行/连续空白折成一个空格、去首尾空格、截 40 字。
+  // 白名单（normalizeData）、记单/编辑表单、报单面板那一格与报单文本、卡片，**全都过它**：账本里存的就是
+  // 界面上会显示的那个值，三处（格/文本/账本）永远对得上。
+  // 为什么必须折空白而不是只 trim：报单是「一行一件」，一个带换行的单号会把那一行切成半截（v29 对商品名
+  // 踩过同一个坑）；这类脏值只能从「导入的 JSON / 云端旧数据」进来，而三条入口最后都要过这一支。
+  // 曾经有过两套口径（白名单只 trim+slice）——表现是账本存 `A\nB`、卡片与文本显示 `A B`，
+  // 只在脏数据上出现，但「账本里那一格永远是一个规范值」这句话就不成立了。
+  function cleanTracking(v) {
+    return String(v === null || v === undefined ? "" : v).replace(/\s+/g, " ").trim().slice(0, 40);
+  }
+
   // soloBatch：这一单的批次只剩它自己（页面上不显示「一起寄出」表头），卡片里补一句归属，
   // 免得「退出本批」这个按钮看起来没有来由
   function orderCardHtml(o, extraClass, soloBatch) {
@@ -601,12 +622,14 @@
       actions.push(`<button class="act" data-act="unbatch" data-id="${escapeHtml(o.id)}">退出本批</button>`);
     }
     actions.push(`<button class="act danger" data-act="del" data-id="${escapeHtml(o.id)}">删除</button>`);
+    // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
+    // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
         <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
       </div>
-      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
+      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
       <div class="order-money">
         <span>垫付 <b>${money(o.cost)}</b></span>
         <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
@@ -989,6 +1012,10 @@
     if (order && !statusOpts.includes(order.status)) statusOpts.push(order.status);
     fillSelect(f.status, statusOpts.map((s) => [s, statusLabel(s)]), order ? order.status : "在途");
     f.note.value = src ? src.note : "";
+    // v31：快递单号只在**编辑既有单**时回填它的值；新建与「再来一单」一律空着——
+    // 「再来一单」是又寄了一次、单号一定不一样（沿用原单的单号会报错单，比空着严重）。
+    // 注意不能写成 `src ? src.tracking : ""`：src 也包含 prefill（再来一单），那正是要排除的那条路。
+    f.tracking.value = order ? cleanTracking(order.tracking) : "";
     // v24：批内单的「邮费该在哪改」。用户的困惑点正是这个——他一直在找"每一单的邮费"，
     // 而项目模型是**一起寄的一批只有一笔邮费**，那个数记在批次上（改入口在批次表头和这张单的
     // 卡片上）。未成批的单不加这行（它的邮费就是它自己的）。不改表单行为：邮费框照样可改，
@@ -1061,6 +1088,9 @@
         batchId: "", batchDate: "", batchFee: 0, batchIncome: 0, batchCount: 0,
         batchFeeShare: 0, batchIncomeShare: 0,
         note: String(f.note.value || "").trim(),
+        // v31：收入单不会寄件，单号恒空（那一格在收入模式下是 .kind-order、隐藏且不参与校验，
+        // 与邮费/数量同一条规矩：隐藏字段取库里的定值，不回读界面）
+        tracking: "",
         createdAt: new Date().toISOString(),
       };
       data.orders.push(order);
@@ -1115,6 +1145,9 @@
       batchFeeShare: existing ? existing.batchFeeShare : 0,
       batchIncomeShare: existing ? existing.batchIncomeShare : 0,
       note: String(f.note.value || "").trim(),
+      // v31：新建与编辑**同一条表达式**——编辑时这一格由 openForm 回填了原值，用户改成什么就存什么；
+      // 清空这一格再保存＝把这一单的单号去掉（与「邮费留空＝删掉」同一条规矩，界面里也有「清空」小按钮）
+      tracking: cleanTracking(f.tracking.value),
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
     if (existing) Object.assign(existing, order, { id: existing.id });
@@ -1194,6 +1227,10 @@
   //   · 回款金额那个框带着 required，置空会被浏览器拦下（点完「清空」再点确认会像卡住一样没反应），
   //     所以置 0——金额口径完全一样（numberValue("") === numberValue("0") === 0）。
   // 置完立刻跑既有的利润预览，数字当场跟着变。
+  // v31：报单面板「快递单号」那一格的「清空」也走这一支（data-clear="tracking"）。
+  // 清空＝**用户动过那一格**（与手输同一个提交口）：「留空＝去掉这几单的单号」与邮费那一格同一条规矩。
+  // 这里不自己动手写库/复制，直接交给 commitBaodanTracking（写库 + 重算文本 + 重新复制 + toast 一套全走它），
+  // 免得清空与手输两条路各写一套、日子久了行为分叉。
   function clearField(ev) {
     const btn = ev.target.closest("button[data-clear]");
     if (!btn) return;
@@ -1201,6 +1238,11 @@
     if (btn.dataset.clear === "income") {
       $("#payForm").income.value = "0";
       updatePayPreview();
+      return;
+    }
+    if (btn.dataset.clear === "tracking") {
+      $("#baodanTracking").value = "";
+      commitBaodanTracking();
       return;
     }
     $("#orderForm").fee.value = "";
@@ -1508,7 +1550,10 @@
   //  ③ 件数唯一来源是 **Σqty**，不是订单条数：批次表头那个 `batchCount`（单数）最顺手，
   //     复用它就会出现「4 单各 2 件」报成 ×4、收货商少收 4 件。每行的 ×N 与面板摘要里的件数
   //     都出自同一个 baodanCompute()，杜绝两处各算一套。
-  //  ④ 面板是**只读视图 + 内存态**：勾选、手改文案都不写 localStorage、不进同步包，关掉即丢。
+  //  ④ 面板基本是**只读视图 + 内存态**：勾选、手改文案都不写 localStorage、不进同步包，关掉即丢。
+  //     **例外只有快递单号那一格（v31）**：**用户自己改了它**（change / 「清空」）才写进这次报的那几单
+  //     （见 commitBaodanTracking）。打开面板那一下的自动复制、以及没动过那一格时的「复制报单」，
+  //     一个字都不写——预填只是众数，顺手写会串掉少数派单的正确单号。
   //  ⑤ 组内「代表写法」= 最早那条单的原始 name（见 baodanCompute 里的说明），不是「数组里第一单」。
   function skuKey(name) {
     return String(name || "")
@@ -1534,6 +1579,8 @@
   //   荣耀畅玩 50 6+128 紫色 ×2
   // 即：首行「月.日 待结」（月日不补零，抬头用词用户说无所谓，跟样例保持一致），
   // 底下**一行一件、每行行尾都带 ×N**（用户明确要「加上数量」）。
+  // v31：抬头下面多一行「快递单号 X」（用户这次的要求：报单里要带日期、**快递单号**和明细）——
+  // 值为空时**整行不渲染**（不许出现「快递单号 」这种空占位行，收货商那边看就是一行噪声）。
   // **末尾没有合计行**——收货商自己数，件数交给面板摘要与复制后的提示去交代。
   // 首行是纯文本，用户想改（称呼/单号）直接改文本框。
   function mdShort(dateStr) {
@@ -1547,7 +1594,50 @@
     return `${d.getMonth() + 1}.${d.getDate()}`;
   }
 
-  // 返回 { orders, groups, qty, kinds, header, text }——件数/种数/文本都从这一处出
+  // v31：单号那一格的**预填值** = 这个范围里最常见的非空单号（同一次寄件通常只有一个单号，
+  // 用户填过一次、以后打开面板就自动带着，不用每次重打）。
+  // 空的一律不参与统计——否则「最常见」会被一堆空单统治，永远预填不出东西。
+  // 返回值里带 list（按出现次数降序、同次数按范围内首次出现的先后）——提示行与开面板那句 toast 也用它，
+  // 但**都不再存快照**：每次渲染现算（见 bdTrackingHint 上方说明）。
+  function bdTrackingPick(cands) {
+    const stat = new Map();
+    cands.forEach((o, i) => {
+      const v = cleanTracking(o.tracking);
+      if (!v) return;
+      const rec = stat.get(v) || { value: v, count: 0, first: i };
+      rec.count += 1;
+      stat.set(v, rec);
+    });
+    const list = Array.from(stat.values()).sort((a, b) => b.count - a.count || a.first - b.first);
+    return { value: list.length ? list[0].value : "", list };
+  }
+
+  // v31：单号那一格下面那行小字——**每次渲染现算**（不存快照）。
+  // 快照版踩过一个真缺陷（独立验收在副本里用真实鼠标/键盘打出来的）：把那一格改成统一值、写库成功之后，
+  // hint 还一字不变地说着「有 2 个不同的单号…改这一格才会统一」——它已经统一完了，那句提示当场成了假话。
+  // 现算就在写库/改勾选之后自己消失。
+  // 而且只按**本次勾选的单**算（不是整个范围）：报出去的文本＝勾选的那些单，提示要说的是这个集合的事。
+  // 四种情形，最常用的那条路径一个字都不吵：
+  //   ① 勾选的单里有 ≥2 个不同非空单号 → 列出来（最多 3 个、多的写「等共 N 个」，与「同物异写」那条同一写法），
+  //      并说清「文本里只带上面那一格的值」——预填只是众数，少数派那几单的号并不在文本里；
+  //   ② 勾选的单里恰好一种非空单号、而那一格非空且**与它不同** → 说清「这一格填的号不在这次报的单里」：
+  //      用户取消了少数派勾选之后就是这种局面（文本里带着的那个号不属于任何被报出去的单，收货商按它查不到件）；
+  //   ③ 勾选的单一个号都没有（最常见的新增场景：新寄的货还没抄单号）→ **不给任何提示**，别在这里报警；
+  //   ④ 其余（两边一致、或那一格为空）→ 无提示。
+  function bdTrackingHint(orders, fieldValue) {
+    const list = bdTrackingPick(orders).list;
+    const values = list.map((r) => r.value);
+    if (values.length > 1) {
+      const shown = values.slice(0, 3).join(" / ") + (values.length > 3 ? ` 等共 ${values.length} 个` : "");
+      return `本次报的单里有 ${values.length} 个不同单号：${shown}——文本里只带上面那一格的值；要统一就改这一格。`;
+    }
+    if (values.length === 1 && fieldValue && fieldValue !== values[0]) {
+      return `上面这一格填的单号不在这次报的单里（它们记的是 ${values[0]}）；要改它们就改这一格。`;
+    }
+    return "";
+  }
+
+  // 返回 { orders, groups, qty, kinds, header, tracking, text }——件数/种数/文本都从这一处出
   function baodanCompute() {
     const orders = baodanCandidates.filter((o) => baodanSel.has(o.id));
     const map = new Map();
@@ -1574,9 +1664,53 @@
     // 从账本工具条进来（按当前筛选报）没有批次日期，取今天
     const headDate = (baodanScope && baodanScope.headDate) || todayStr();
     const header = `${mdShort(headDate)} 待结`;
+    // v31：单号取自**面板那一格**（不是账本里的值）——这一格是「这次报出去的单号」，改动它＝改文本第 2 行；
+    // 账本里的单号只在点「复制报单」且两者不同时才被写回（见 baodanApplyTracking）。
+    const tracking = cleanTracking($("#baodanTracking") ? $("#baodanTracking").value : "");
+    const head = tracking ? `${header}\n快递单号 ${tracking}` : header;
     const text = groups.length === 0 ? ""
-      : header + "\n" + groups.map((g) => `${g.name} ×${g.qty}`).join("\n");
-    return { orders, groups, qty, kinds: groups.length, header, text };
+      : head + "\n" + groups.map((g) => `${g.name} ×${g.qty}`).join("\n");
+    return { orders, groups, qty, kinds: groups.length, header, tracking, text };
+  }
+
+  // v31：把面板那一格的单号写进「这次报的那几单」（只写 tracking 一个字段，然后走既有的 saveData：
+  // persist + render + 排程云同步）。返回是否真的写了。
+  // 判据是「与账本里存的不同」——**全部目标单都已经是这个值时什么都不做**：于是同一份报单连点两次
+  // 复制，第二次一个字节都不写（updatedAt 不被平白改掉、不多发一次同步），这就是「值没变不写」那条断言
+  // 钉的东西。清空那一格＝把这几单的单号去掉（value 为空也照写，别当成「没填就不动」）。
+  // **调用方必须先确认「用户真的动过那一格」**（baodanTrackingTouched）——本函数只管值比不比得上。
+  function baodanApplyTracking(value) {
+    const targets = baodanCompute().orders;
+    if (targets.length === 0) return false;
+    if (!targets.some((o) => cleanTracking(o.tracking) !== value)) return false;
+    targets.forEach((o) => { o.tracking = value; });   // 就地改：候选单与账本里是同一批对象，快照不会脱钩
+    saveData();
+    return true;
+  }
+
+  // v31：**用户真的改过那一格之后的唯一提交口**（change 事件与「清空」按钮都走它）。
+  // 为什么写库挂在这里而不是「点复制」上：面板一打开就自动复制过一次，那一刻那一格还是预填的众数，
+  // 而少数派单（同一批里另一个包裹的号）与它必然不同——只比字符串的话，用户「什么都没改、只想再复制一遍」
+  // 就会把那些单的正确单号统一成众数，账本被静默改写且无处可撤。所以：
+  //   · 写库的**必要条件**是「用户动过这一格」（touched，见它的声明）；
+  //   · 复制那一下只在「动过且值仍然不同」时兜一道底（勾选集合在动过之后又变了的那种情形）。
+  // 顺序是四件事：收敛这一格的显示 → 写账本（值没变就不写）→ 重算文本 → **再复制一次剪贴板** → toast。
+  // 重复制不是锦上添花：不重复制的话，剪贴板里还是**打开面板那一刻**的旧文本（没有单号或旧单号），
+  // 而 toast 还在教用户「直接去微信粘贴」——他会粘出一份与面板所见不一致的报单。
+  async function commitBaodanTracking() {
+    baodanTrackingTouched = true;
+    const box = $("#baodanTracking");
+    box.value = cleanTracking(box.value);       // 界面也收敛：超 40 字的当场截断，三处（格/文本/账本）同一个值
+    const written = baodanApplyTracking(box.value);
+    renderBaodan();                             // 文本第 2 行跟着这一格走
+    // 范围里一单都没有（空范围面板）：这一格改了也没账本可写、没有文本可复制，如实说一句就走
+    // （不拦的话会复制一个空串、还报「已重新复制」——那是句假话）
+    if (!$("#baodanText").value.trim()) { toast("这个范围里没有可报的单"); return; }
+    const ok = await writeClipboard($("#baodanText").value, $("#baodanText"));
+    if (!ok) { toast("单号已改，但复制失败：长按上面的文本框手动全选"); return; }
+    toast(written
+      ? `单号已记到 ${baodanCompute().orders.length} 单 · 已重新复制`
+      : "单号没变，账本没动 · 已重新复制");
   }
 
   // 写剪贴板：非安全上下文/旧 WebView/无权限时会抛错，回退 execCommand，两条路都给可见反馈。
@@ -1623,12 +1757,25 @@
     baodanScope.title = fromBatch
       ? `一起寄出 · ${head ? (head.batchDate || head.date) : ""} · ${baodanCandidates.length} 单`
       : `账本当前筛选「${currentFilter}」· ${baodanCandidates.length} 单`;
-    const { qty, kinds, text } = renderBaodan();
+    // v31：单号那一格预填**范围里最常见的非空单号**。这里只取预填值，**不存快照**——
+    // 提示行按「本次勾选的单」现算（见 bdTrackingHint），这样写库统一之后它自己就消失了。
+    baodanTrackingTouched = false;      // 新开一次面板＝这一格还没被用户动过（写账本的必要条件）
+    const tkBox = $("#baodanTracking");
+    if (tkBox) tkBox.value = bdTrackingPick(baodanCandidates).value;
+    const { qty, kinds, text, orders } = renderBaodan();
     $("#baodanModal").classList.add("show");
     // 范围里没有单：面板会写「这个范围里没有可报的单」，但也得给一句 toast —— 点完什么都没发生很像坏了
     if (!text) { toast("这个范围里没有可报的单"); return; }
     const ok = await writeClipboard(text, $("#baodanText"));
-    toast(ok ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴` : "复制失败：长按面板里的文本框手动全选");
+    // v31：本次报的单里单号不止一种时，这一下自动复制出去的文本用的是**预填的那个号**（众数）——少数派那几单
+    // 的号并不在文本里。这一下**不写账本**（见 commitBaodanTracking 的说明），但必须当场说清「单号不止一个」，
+    // 否则用户点完直接切微信粘贴，收货商拿到的是别的包裹的号（v28 那类「静默报错单」的老毛病）。
+    const tkKinds = bdTrackingPick(orders).list.length;
+    toast(ok
+      ? (tkKinds > 1
+        ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 单号有 ${tkKinds} 种，先核对面板里的提示再报`
+        : `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴`)
+      : "复制失败：长按面板里的文本框手动全选");
   }
 
   function closeBaodan() {
@@ -1636,6 +1783,7 @@
     baodanScope = null;
     baodanCandidates = [];
     baodanSel = new Set();
+    baodanTrackingTouched = false;
   }
 
   function renderBaodan() {
@@ -1659,6 +1807,9 @@
     $("#baodanSummary").innerHTML = orders.length === 0
       ? "还没勾选订单"
       : `已选 ${orders.length} 单 · 共 <b>${qty}</b> 件 / ${kinds} 种`;
+    // v31：那一格下面的提示行——按**本次勾选的单 + 这一格现在的值**现算（见 bdTrackingHint）。
+    // 别再退回成「开面板那一刻的快照」：写库统一之后它不会自己消失，会一直说着已经失效的话。
+    $("#baodanTrackingHint").textContent = bdTrackingHint(orders, res.tracking);
     $("#baodanText").value = text;
     $("#baodanText").placeholder = baodanCandidates.length === 0 ? "这个范围里没有可报的单" : "勾选订单后这里会出现报单内容";
     return res;
@@ -1678,6 +1829,12 @@
     const edited = box.value !== res.text;
     const ok = await writeClipboard(box.value, box);
     if (!ok) { toast("复制失败：长按上面的文本框手动全选"); return; }
+    // v31：复制这一刻**不再无条件写库**，只在「用户真的动过那一格（touched）且值仍与账本里存的不同」时兜一道底。
+    // touched 是必要条件：面板一打开就自动复制过一次，那一刻那一格是预填的**众数**，少数派单与它必然不同——
+    // 只比字符串的话，用户「什么都没改、只想再复制一遍」就会把那几单的正确单号统一成众数（静默串单、无处可撤）。
+    // 正常路径下这一句其实没事可做：用户改完那一格时 change 已经把账本写了（commitBaodanTracking）；
+    // 它管的是「动过之后**勾选集合又变了**」——新勾进来的单可能不是这个号，这一下把它补上。
+    if (baodanTrackingTouched) baodanApplyTracking(res.tracking);
     toast(edited ? "已复制 · 你改过的那份" : `已复制报单 · ${res.qty} 件 / ${res.kinds} 种 · 直接去微信粘贴`);
   }
 
@@ -1911,6 +2068,8 @@
     // v24：表单里的两个「清空」小按钮（邮费 / 回款金额），两个表单共用一个处理函数
     $("#orderForm").addEventListener("click", clearField);
     $("#payForm").addEventListener("click", clearField);
+    // v31：「快递单号」那一格（记单表单在 #orderForm 里，报单面板那一格在 #baodanModal 里）
+    $("#baodanModal").addEventListener("click", clearField);
 
     // 批量结算（注意别把 click 事件本身当参数传进去：openBatchModal 的第一个参数是「预选哪一批」）
     $("#batchBtn").addEventListener("click", () => openBatchModal());
@@ -1930,6 +2089,13 @@
       if (cb.checked) baodanSel.add(cb.dataset.bd); else baodanSel.delete(cb.dataset.bd);
       renderBaodan();        // 勾选一变：件数/种数/报单文本一起重算
     });
+    // v31：单号那一格分两个时机：
+    //   input  = 每敲一下：只重算文本第 2 行（看得见就行，不写账本——写账本要等用户离开这一格）
+    //   change = 用户真的改完了（blur / 回车）：写账本（若值变了）→ 重算 → **重新复制剪贴板** → toast，
+    //            这一套在 commitBaodanTracking 里。为什么必须是 change 而不是 input：打字途中的半截单号
+    //            会一次次写进账本、还每次重算文本；而复制挂在 change 上，剪贴板才不会停在打开面板那一刻的旧文本
+    $("#baodanTracking").addEventListener("input", () => renderBaodan());
+    $("#baodanTracking").addEventListener("change", () => commitBaodanTracking());
     $("#batchCancel").addEventListener("click", closeBatchModal);
     $("#batchSubmit").addEventListener("click", submitBatch);
     // v24：弹窗里那一行只是说明（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉），没有可点的选择
