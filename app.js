@@ -82,6 +82,10 @@
   // 只比字符串会让「点一下复制、什么都没改」顺手改掉那些单的正确单号（静默串单）。
   let baodanTrackingTouched = false;
   let currentFilter = "在途";
+  // v32：「一起寄出」批次块折叠 —— 只记「被用户手动展开过的那些批次 id」。
+  // 它是展开态的唯一真相（重渲染也照它还原），但**刻意只活在内存里**：不落库、不进同步包、
+  // 不写 localStorage，刷新页面回到默认收起（用户确认过的默认态）。
+  const expandedBatches = new Set();
 
   // 报表
   let reportMode = "month";
@@ -503,12 +507,25 @@
       if (o.date > b.date) b.date = o.date;
     });
     blocks.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
+    // v32：顺手清掉已经不存在的批次 id（批次随删单/重组消失）。不清理也能跑，
+    // 但一个长会话里来回重组批次会让这个 Set 一直涨；它只是内存里的一串 id，清理是幂等的。
+    expandedBatches.forEach((id) => { if (!groups.has(id)) expandedBatches.delete(id); });
     const parts = [];
     blocks.forEach((b) => {
       const g = b.id ? groups.get(b.id) : null;
       const grouped = g && g.count > 1;      // 只剩一单的批次不再撑表头，免得「一起寄出 · 1 单」
       const solo = !!g && g.count === 1;     // 单成员批次：没表头，卡片上补一句它的批次归属
-      if (grouped) parts.push(batchHeadHtml(g, orders));
+      if (grouped) {
+        // v32：多成员批次整块包一层 .batch-block（默认收起态）。
+        // 为什么包一层而不是给每张卡片加类：收起＝「表头 + 这一批全部成员」一起不显示，
+        // 需要一个共同的祖先来挂状态；展开/收起只切这一个类，成员卡片与提示行始终留在
+        // DOM 里（见 styles.css 的 .batch-block.collapsed），所以切态**不需要重渲染**。
+        parts.push(`<div class="batch-block${expandedBatches.has(g.id) ? "" : " collapsed"}" data-batch="${escapeHtml(g.id)}">`);
+        parts.push(batchHeadHtml(g, orders));
+        b.orders.forEach((o) => parts.push(orderCardHtml(o, "in-batch", false)));
+        parts.push("</div>");
+        return;
+      }
       b.orders.forEach((o) => parts.push(orderCardHtml(o, grouped ? "in-batch" : "", solo)));
     });
     $("#orderList").innerHTML = parts.join("");
@@ -565,19 +582,56 @@
     if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
     if (g.pending > 0) bits.push(`${g.pending} 单在途`);
     const drift = batchDrift(g, members, batchCount);
+    const expanded = expandedBatches.has(g.id);
+    // v32：收起态只留两行（第一行 + 整批摘要），所以告警**不能**只靠下面那几行 .bh-note 说话——
+    // 有 warn 级提示时在摘要行尾部补一个紧凑标记，展开后才看得到完整文案（文案一个字没改）。
+    // 没有告警的批次一个字节都不多渲染。
+    const warnFlag = drift.some((n) => n.warn) ? `<span class="bh-warnflag">⚠ 待对账</span>` : "";
+    // v32：筛选把成员藏起来时，收起卡上的「N 单」会误导（那是**整批**单数，本页只有 N 单可看）——
+    // 原来那句「本页只显示其中 N 单」就在下面几行里，折叠把它藏起来等于把它作废。
+    // 同一套做法：本页可见成员 < 本批成员时，在摘要行尾部补一个短标记（收起态才显示，展开态照旧是完整那句）。
+    // 与告警标记刻意分开：这个走弱色（只是「本页没显示全」的事实），告警那个走 --neg 红粗（真要动手对账）。
+    const filterFlag = shownCount < g.count ? `<span class="bh-filterflag">· 本页 ${shownCount} 单</span>` : "";
+    // v32：第一行整行是折叠开关。必须是真 <button> —— div 在手机上拿不到正确的键盘/触摸语义；
+    // 样式在 styles.css 里抹平成「和以前那个 div 一样」（整行宽、左对齐、无边框背景）。
+    // 箭头只有 ▾ 一个字符，收起态靠 CSS 转 -90° 变成 ▸ —— 这样切态只改类、不用重渲染。
+    // title 给鼠标/读屏补一句「这一行是干什么的」（可见文本只有标题+单数+箭头，状态只有 aria-expanded）；
+    // **刻意不用 aria-label**：那会把「一起寄出 · 日期 N 单」这段可见文本从无障碍名里整个顶掉。
     return `<div class="batch-head">
-      <div class="bh-top">
+      <button type="button" class="bh-top" data-act="btoggle" data-batch="${escapeHtml(g.id)}" title="点一下展开/收起这一批的单子" aria-expanded="${expanded ? "true" : "false"}">
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
-        <span class="bh-count">${g.count} 单</span>
-      </div>
+        <span class="bh-right">
+          <span class="bh-count">${g.count} 单</span>
+          <span class="bh-caret" aria-hidden="true">▾</span>
+        </span>
+      </button>
       <div class="bh-meta-row">
         <div class="bh-meta">整批：${bits.join(" · ")}</div>
+        ${filterFlag}
+        ${warnFlag}
         <button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批邮费</button>
         <button type="button" class="bh-act" data-act="baodan" data-batch="${escapeHtml(g.id)}">报单</button>
       </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
     </div>`;
+  }
+
+  // v32：批次块折叠开关。**只改这一次 DOM**——切一个类 + 同步 aria-expanded；
+  // 箭头是 CSS 按这个类转的，告警标记/成员卡片/提示行的显隐也全在这个类上，
+  // 所以**绝不调 renderList()**：整列表重渲染会把滚动位置和用户此刻手上的状态（比如刚点开的弹窗）打飞。
+  // 触发区严格限定在表头第一行那个 button 上：点这一批的「改本批邮费」「报单」或任何一张成员卡片上的
+  // 按钮时，事件委托里的 closest("button[data-act]") 命中的是那些按钮自己（它们在 .bh-top 之外），
+  // 不会走到这里，也不会顺手折叠——这一条有专门的断言（36.4）。
+  function toggleBatchBlock(btn) {
+    const id = btn.dataset.batch || "";
+    if (!id) return;
+    if (expandedBatches.has(id)) expandedBatches.delete(id);
+    else expandedBatches.add(id);
+    const expanded = expandedBatches.has(id);
+    const block = btn.closest(".batch-block");
+    if (block) block.classList.toggle("collapsed", !expanded);
+    btn.setAttribute("aria-expanded", String(expanded));
   }
 
   // v31：快递单号（可空）**全局唯一**的一支规范化——换行/连续空白折成一个空格、去首尾空格、截 40 字。
@@ -2029,6 +2083,10 @@
     $("#orderList").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-act]");
       if (!btn) return;
+      // v32：折叠开关（触发区只有表头第一行那个 button，它里面没有嵌套按钮）。
+      // 注意判断顺序：落在别的按钮上时 closest 先命中的是那个按钮，下面这些分支各走各的，
+      // 折叠只在真的点到 .bh-top 时发生——所以点「改本批邮费」不会顺手收起这一批。
+      if (btn.dataset.act === "btoggle") { toggleBatchBlock(btn); return; }
       const { act, id } = btn.dataset;
       if (act === "pay") openPayForm(id);
       else if (act === "dup") duplicateOrder(id);
