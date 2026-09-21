@@ -583,10 +583,14 @@
     // 走同一个 #payModal），位置/样式一字不动。
     // 旧「自留（旧）」单不给这个入口：它不是「回款」语义（那笔钱已经落地、只是没走回款流程），
     // 保持原样只读——**只有真的已回款**才认。
-    if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">回款</button>`);
-    else if (o.status === "已回款") actions.push(`<button class="act primary" data-act="pay" data-id="${o.id}">改回款</button>`);
-    actions.push(`<button class="act" data-act="dup" data-id="${o.id}">再来一单</button>`);
-    actions.push(`<button class="act" data-act="edit" data-id="${o.id}">编辑</button>`);
+    // v29：o.id / o.batchId 一律过 escapeHtml —— 自己生成的 id 是 crypto.randomUUID()，但这个值
+    // **会从外部数据进来**（「导入 JSON 备份」与云端拉取都直接落进 orders），一份 id 里带 `">` 的
+    // 备份文件就能在渲染卡片时把脚本注进页面（外部验收实测：`data-id="qX"><img src=x onerror=…>`
+    // 真的执行了）。同类写法在本文件里早就有先例（批次表头与报单清单都转义过），这里补齐。
+    if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${escapeHtml(o.id)}">回款</button>`);
+    else if (o.status === "已回款") actions.push(`<button class="act primary" data-act="pay" data-id="${escapeHtml(o.id)}">改回款</button>`);
+    actions.push(`<button class="act" data-act="dup" data-id="${escapeHtml(o.id)}">再来一单</button>`);
+    actions.push(`<button class="act" data-act="edit" data-id="${escapeHtml(o.id)}">编辑</button>`);
     if (o.batchId) {
       // v24：批次的金额入口**常驻在卡片上**（与批次表头那个 .bh-act 走同一个动作）。
       // v23 只有表头一条路，于是两种情形下用户根本点不到：①单成员批次不渲染表头；
@@ -594,9 +598,9 @@
       // 与「这一批是不是被筛选藏了」「这一批还剩几个人」都无关。
       // 已回款的成员同样有——openBatchModal 会把该批**全部成员**并进弹窗（不管在不在途）。
       actions.push(`<button class="act" data-act="batchfee" data-batch="${escapeHtml(o.batchId)}">改本批邮费</button>`);
-      actions.push(`<button class="act" data-act="unbatch" data-id="${o.id}">退出本批</button>`);
+      actions.push(`<button class="act" data-act="unbatch" data-id="${escapeHtml(o.id)}">退出本批</button>`);
     }
-    actions.push(`<button class="act danger" data-act="del" data-id="${o.id}">删除</button>`);
+    actions.push(`<button class="act danger" data-act="del" data-id="${escapeHtml(o.id)}">删除</button>`);
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
@@ -1486,6 +1490,14 @@
 
   function qtyOf(o) { return Math.max(1, Math.round(numberValue(o.qty)) || 1); }
 
+  // 报单里显示的名字（v29）：换行折成一个空格、首尾空白去掉、全是空白的落成「未命名」。
+  // 起因：`name` 是自由文本，一份从别处导入的脏数据里可能带换行或整串空白——那会把「一行一件」
+  // 的报单切成半截行（外部验收实测：名字 `冒烟换行\n己` 报出独立一行 `己 ×2`）、或报出 ` ×1` 这种空行。
+  // 只做这两步：名字**内部**的空格/全角空格/大小写原样保留（分组键早就把它们抹平了，但显示要是他写的样子）。
+  function bdName(name) {
+    return String(name == null ? "" : name).replace(/\s*\n\s*/g, " ").trim() || "未命名";
+  }
+
   // 报单文本的形状照用户发给收货商的那种消息来（他给的样例）：
   //   9.21 待结
   //   荣耀 x60pro 8+128 灰 ×1
@@ -1496,7 +1508,13 @@
   // **末尾没有合计行**——收货商自己数，件数交给面板摘要与复制后的提示去交代。
   // 首行是纯文本，用户想改（称呼/单号）直接改文本框。
   function mdShort(dateStr) {
-    const d = parseDate(dateStr) || new Date();
+    // 正规入口（日期选择框）给的一定是 YYYY-MM-DD；导入的脏数据里可能是 `2026-1-5` 这种两位不齐的写法，
+    // parseDate 会判不合法，这里再用宽松解析兜一道，两条都不成才回落今天（v29 补，原先直接回落今天）
+    let d = parseDate(dateStr);
+    if (!d) {
+      const alt = new Date(String(dateStr || "").replace(/-/g, "/"));
+      d = Number.isNaN(alt.getTime()) ? new Date() : alt;
+    }
     return `${d.getMonth() + 1}.${d.getDate()}`;
   }
 
@@ -1514,10 +1532,10 @@
       // 不同的写法。createdAt 相同（同一毫秒 / 导入的老数据）时用 id 兜底 —— 老数据没有 createdAt，
       // 补 "~"（比十六进制字符都大）让它排在最后，仍然唯一确定。归一化串永不显示。
       const k = candKey(o);
-      if (g.nameKey === null || k < g.nameKey) { g.name = o.name || "未命名"; g.nameKey = k; }
+      if (g.nameKey === null || k < g.nameKey) { g.name = bdName(o.name); g.nameKey = k; }
       g.qty += qtyOf(o);
       g.count += 1;
-      g.raw.add(o.name || "未命名");
+      g.raw.add(bdName(o.name));
     });
     // 件数多的排前面（收货商按行核货，大头在最上面）；同件数按名称排，顺序稳定可复现
     const groups = Array.from(map.values())
@@ -1578,7 +1596,8 @@
       : `账本当前筛选「${currentFilter}」· ${baodanCandidates.length} 单`;
     const { qty, kinds, text } = renderBaodan();
     $("#baodanModal").classList.add("show");
-    if (!text) return;
+    // 范围里没有单：面板会写「这个范围里没有可报的单」，但也得给一句 toast —— 点完什么都没发生很像坏了
+    if (!text) { toast("这个范围里没有可报的单"); return; }
     const ok = await writeClipboard(text, $("#baodanText"));
     toast(ok ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴` : "复制失败：长按面板里的文本框手动全选");
   }
@@ -1600,7 +1619,7 @@
       ? `<div class="bd-empty">这个范围里没有可报的单</div>`
       : baodanCandidates.map((o) => `<label class="batch-item">
           <input type="checkbox" data-bd="${escapeHtml(o.id)}"${baodanSel.has(o.id) ? " checked" : ""}>
-          <span class="bi-name">${escapeHtml(o.name || "未命名")}</span>
+          <span class="bi-name">${escapeHtml(bdName(o.name))}</span>
           <span class="bi-cost">${escapeHtml(String(o.date || "").slice(5))} · ×${qtyOf(o)}</span>
         </label>`).join("");
     // 同物异写被并成一组时，把并了哪些原始名写出来——看得见机器并了什么，才敢拿它去报货
@@ -1616,17 +1635,21 @@
     return res;
   }
 
-  // 复制的是框里**现在的文字**（用户手改过的也算），件数只用于给一句「复制对了」的凭据
+  // 复制的是框里**现在的文字**（用户手改过的也算）。
+  // v29：件数/种数是从**勾选**重算出来的，手改过之后它已经和框里的内容脱钩了——那时不报数字，
+  // 免得给一句「已复制 3 件」的假凭据（外部验收指出：删掉一行再复制，提示还是旧的件数）。
   async function copyBaodan() {
     const box = $("#baodanText");
-    const { orders, qty, kinds } = baodanCompute();
+    const res = baodanCompute();
     if (!box.value.trim()) {
       // 两种「空」分开说：一单没勾 vs 勾了但用户把文本框清空了（后者叫他先填内容，别再让他去查勾选）
-      toast(orders.length === 0 ? "先勾选要报的单" : "文本框是空的，先写上要报的内容");
+      toast(res.orders.length === 0 ? "先勾选要报的单" : "文本框是空的，先写上要报的内容");
       return;
     }
+    const edited = box.value !== res.text;
     const ok = await writeClipboard(box.value, box);
-    toast(ok ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴` : "复制失败：长按上面的文本框手动全选");
+    if (!ok) { toast("复制失败：长按上面的文本框手动全选"); return; }
+    toast(edited ? "已复制 · 你改过的那份" : `已复制报单 · ${res.qty} 件 / ${res.kinds} 种 · 直接去微信粘贴`);
   }
 
   // ---- 云同步（改动防抖推送，启动拉取）----
