@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=27">
+  <link rel="stylesheet" href="./styles.css?v=28">
 </head>
 <body>
   <header class="topbar">
@@ -75,7 +75,11 @@
     <section id="view-list" class="view">
       <div class="chips-row">
         <div id="filterChips" class="chips"></div>
-        <button id="batchBtn" type="button" class="batch-btn">批量结算</button>
+        <!-- v28：两个按钮包在一个盒子里，窄屏上整盒下移（不拆成两个按钮各占一行） -->
+        <div class="list-acts">
+          <button id="batchBtn" type="button" class="batch-btn">批量结算</button>
+          <button id="baodanBtn" type="button" class="batch-btn">报单</button>
+        </div>
       </div>
       <div id="orderList"></div>
     </section>
@@ -224,6 +228,28 @@
     </div>
   </div>
 
+  <!-- 报单（v28：寄出后给收货商报「型号 颜色 数量」）-->
+  <div id="baodanModal" class="modal">
+    <div class="sheet">
+      <h2>报单 <small id="baodanScopeLabel">-</small></h2>
+      <p class="batch-sub">点「报单」时已经复制好了，直接去微信粘贴；要改动就先改下面的内容再点一次复制</p>
+      <div class="bd-toolbar">
+        <button type="button" id="baodanAll" class="batch-btn">全选</button>
+        <span id="baodanPickInfo" class="bd-info">已选 0/0 单</span>
+      </div>
+      <div id="baodanList" class="batch-list"></div>
+      <div id="baodanMerge"></div>
+      <div id="baodanSummary" class="batch-summary">还没勾选订单</div>
+      <!-- 复制出去的就是这个框里现在的文字：想改格式（称呼/单号/数量写法）直接在这里改 -->
+      <textarea id="baodanText" rows="7" spellcheck="false" placeholder="勾选订单后这里会出现报单内容"></textarea>
+      <p class="foot-note">格式照着发给收货商的那种消息来：首行「日期 待结」，下面一行一件、行尾带数量 ×N。件数按每条单的数量相加（不是条数）。</p>
+      <div class="sheet-actions">
+        <button type="button" id="baodanClose" class="btn ghost">关闭</button>
+        <button type="button" id="baodanCopy" class="btn primary">复制报单</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
@@ -264,7 +290,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=27"></script>
-  <script src="./app.js?v=27"></script>
+  <script src="./sync.js?v=28"></script>
+  <script src="./app.js?v=28"></script>
 </body>
 </html>

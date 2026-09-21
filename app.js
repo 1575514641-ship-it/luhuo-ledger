@@ -72,6 +72,11 @@
   // （已回款的单 → 只改 income/incomeDate）。由 openPayForm 按记录当前 status 决定，closePayForm 复位。
   let payEditMode = false;
   let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
+  // v28 报单（寄出后给收货商报「型号 颜色 数量」）：范围在打开面板那一刻定死，
+  // 勾选与手改文案都只活在内存里——不落库、不进同步包、关掉即丢（见 openBaodan 上方说明）
+  let baodanScope = null;     // { type:"batch"|"filter", batchId, title }
+  let baodanCandidates = [];  // 这一次范围里的全部候选单（快照）
+  let baodanSel = new Set();  // 勾选中的单 id
   let currentFilter = "在途";
 
   // 报表
@@ -558,6 +563,7 @@
       <div class="bh-meta-row">
         <div class="bh-meta">整批：${bits.join(" · ")}</div>
         <button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批邮费</button>
+        <button type="button" class="bh-act" data-act="baodan" data-batch="${escapeHtml(g.id)}">报单</button>
       </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
@@ -1457,6 +1463,172 @@
     toast(msg);
   }
 
+  // ---- 报单（v28：寄出后给收货商报「型号 颜色 数量」）----
+  // 用户的痛点：寄出一批之后要向收货商报型号/颜色/数量，货多时得一个个手打。四条取舍：
+  //  ① **不新增字段、不从 name 里猜着切型号和颜色**。名称里型号和颜色本来就是粘在一起的自由文本
+  //     （「狗屁王 4 朱雀黑」与「狗屁王二代金刚黑」两种写法并存），要切就得靠颜色词表 + 正则，
+  //     而词表必然误伤「红米 Note 13」里的数字与「白象方便面」这类名字，猜错还是静默的——
+  //     收货商按型号+颜色核货，猜错比多出一行严重。整串参与分组，不确定的部分留给人看一眼。
+  //  ② 分组键 = 归一化后的 name **全等**（空格全删 + ASCII 小写），key **只进 Map**：
+  //     这样 `红米 Note 13 白` 与 `红米Note13白` 能并成一组，而「Note 13」里的 13 不会被切坏。
+  //     渲染一律用组内第一单的**原始 name**——绝不把归一化串显示给用户（否则像账本被改坏了）。
+  //  ③ 件数唯一来源是 **Σqty**，不是订单条数：批次表头那个 `batchCount`（单数）最顺手，
+  //     复用它就会出现「4 单各 2 件」报成 ×4、收货商少收 4 件。每行的 ×N 与面板摘要里的件数
+  //     都出自同一个 baodanCompute()，杜绝两处各算一套。
+  //  ④ 面板是**只读视图 + 内存态**：勾选、手改文案都不写 localStorage、不进同步包，关掉即丢。
+  //  ⑤ 组内「代表写法」= 最早那条单的原始 name（见 baodanCompute 里的说明），不是「数组里第一单」。
+  function skuKey(name) {
+    return String(name || "")
+      .replace(/[\u3000\u00a0\u2007\u202f]/g, " ")   // 全角/不换行空格先并成普通空格
+      .replace(/\s+/g, "")                           // 再删掉所有空白（含换行）
+      .toLowerCase();                                // ASCII 大小写：note13 / Note13
+  }
+
+  function qtyOf(o) { return Math.max(1, Math.round(numberValue(o.qty)) || 1); }
+
+  // 报单文本的形状照用户发给收货商的那种消息来（他给的样例）：
+  //   9.21 待结
+  //   荣耀 x60pro 8+128 灰 ×1
+  //   荣耀 x60 8+128 ×1
+  //   荣耀畅玩 50 6+128 紫色 ×2
+  // 即：首行「月.日 待结」（月日不补零，抬头用词用户说无所谓，跟样例保持一致），
+  // 底下**一行一件、每行行尾都带 ×N**（用户明确要「加上数量」）。
+  // **末尾没有合计行**——收货商自己数，件数交给面板摘要与复制后的提示去交代。
+  // 首行是纯文本，用户想改（称呼/单号）直接改文本框。
+  function mdShort(dateStr) {
+    const d = parseDate(dateStr) || new Date();
+    return `${d.getMonth() + 1}.${d.getDate()}`;
+  }
+
+  // 返回 { orders, groups, qty, kinds, header, text }——件数/种数/文本都从这一处出
+  function baodanCompute() {
+    const orders = baodanCandidates.filter((o) => baodanSel.has(o.id));
+    const map = new Map();
+    const candKey = (o) => String(o.createdAt || "~") + "\u0000" + String(o.id || "");
+    orders.forEach((o) => {
+      const key = skuKey(o.name) || ("\u0000" + o.id);   // 名称全空白的单各算一组，不互相并
+      let g = map.get(key);
+      if (!g) { g = { name: "", nameKey: null, qty: 0, count: 0, raw: new Set() }; map.set(key, g); }
+      // 组内「代表写法」= **最早那条单的原始 name**。不能取「数组里第一单」：候选顺序被
+      // filteredOrders 的日期排序打乱过（同一天的多单顺序不稳定），那样同一份报单每次会显示成
+      // 不同的写法。createdAt 相同（同一毫秒 / 导入的老数据）时用 id 兜底 —— 老数据没有 createdAt，
+      // 补 "~"（比十六进制字符都大）让它排在最后，仍然唯一确定。归一化串永不显示。
+      const k = candKey(o);
+      if (g.nameKey === null || k < g.nameKey) { g.name = o.name || "未命名"; g.nameKey = k; }
+      g.qty += qtyOf(o);
+      g.count += 1;
+      g.raw.add(o.name || "未命名");
+    });
+    // 件数多的排前面（收货商按行核货，大头在最上面）；同件数按名称排，顺序稳定可复现
+    const groups = Array.from(map.values())
+      .sort((a, b) => b.qty - a.qty || a.name.localeCompare(b.name, "zh-Hans-CN"));
+    const qty = groups.reduce((a, g) => a + g.qty, 0);
+    // 抬头日期：成批报用**批次自己的日期**（就是一起寄出的那天，和收货商账单上「7.22 待结」同义）；
+    // 从账本工具条进来（按当前筛选报）没有批次日期，取今天
+    const headDate = (baodanScope && baodanScope.headDate) || todayStr();
+    const header = `${mdShort(headDate)} 待结`;
+    const text = groups.length === 0 ? ""
+      : header + "\n" + groups.map((g) => `${g.name} ×${g.qty}`).join("\n");
+    return { orders, groups, qty, kinds: groups.length, header, text };
+  }
+
+  // 写剪贴板：非安全上下文/旧 WebView/无权限时会抛错，回退 execCommand，两条路都给可见反馈。
+  // 返回 true/false 让调用方决定提示文案（面板与「点一下报单」两处共用这一支）
+  async function writeClipboard(text, box) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch {
+      // 兜底路径（http / 旧 WebView / 权限被拒）：选中文本 + execCommand。
+      // **v28 修过的真缺陷**：这里原先只 `box.select()` 就无条件 `return true`，漏了 execCommand ——
+      // 于是复制没发生、却报「已复制报单」，用户到微信粘出来的是上一批货的内容，静默报错单。
+      // 现在两条路都拿 execCommand 的返回值说话，false 就如实报失败（面板里的文本框仍是手动兜底）。
+      let tmp = null;
+      try {
+        let target = box;
+        if (!target) {                                     // 没有现成文本框时临时造一个（同一个用户手势里）
+          tmp = document.createElement("textarea");
+          tmp.value = text; tmp.setAttribute("readonly", "");
+          tmp.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+          document.body.appendChild(tmp);
+          target = tmp;
+        }
+        target.select();
+        return !!document.execCommand("copy");
+      } catch { return false; }
+      finally { if (tmp) tmp.remove(); }
+    }
+  }
+
+  // scope：{ type:"batch", batchId } 从批次表头进（报这一次寄出的货）；
+  //        省略 / { type:"filter" } 从账本工具条进（报账本当前筛选下看得见的单）
+  // v28 关键交互：**点一下就进剪贴板**——用户的原话是「点一下报单，它就自动整理好并粘贴到我的
+  // 剪贴板里，然后我直接在微信发给对方就好了」。所以这里开面板的同时就把文本复制好，
+  // 面板是「刚才复制了什么」的凭据 + 需要微调时的入口（改动后按「复制报单」再复制一次）。
+  async function openBaodan(scope) {
+    const fromBatch = !!(scope && scope.type === "batch");
+    baodanScope = { type: fromBatch ? "batch" : "filter", batchId: fromBatch ? scope.batchId : "" };
+    baodanCandidates = fromBatch
+      ? data.orders.filter((o) => o.batchId === baodanScope.batchId)
+      : filteredOrders();
+    // 默认全选：常规「寄出一批 → 报单 → 去微信粘贴」。要拆两次报或剔掉赠品就在清单里取消勾选
+    baodanSel = new Set(baodanCandidates.map((o) => o.id));
+    const head = baodanCandidates[0];
+    if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : "";
+    baodanScope.title = fromBatch
+      ? `一起寄出 · ${head ? (head.batchDate || head.date) : ""} · ${baodanCandidates.length} 单`
+      : `账本当前筛选「${currentFilter}」· ${baodanCandidates.length} 单`;
+    const { qty, kinds, text } = renderBaodan();
+    $("#baodanModal").classList.add("show");
+    if (!text) return;
+    const ok = await writeClipboard(text, $("#baodanText"));
+    toast(ok ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴` : "复制失败：长按面板里的文本框手动全选");
+  }
+
+  function closeBaodan() {
+    $("#baodanModal").classList.remove("show");
+    baodanScope = null;
+    baodanCandidates = [];
+    baodanSel = new Set();
+  }
+
+  function renderBaodan() {
+    const res = baodanCompute();
+    const { orders, groups, qty, kinds, text } = res;
+    $("#baodanScopeLabel").textContent = baodanScope ? baodanScope.title : "";
+    $("#baodanPickInfo").textContent = `已选 ${orders.length}/${baodanCandidates.length} 单`;
+    $("#baodanAll").textContent = baodanCandidates.length > 0 && orders.length === baodanCandidates.length ? "全不选" : "全选";
+    $("#baodanList").innerHTML = baodanCandidates.length === 0
+      ? `<div class="bd-empty">这个范围里没有可报的单</div>`
+      : baodanCandidates.map((o) => `<label class="batch-item">
+          <input type="checkbox" data-bd="${escapeHtml(o.id)}"${baodanSel.has(o.id) ? " checked" : ""}>
+          <span class="bi-name">${escapeHtml(o.name || "未命名")}</span>
+          <span class="bi-cost">${escapeHtml(String(o.date || "").slice(5))} · ×${qtyOf(o)}</span>
+        </label>`).join("");
+    // 同物异写被并成一组时，把并了哪些原始名写出来——看得见机器并了什么，才敢拿它去报货
+    const merged = groups.filter((g) => g.raw.size > 1);
+    $("#baodanMerge").innerHTML = merged.length === 0 ? "" : `<div class="bd-merge">已把同物异写并成一组：${
+      merged.slice(0, 3).map((g) => escapeHtml(Array.from(g.raw).join(" / "))).join("；")
+    }${merged.length > 3 ? `；等共 ${merged.length} 组` : ""}</div>`;
+    $("#baodanSummary").innerHTML = orders.length === 0
+      ? "还没勾选订单"
+      : `已选 ${orders.length} 单 · 共 <b>${qty}</b> 件 / ${kinds} 种`;
+    $("#baodanText").value = text;
+    $("#baodanText").placeholder = baodanCandidates.length === 0 ? "这个范围里没有可报的单" : "勾选订单后这里会出现报单内容";
+    return res;
+  }
+
+  // 复制的是框里**现在的文字**（用户手改过的也算），件数只用于给一句「复制对了」的凭据
+  async function copyBaodan() {
+    const box = $("#baodanText");
+    const { orders, qty, kinds } = baodanCompute();
+    if (!box.value.trim()) {
+      // 两种「空」分开说：一单没勾 vs 勾了但用户把文本框清空了（后者叫他先填内容，别再让他去查勾选）
+      toast(orders.length === 0 ? "先勾选要报的单" : "文本框是空的，先写上要报的内容");
+      return;
+    }
+    const ok = await writeClipboard(box.value, box);
+    toast(ok ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴` : "复制失败：长按上面的文本框手动全选");
+  }
+
   // ---- 云同步（改动防抖推送，启动拉取）----
   let syncTimer = null, syncPending = false, syncInFlight = false;
   let syncEpoch = 0;   // 导入同步码/重置身份时换代：旧身份数据的晚到同步直接作废
@@ -1655,6 +1827,8 @@
       else if (act === "unbatch") leaveBatch(id);
       // 批次表头上的「改本批邮费」：直接开批量结算并预选这一批的全部成员（含已回款的）
       else if (act === "batchfee") openBatchModal(btn.dataset.batch || "");
+      // v28：批次表头上的「报单」——范围就是这一批的全部成员（不看在不在途：报单发生在寄出后）
+      else if (act === "baodan") openBaodan({ type: "batch", batchId: btn.dataset.batch || "" });
       else if (act === "del") deleteOrder(id);
     });
 
@@ -1688,6 +1862,22 @@
 
     // 批量结算（注意别把 click 事件本身当参数传进去：openBatchModal 的第一个参数是「预选哪一批」）
     $("#batchBtn").addEventListener("click", () => openBatchModal());
+
+    // v28：报单面板。工具条入口报的是**账本当前筛选**下的单（所见即所报），批次表头入口报那一批
+    $("#baodanBtn").addEventListener("click", () => openBaodan({ type: "filter" }));
+    $("#baodanClose").addEventListener("click", closeBaodan);
+    $("#baodanCopy").addEventListener("click", copyBaodan);
+    $("#baodanAll").addEventListener("click", () => {
+      const all = baodanCandidates.length > 0 && baodanSel.size === baodanCandidates.length;
+      baodanSel = all ? new Set() : new Set(baodanCandidates.map((o) => o.id));
+      renderBaodan();
+    });
+    $("#baodanList").addEventListener("change", (ev) => {
+      const cb = ev.target.closest("input[data-bd]");
+      if (!cb) return;
+      if (cb.checked) baodanSel.add(cb.dataset.bd); else baodanSel.delete(cb.dataset.bd);
+      renderBaodan();        // 勾选一变：件数/种数/报单文本一起重算
+    });
     $("#batchCancel").addEventListener("click", closeBatchModal);
     $("#batchSubmit").addEventListener("click", submitBatch);
     // v24：弹窗里那一行只是说明（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉），没有可点的选择
