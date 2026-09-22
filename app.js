@@ -91,6 +91,9 @@
   // 锁定的值本身不需要持久化，它已经写进各单的 income；刷新后重置锁＝回到「全员未锁定」，
   // 下一次编辑按 A 语义从当前分摊重新钉住（不新增任何账本字段）。
   const profitLocks = new Map();
+  // v37：状态提示的「每批每会话只首判一次」记号 —— batchId 的内存 Set（不落库、不进同步包，刷新即清）。
+  // 首判＝本会话对该批的第一次提交编辑；**无论是否弹出都记为已看过**（见 commitProfitEdit 内注释）。
+  const statusHintSeen = new Set();
 
   // 报表
   let reportMode = "month";
@@ -527,6 +530,8 @@
   window.luhuoPure = {
     batchProfitSplit,
     profitLockSnapshot: () => [...profitLocks].map(([bid, m]) => [bid, [...m]]),
+    // v37 只读探针：状态提示的首判记号（测试断言「每批每会话只首判一次」用；无写入口）
+    statusHintSeenKeys: () => [...statusHintSeen],
     batchProfitInfoFor: (batchId) => {
       const g = batchGroups().get(batchId);
       const members = data.orders.filter((o) => o.batchId === batchId);
@@ -1612,6 +1617,18 @@
     // 按整数分算当前利润再转回元显示（orderProfit 是浮点直减，喂给输入框前先落分，避免 0.1+0.2 类残差）
     input.value = ((toCents(o.income === null ? 0 : o.income) - toCents(o.cost) - toCents(o.fee)) / 100).toFixed(2);
     btn.replaceWith(input);
+    // v37 改动 B：输入框打开期间给一行灰色小字，把「钉住的作用域」讲清楚（只在编辑时占位，
+    // 提交/放弃/Escape 都走 rerenderBatchBlock 整块重绘，提示随之消失、收起后零占位）。
+    // 样式复用既有 .foot-note 小字，不新造视觉；文案为用户拍板的短版。
+    const card = input.closest(".order-card");
+    if (card && !card.querySelector(".profit-lock-hint")) {
+      const hint = document.createElement("div");
+      hint.className = "foot-note profit-lock-hint";
+      hint.textContent = "钉住只在本次有效；刷新后按现值重算";
+      const top = card.querySelector(".order-top");
+      if (top) top.insertAdjacentElement("afterend", hint);
+      else card.appendChild(hint);
+    }
     input.focus();
     input.select();
   }
@@ -1678,6 +1695,13 @@
       rerenderBatchBlock(batchId);
       return;
     }
+    // v37 状态提示必须在**写回之前**判定「现值 ≠ 默认值」——若等写回后再看，首编从全默认出发
+    // 也会因本次写入把各项掰离默认而误弹，正好破坏「正常分配流程零提示」。
+    const preIncomes = members.map((m) => toCents(m.income));
+    const defCents = splitByWeight(g.incomeCents, members.map((m) => Math.max(0, toCents(m.cost))));
+    const offNames = members
+      .filter((m, i) => preIncomes[i] !== defCents[i])
+      .map((m) => m.name || "未命名");
     let changed = false;
     members.forEach((m, i) => {
       const incCents = r.shares[i] + toCents(m.cost) + toCents(m.fee);  // 利润 = 回款 − 垫付 − 邮费 反推回款
@@ -1694,11 +1718,39 @@
     const next = new Map(kept);
     next.set(id, newProfit);
     profitLocks.set(batchId, next);
+    // v37 改动 A（最终定稿：状态提示，而非逐次报账）——两条提示**互斥**：
+    // dropped 非空时只出 v36 陈旧锁原句（更精确：点名失效项 + 原因），状态提示不参与；
+    // dropped 为空时才走状态提示的**每批每会话只首判一次**规则。
+    //
+    // 判定时机＝本会话对该批的第一次提交编辑；**无论是否弹出都记为已看过**（内存 Set，不落库）。
+    // 触发条件＝该批存在「现值 ≠ 默认值」的成员（默认值按 3.1：splitByWeight(g.incomeCents, cost)；
+    // 判偏离用 m.income，禁用 batchIncomeShare——后者经 shareCents 把负值夹成 0，是有损视图）。
+    // offNames 在写回前算好（见上方 preIncomes）。
+    //
+    // 为什么不要「逐次报被吃掉的手改值」（选 1）也不要「首次满足条件时才弹」（选 2）：
+    // - 选 1：A 手感下第一次编辑之后，未钉住项就全是非默认值 ⇒ 从第二次编辑起几乎每次都弹 ⇒
+    //   用户很快不再读它，而这条提示的价值全在被读到，噪音会摧毁机制本身。
+    // - 选 2：构造上做不到——刷新后没有任何内存状态能区分「用户手改留下的值」与「上次重摊留下的值」，
+    //   两者都只是「不等于默认值」；要能区分就得落库，本轮已排除。
+    // 所以改成「每批每会话说一次状态」：正常分配流程零提示；刷新后再编辑必弹一次并点名非默认项。
+    //
+    // 与 v36 陈旧锁句**互斥、不合并**的理由：陈旧锁那条已经比状态提示更精确（点名失效项 + 原因），
+    // 再叠一句状态陈述是冗余；而「两者同现」在真实操作里不可达——陈旧锁要求本会话先前编辑过该批，
+    // 而那次编辑就是首判点，当时各项还是默认值。
     if (dropped.length) {
       // 反静默：失效必须说人话，且带上**被失效那些项的项名**（手机 360px 下也不能只报「N 项」）。
       // 名字超过 3 个就省略号收尾——一整批十几项时 toast 会连成一条挤爆屏幕。
       const names = dropped.map((m) => m.name || "未命名");
       toast(`本批已重摊，${names.slice(0, 3).join("、")}${names.length > 3 ? "…" : ""} 这 ${names.length} 项的手改锁定失效（已按现值重算）`);
+    } else if (!statusHintSeen.has(batchId)) {
+      statusHintSeen.add(batchId);   // 无论是否弹出都记为已看过（内存态，reload 清零）
+      if (offNames.length) {
+        // 措辞：前向陈述、不出现「手改」二字、不报金额；名字最多 2 个 +「等 N 项」，整条 ≤2 行
+        const namePart = offNames.length > 2
+          ? `（${offNames.slice(0, 2).join("、")} 等 ${offNames.length} 项）`
+          : `（${offNames.join("、")}）`;
+        toast(`本批现值与默认分摊不同${namePart}：本次编辑会把没钉住的项一并重算（钉住只在刷新前有效）`);
+      }
     }
     if (changed) touchBatchAndRerender(batchId);
     else rerenderBatchBlock(batchId);   // 值没变（比如原样确认）：只收起输入框，不碰账本、不触发同步
