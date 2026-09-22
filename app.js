@@ -126,7 +126,15 @@
   function parseDate(dateStr) {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr || ""));
     if (!m) return null;
-    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    // v33：**回读校验**——`new Date(y, m-1, d)` 会把不存在的日期静默进位（`2026-02-30` → 3 月 2 日、
+    // `2026-13-45` → 2027 年 2 月 14 日）。旧版这里只验格式，于是那种日子会悄悄落进**别的期**：
+    // 2 月榜空着、3 月榜里多出这一笔，页面上没有任何提示。v33 起回款日期第一次决定商品榜与环图的
+    // 归期，这条就变得更要紧。构造出来回读三个字段，对不上就当「不合法」返回 null ——
+    // 与既有的「解析失败就不归期」完全同一条路（不改数据、不改卡片、不改看板累计）。
+    const y = Number(m[1]), mo = Number(m[2]), day = Number(m[3]);
+    const dt = new Date(y, mo - 1, day);
+    if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== day) return null;
+    return dt;
   }
 
   function escapeHtml(text) {
@@ -458,7 +466,8 @@
     }).join("");
 
     // 近 6 个月迷你走势（垫出/回款）
-    $("#dashFlowLegend").innerHTML = `<i class="lg-dot" style="background:#b97909"></i>垫出　<i class="lg-dot" style="background:#17b26a"></i>回款`;
+    // v33：图例点＝该序列线/柱的实色（与 chartFlowSVG 共用 SERIES_COLOR）
+    $("#dashFlowLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.cost}"></i>垫出　<i class="lg-dot" style="background:${SERIES_COLOR.income}"></i>回款`;
     const flowBuckets = s.months.map((m) => ({ label: `${parseInt(m.month.slice(5), 10)}月` }));
     const flowStats = s.months.map((m) => ({ cost: m.cost, income: m.income }));
     $("#dashFlow").innerHTML = chartFlowSVG(flowBuckets, flowStats, 118);
@@ -678,17 +687,24 @@
     actions.push(`<button class="act danger" data-act="del" data-id="${escapeHtml(o.id)}">删除</button>`);
     // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
     // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
+    // v33：利润从金额格里挪到卡片右上的 .order-side（状态下面），金额格只留垫付/回款/邮费三格。
+    // 判据（showProfit / profit 的计算）一个字没动，只搬展示位置。
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
-        <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
+        <div class="order-side">
+          ${showProfit ? `<div class="order-profit">
+            <span>利润</span>
+            <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>
+          </div>` : ""}
+          <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
+        </div>
       </div>
       <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
       <div class="order-money">
         <span>垫付 <b>${money(o.cost)}</b></span>
         <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
         <span>邮费 <b>${money(o.fee)}</b></span>
-        ${showProfit ? `<span>利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></span>` : ""}
       </div>
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
       <div class="order-actions">${actions.join("")}</div>
@@ -722,20 +738,27 @@
       if (inByDate) {
         n += 1;
         cost += o.cost;
-        const g = byName[o.name || "未命名"] = byName[o.name || "未命名"] || { count: 0, profit: 0, pending: 0 };
-        g.count += 1;
-        if (isSettled(o)) g.profit += orderProfit(o);
-        else g.pending += 1;
       }
-      // v27：收入判据与看板**同一条**（hasIncome：回款非空即收入，按回款日期归期）。
-      // 改之前这里是 `isSettled(o) && o.incomeDate`，比看板多要一个「已结算」条件——
-      // 「已回款 → 改成在途（回款保留）」的单于是看板算、报表不算，两页对不上。
-      // 利润跟着收入一起认（同一个分支）：认了这笔收入，就该认这笔生意的盈亏。
+
+      // v33：商品榜与环图沿用顶部利润的记录集合，按回款日期归期。
+      // 回款非空即计入，0 也是回款；不以状态是否“已回款”筛掉记录。
       if (hasIncome(o)) {
         const id = parseDate(o.incomeDate);
         if (id && id >= startD && id < endD) {
+          const p = orderProfit(o);
           income += o.income;
-          profit += orderProfit(o);
+          profit += p;
+          const name = o.name || "未命名";
+          let g = Object.prototype.hasOwnProperty.call(byName, name)
+            ? byName[name] : null;
+          if (!g) {
+            g = { count: 0, profit: 0 };
+            Object.defineProperty(byName, name, {
+              value: g, enumerable: true, writable: true, configurable: true,
+            });
+          }
+          g.count += 1;
+          g.profit += p;
         }
       }
     });
@@ -748,7 +771,20 @@
   }
 
   // ---- 报表图表（手写 SVG，无外部依赖）----
-  const PALETTE = ["#14b8a6", "#7d8fa1", "#c0724f", "#7a5fb5", "#8a8378"];
+  // v33：环图分片配色。**同一张环图里任意两片的 stroke 必须两两不同**。
+  // 一张环图最多 6 片（利润 Top 5 + 「其他」），原来的 5 色调色板取模后第 6 片会绕回第 0 色，
+  // 于是「其他」与榜首撞成同一个 #14b8a6、分不出来。补第 6 色（琥珀 #b97909，本就是本文件
+  // 图表里在用的色），6 色对 6 片正好取模也不重复。
+  // 分片与图例**必须**共用下面 donutColor() 这一支，别再各写一份 `% length`（那是上一版漏的地方）。
+  const PALETTE = ["#14b8a6", "#7d8fa1", "#c0724f", "#7a5fb5", "#8a8378", "#b97909"];
+  const donutColor = (i) => PALETTE[i % PALETTE.length];
+
+  // v33：**图的实色只此一份**——SVG 里的线/柱与图例点共用这批常量。
+  // 改之前图例的颜色是从渐变里手抄的，而且抄的正是 `stop-opacity="0"` 那一端的色
+  // （垫出抄成 #b97909、回款抄成 #17b26a、亏抄成 #d05f45），于是图例点与线/柱的颜色对不上
+  // （垫出线是 #7d8fa1 的板岩色，图例却点了个琥珀）。渐变那两个 stop 是**渐隐端**、
+  // 只参与面积图的中间过渡，别再把它们当成序列色去用。
+  const SERIES_COLOR = { cost: "#7d8fa1", income: "#14b8a6", gain: "#14b8a6", loss: "#c0724f" };
   let gradSeq = 0;
 
   // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
@@ -815,9 +851,9 @@
       </defs>
       ${grid}
       ${area("cost", idA)}${area("income", idB)}
-      <path d="${path("cost")}" fill="none" stroke="#7d8fa1" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="${path("income")}" fill="none" stroke="#14b8a6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      ${dots("cost", "#7d8fa1")}${dots("income", "#14b8a6")}
+      <path d="${path("cost")}" fill="none" stroke="${SERIES_COLOR.cost}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="${path("income")}" fill="none" stroke="${SERIES_COLOR.income}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots("cost", SERIES_COLOR.cost)}${dots("income", SERIES_COLOR.income)}
       ${ticks}
     </svg>`;
   }
@@ -838,7 +874,7 @@
       const bx = (padL + i * slot + (slot - bw) / 2).toFixed(1);
       const by = s.profit >= 0 ? (zero - h).toFixed(1) : zero.toFixed(1);
       bars += `<rect x="${bx}" y="${by}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3, bw / 2).toFixed(1)}"
-        fill="${s.profit >= 0 ? "#14b8a6" : "#c0724f"}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
+        fill="${s.profit >= 0 ? SERIES_COLOR.gain : SERIES_COLOR.loss}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
       if (n <= 13 && s.profit !== 0) {
         const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
         bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
@@ -909,10 +945,14 @@
 
     const lines = [];
     const feeStats = reportFeeStats(range.start, range.end);
-    if (s.n === 0 && s.income === 0) {
+    // v33：空态不再只看「下单数 + 回款总额」——本期只记了批次邮费、或本期回款合计正好为零，
+    // 都会被旧条件误判成「没有记录」。改成同时看本期回款记录（byName 由回款日期归期建组）与本期邮费。
+    const hasPeriodIncome = Object.keys(s.byName).length > 0;
+    if (s.n === 0 && !hasPeriodIncome && feeStats.totalCents === 0) {
       lines.push(`<b>${escapeHtml(range.label)}</b> 没有记录。`);
     } else {
-      lines.push(`<b>${escapeHtml(range.label)}</b> 共 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，邮费 <b>${money(feeStats.totalCents / 100)}</b>，收回 <b>${money(s.income)}</b>，净${s.profit >= 0 ? "赚" : "亏"} <b class="${s.profit >= 0 ? "pos" : "neg"}">${money(s.profit)}</b>。`);
+      // v33：净亏时金额取绝对值——「净亏 ¥-120」是双负号读法，负号由文字承担。
+      lines.push(`<b>${escapeHtml(range.label)}</b> 下单 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，邮费 <b>${money(feeStats.totalCents / 100)}</b>，收回 <b>${money(s.income)}</b>，净${s.profit >= 0 ? "赚" : "亏"} <b class="${s.profit >= 0 ? "pos" : "neg"}">${money(Math.abs(s.profit))}</b>。`);
       const st = computeStats();
       if (st.outCount > 0) lines.push(`现在还有 ${st.outCount} 单 / ${money(st.outstanding)} 在途，回款了记得来销账。`);
       if (prev.n > 0 || prev.income > 0) {
@@ -933,10 +973,11 @@
     const buckets = buildBuckets(reportMode, range);
     const bucketStats = buckets.map((b) => reportStats(b.start, b.end));
 
-    $("#flowLegend").innerHTML = `<i class="lg-dot" style="background:#b97909"></i>垫出　<i class="lg-dot" style="background:#17b26a"></i>回款`;
+    // v33：图例点＝该序列线/柱的实色（与两支绘图函数共用 SERIES_COLOR）
+    $("#flowLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.cost}"></i>垫出　<i class="lg-dot" style="background:${SERIES_COLOR.income}"></i>回款`;
     $("#chartFlow").innerHTML = chartFlowSVG(buckets, bucketStats);
 
-    $("#profitLegend").innerHTML = `<i class="lg-dot" style="background:#17b26a"></i>赚　<i class="lg-dot" style="background:#d05f45"></i>亏`;
+    $("#profitLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.gain}"></i>赚　<i class="lg-dot" style="background:${SERIES_COLOR.loss}"></i>亏`;
     $("#chartProfit").innerHTML = chartProfitSVG(buckets, bucketStats);
 
     // 邮费统计：整批一起寄的合成一行（含这一批都是哪些货），单寄的合并成一行
@@ -976,7 +1017,7 @@
       ? `<div class="empty-mini">本期没有邮费记录</div>`
       : `<div class="fee-total"><span>本期邮费合计</span><b>${money(feeStats.totalCents / 100)}</b></div>${feeRows.join("")}`;
 
-    // 环形图：已结算利润为正的商品，Top5 + 其他
+    // 环形图：本期回款里合计利润为正的商品，Top5 + 其他
     const ranked = Object.entries(s.byName).map(([name, g]) => ({ name, value: g.profit }))
       .filter((x) => x.value > 0).sort((a, b) => b.value - a.value);
     const top = ranked.slice(0, 5);
@@ -984,29 +1025,31 @@
     if (restVal > 0) top.push({ name: "其他", value: restVal });
     const total = top.reduce((a, b) => a + b.value, 0);
     if (total <= 0) {
-      $("#chartDonut").innerHTML = `<div class="empty-mini">这个周期还没有已结算的利润可分</div>`;
+      $("#chartDonut").innerHTML = `<div class="empty-mini">本期回款中，暂无合计利润为正的商品</div>`;
     } else {
+      // v33：切片色与图例色**同出一个数组**——分片与图例各写一份取模正是「其他」撞榜首的来路。
+      const sliceColors = top.map((_, i) => donutColor(i));
       const legend = top.map((it, i) => `
         <div class="donut-legend-row">
-          <i class="lg-dot" style="background:${PALETTE[i % PALETTE.length]}"></i>
+          <i class="lg-dot" style="background:${sliceColors[i]}"></i>
           <span class="dl-name">${escapeHtml(it.name)}</span>
           <span class="dl-val">${money(it.value)} · ${Math.round(it.value / total * 100)}%</span>
         </div>`).join("");
-      $("#chartDonut").innerHTML = `<div class="donut-wrap">${chartDonutSVG(top, total)}<div class="donut-legend">${legend}</div></div>`;
+      $("#chartDonut").innerHTML = `<div class="donut-wrap">${chartDonutSVG(top, total, "盈利合计", sliceColors)}<div class="donut-legend">${legend}</div></div>`;
     }
 
-    // 商品榜 + 比例条
+    // v33：本期回款商品榜；与顶部净盈亏共用记录集合。
     const products = Object.entries(s.byName)
       .sort((a, b) => b[1].profit - a[1].profit)
       .slice(0, 5);
     const maxP = Math.max(1, ...products.map(([, g]) => Math.abs(g.profit)));
     $("#reportProducts").innerHTML = products.length === 0
-      ? `<div class="empty-mini">该周期没有商品</div>`
+      ? `<div class="empty-mini">本期没有回款记录</div>`
       : products.map(([name, g]) => `
         <div class="prod-row">
           <div class="prod-line">
-            <span class="prod-name">${escapeHtml(name)}${g.pending ? ` <i class="pending-tag">在途${g.pending}</i>` : ""}</span>
-            <span class="prod-nums">${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
+            <span class="prod-name">${escapeHtml(name)}</span>
+            <span class="prod-nums">回款 ${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
           </div>
           <div class="prod-bar-track"><span class="prod-bar ${g.profit >= 0 ? "pos" : "neg"}" style="width:${Math.round(Math.abs(g.profit) / maxP * 100)}%"></span></div>
         </div>`).join("");
@@ -1014,14 +1057,38 @@
 
   // ---- 记单 / 编辑 ----
   // v25：类型切换只是**表单的显隐形态**（见文件头）。这里与落库无关，一个字都不写进数据。
+  // v33：渠道控件只有**一个**（<select name="channel">），货单时住在「更多」里、收入模式搬回主区——
+  // 移动的是同一个 DOM 节点（值和事件都跟着走），所以永远不可能出现两份控件不同步。
+  // 摘要只在非默认状态时追加状态名；渠道为空**必须**显示「未填写」，不能虚报「收货商」——
+  // 标题说的必须是真正会保存下去的那个值（提交那一步存的就是这一格的现值）。
+  function updateFormMoreSummary() {
+    const f = $("#orderForm");
+    const channel = String(f.channel.value || "").trim() || "未填写";
+    const status = f.status.value;
+    const tail = status && status !== "在途" ? ` · ${statusLabel(status)}` : "";
+    $("#formMoreSummary").textContent = `更多（渠道：${channel}${tail}）`;
+  }
+
   function applyKindUi() {
     const income = formKind === "income";
     const f = $("#orderForm");
+    const channelField = $("#formChannelField");
+
+    // v33：只移动原控件，保留值和事件；收入模式的渠道仍默认可见。
+    if (income) {
+      $("#formChannelHome").appendChild(channelField);
+    } else {
+      const body = $("#formMore .more-body");
+      body.insertBefore(channelField, body.firstChild);
+    }
+
     f.classList.toggle("kind-income", income);
-    $$("#formKind .seg").forEach((b) => b.classList.toggle("on", b.dataset.kind === formKind));
+    $$("#formKind .seg").forEach((b) =>
+      b.classList.toggle("on", b.dataset.kind === formKind));
     $("#formCostLabel").textContent = income ? "金额" : "垫付金额";
     $("#formChannelLabel").textContent = income ? "渠道" : "出掉渠道";
     f.goods.placeholder = income ? "这笔钱是什么？" : "卖什么？";
+    updateFormMoreSummary();
   }
 
   // 切类型：隐藏的字段**不清空**（切回来值还在），共有字段（名称/金额/日期/渠道/备注）保留。
@@ -1058,7 +1125,15 @@
     f.cost.value = src ? numberValue(src.cost) : "";
     f.qty.value = src ? src.qty : 1;
     f.date.value = order ? order.date : todayStr();     // 预填/新建一律用今天
-    f.channel.value = src ? (src.channel || "收货商") : "收货商";
+    // v33：渠道下拉照**状态下拉那一套既有做法**——打开表单时把这一单自己的渠道补进选项。
+    // 旧写法只写 `f.channel.value = src.channel`：渠道不在 CHANNELS 六项里时（比如一份手写备份或者
+    // 早期版本留下的「拼多多」），控件因没有匹配项而回空、摘要如实写「未填写」，用户**不动任何格子
+    // 直接保存就把渠道静默清成 ""**——v25 的状态下拉踩过同一个坑，当时的处理办法就是补一个选项。
+    // 重建的是**那个唯一的渠道控件**本身（全表单只有一个 name="channel"）：收入模式下 applyKindUi
+    // 把它整格搬到主区，选项跟着控件走，所以货单态与收入态都生效。
+    const channelOpts = CHANNELS.slice();
+    if (src && src.channel && !channelOpts.includes(src.channel)) channelOpts.push(src.channel);
+    fillSelect(f.channel, channelOpts.map((c) => [c, c]), src ? (src.channel || "收货商") : "收货商");
     f.fee.value = src ? numberValue(src.fee) : "";      // 同上：0 写成 0（邮费可不填，留空仍按 0 算）
     // 状态下拉：现役两态；编辑遗留「自留」单时把该单自己的旧状态补进去（只读项），
     // 否则下拉会因没有匹配项而回空、保存时把状态静默改写掉——v21 的红线就是不许改写旧状态
@@ -1642,9 +1717,13 @@
     // parseDate 会判不合法，这里再用宽松解析兜一道，两条都不成才回落今天（v29 补，原先直接回落今天）
     let d = parseDate(dateStr);
     if (!d) {
-      const alt = new Date(String(dateStr || "").replace(/-/g, "/"));
-      d = Number.isNaN(alt.getTime()) ? new Date() : alt;
+      // v33：宽松那一条**也必须过同一套回读校验**——`new Date("2026/02/30")` 一样会静默进位成 3 月 2 日。
+      // 做法：先把 1 位/2 位的月日补成规范写法，再交给 parseDate 去验（只有一支校验，不会两处走岔）；
+      // 仍不合法就与「压根解析不出来」一样回落今天。
+      const loose = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(String(dateStr || ""));
+      if (loose) d = parseDate(`${loose[1]}-${pad2(Number(loose[2]))}-${pad2(Number(loose[3]))}`);
     }
+    if (!d) d = new Date();
     return `${d.getMonth() + 1}.${d.getDate()}`;
   }
 
@@ -2108,7 +2187,12 @@
     });
     // 用户自己动过这两格之后，切类型不再覆盖它们（"切回来还在"@ 名称/渠道）
     $("#orderForm").goods.addEventListener("input", () => { nameAuto = false; });
-    $("#orderForm").channel.addEventListener("change", () => { channelTouched = true; });
+    // v33：渠道那一格搬家后仍要实时反映到「更多」的摘要上；状态下拉同理（摘要里那句状态）。
+    $("#orderForm").channel.addEventListener("change", () => {
+      channelTouched = true;
+      updateFormMoreSummary();
+    });
+    $("#orderForm").status.addEventListener("change", updateFormMoreSummary);
 
     $("#payForm").addEventListener("submit", submitPay);
     $("#payCancel").addEventListener("click", closePayForm);

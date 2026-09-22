@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=32">
+  <link rel="stylesheet" href="./styles.css?v=33">
 </head>
 <body>
   <header class="topbar">
@@ -67,7 +67,7 @@
         <h2>近 6 个月 <span class="legend" id="dashFlowLegend"></span></h2>
         <div id="dashFlow"></div>
         <div id="monthList"></div>
-        <p class="foot-note">「差」为现金流视角：正数＝这个月收回来的比垫出去的多。</p>
+        <p class="foot-note">最右一列＝本月回款－本月垫付；正数表示收回的更多。未扣邮费，不等于利润。</p>
       </div>
     </section>
 
@@ -113,14 +113,16 @@
         <div id="reportFees"></div>
       </div>
       <div class="card">
-        <h2>商品利润占比 <small>已结算</small></h2>
+        <h2>盈利商品占比 <small>按回款日期</small></h2>
         <div id="chartDonut"></div>
+        <p class="foot-note">仅展示本期回款中合计利润为正的商品，未扣除亏损商品；盈利合计不等于净盈亏。</p>
       </div>
       <div class="card">
-        <h2>商品榜 <small>已结算利润 Top 5</small></h2>
+        <h2>商品榜 <small>本期回款 · 利润 Top 5</small></h2>
         <div id="reportProducts"></div>
+        <p class="foot-note">按回款日期归期，利润已扣垫付和邮费；单数是本期有回款记录的单数，零元回款也计入。</p>
       </div>
-      <p class="foot-note center">口径：垫付按下单日期、回款和利润按回款日期归期。</p>
+      <p class="foot-note center">口径：单数和垫付按下单日期；回款、利润和商品榜按回款日期；邮费成批按批次日期、单寄按下单日期。</p>
     </section>
   </main>
 
@@ -169,14 +171,17 @@
         <label class="fld">日期<input name="date" type="date" required></label>
         <label class="fld kind-order">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
       </div>
-      <label class="fld"><span id="formChannelLabel">出掉渠道</span><select name="channel"></select></label>
+      <!-- v33：渠道那一格（#formChannelField）是**同一个控件**，按形态搬家：货单住下面的「更多」里、
+           收入模式由 applyKindUi 搬回这个空位（收入单的渠道仍默认可见）。全表单始终只有一个 name="channel" -->
+      <div id="formChannelHome"></div>
+      <!-- v33：快递单号从「更多」挪到这里——它才是常填的那一格（默认可见，整行输入）；
+           收入模式下整格隐藏（.kind-order），保存时写空串（见 submitForm） -->
+      <label class="fld kind-order">快递单号（可空）<input name="tracking" maxlength="40" autocomplete="off" placeholder="SF1234567890"></label>
       <details class="more kind-order" id="formMore">
-        <summary>更多（状态）</summary>
+        <summary id="formMoreSummary">更多（渠道：收货商）</summary>
         <div class="more-body">
+          <label class="fld" id="formChannelField"><span id="formChannelLabel">出掉渠道</span><select name="channel"></select></label>
           <label class="fld">状态<select name="status"></select></label>
-          <!-- v31：快递单号（可空）——货单形态专属（.kind-order：收入模式下整格隐藏，与邮费/数量同一规矩）。
-               用 <input> 而不是多行框：单号是一行文本，多行会切坏报单（app.js 的 cleanTracking 那一支） -->
-          <label class="fld kind-order">快递单号（可空）<input name="tracking" maxlength="40" autocomplete="off" placeholder="SF1234567890"></label>
         </div>
       </details>
       <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
@@ -300,7 +305,7 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="./sync.js?v=32"></script>
-  <script src="./app.js?v=32"></script>
+  <script src="./sync.js?v=33"></script>
+  <script src="./app.js?v=33"></script>
 </body>
 </html>

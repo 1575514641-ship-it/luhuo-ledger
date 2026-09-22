@@ -118,9 +118,15 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .hero-hint { font-size: 12px; color: var(--hero-label); }
 .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-.kpi { display: flex; flex-direction: column; gap: 2px; margin-bottom: 0; }
+/* v33：格子必须能被压回 1fr 那一列里。.kpi 是 grid item，默认 min-width:auto 时它的
+   min-content 就是那行 20px 不换行金额的宽度——近亿元金额（¥99,999,199.99）会把两列一起
+   顶破整页（360px 实测溢出 54.7px、390px 24.7px，430px 才装得下）。
+   两条一起下：格子上 min-width:0 允许压缩；金额上 overflow-wrap:anywhere —— 它**同时**会把
+   自己的 min-content 压到一个字宽（`break-word` 不会，所以必须是 anywhere），
+   于是极长金额自动折行收敛，而四位五位数这类正常金额一行放得下、排版一个像素都不变。 */
+.kpi { display: flex; flex-direction: column; gap: 2px; margin-bottom: 0; min-width: 0; }
 .kpi-label { font-size: 12px; color: var(--muted); }
-.kpi-value { font-size: 20px; font-weight: 700; letter-spacing: .3px; font-variant-numeric: tabular-nums; }
+.kpi-value { font-size: 20px; font-weight: 700; letter-spacing: .3px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .kpi-value.small { font-size: 15px; padding-top: 4px; }
 .kpi-hint { font-size: 11px; color: var(--muted); }
 .kpi-value.pos { color: var(--accent); }
@@ -147,7 +153,12 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .st-loss { background: var(--neg-soft); color: var(--neg); }
 .month-row { gap: 8px; }
 .month-name { font-weight: 600; width: 62px; font-variant-numeric: tabular-nums; }
-.month-cell { flex: 1; text-align: right; font-variant-numeric: tabular-nums; }
+/* v33：与上面 `.kpi-value` 同一处根因——`.month-cell` 是 flex item（`flex:1` = basis 0%），
+   但默认 min-width:auto 时它的**最小尺寸＝那行不换行数字的 min-content**，近亿元金额下
+   三格一起把这一行顶出卡片、末格（「差」那一列）被 body{overflow-x:clip} 裁掉（390px 实测
+   10.8px）。min-width:0 允许压缩；overflow-wrap:anywhere 同时把 min-content 压到一个字宽
+   （break-word 不会），于是极长金额在格内折行、四位五位数这类正常金额一行放得下、排版不变。 */
+.month-cell { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
 .month-cell.pos { color: var(--accent); font-weight: 600; }
 .month-cell.neg { color: var(--neg); font-weight: 600; }
 .empty-mini { color: var(--muted); font-size: 13px; padding: 6px 0; text-align: center; }
@@ -177,8 +188,56 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   padding: 13px 15px; margin-bottom: 10px;
   box-shadow: var(--shadow);
 }
-.order-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.order-name { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* v33：利润与状态上下排列，窄屏不再挤占同一行。 */
+.order-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.order-name {
+  flex: 1 1 0;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.order-side {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 58%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.order-side .status-tag {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.order-profit {
+  min-width: 0;
+  max-width: 100%;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.order-profit > span {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+.order-profit > b {
+  display: block;
+  font-size: 16px;
+  line-height: 1.25;
+  font-weight: 700;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.order-profit > b.pos { color: var(--accent); }
+.order-profit > b.neg { color: var(--neg); }
 .order-mid { font-size: 12px; color: var(--muted); margin: 3px 0 7px; }
 .order-money {
   display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px;
@@ -539,7 +598,28 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .fee-nums { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
 .fee-names { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.5; word-break: break-word; }
 
-.prod-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* v33：商品榜左边多了「回款」两个字，行宽更紧——名称与「回款 N 单 ¥X」在不足时分行，
+   比例条仍独占下一行；数字不省略、也不靠缩到难读的字号容纳。 */
+.prod-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 8px;
+  flex-wrap: wrap;
+}
+.prod-line > .prod-name {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.prod-line > .prod-nums {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
 /* 商品榜每行＝「名字/单数/利润」一行 + 下面一条满宽比例条。
    注意 .prod-row 在共享规则里是 display:flex（和 .status-row/.month-row 写在一起），
    那样 .prod-bar-track 就成了同一行的 flex 项、被内容挤成 1–3px 宽——比例条等于没画
