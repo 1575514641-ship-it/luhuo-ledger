@@ -161,6 +161,10 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .month-cell { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
 .month-cell.pos { color: var(--accent); font-weight: 600; }
 .month-cell.neg { color: var(--neg); font-weight: 600; }
+/* v38：看板「近 6 个月」最右一列原来**没有列名**（只有卡片脚注在讲它是什么，而脚注在卡片底部）。
+   补一个短标识「差」，走更小字号 + 弱色、紧贴数字。字号 10px 是刻意的：这一列在三档窄屏上已经被
+   ¥100,001,999.99 这类极端金额顶到过边（v33 修过一次裁切），标识不能把那一列的可用宽度再吃掉一截。 */
+.month-cell .mc-tag { font-style: normal; font-size: 10px; color: var(--muted); margin-right: 2px; }
 .empty-mini { color: var(--muted); font-size: 13px; padding: 6px 0; text-align: center; }
 
 /* ---- 账本 ---- */
@@ -331,6 +335,10 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 /* 告警项（整批口径与成员明细合不上）用 --neg 系：v20 的 --warn 是灰蓝，和上面那行的 --muted
    几乎同色，肉眼分不出来 */
 .bh-note.warn { color: var(--neg); }
+/* v38（报告 B8 / D4）：状态提示的**完整点名**落在这一行（短 toast 只说关键事实，不再塞项名）。
+   名字一个都不缩写、也不靠 CSS 裁掉后半句，所以必须允许它在**任何**位置断行（任意长串的商品名
+   也要能折，不许撑出容器或自己把自己裁掉）；`anywhere` 同时把 min-content 压到一个字宽。 */
+.bh-note.bh-statusdetail { overflow-wrap: anywhere; }
 /* v32：收起态下「有告警」这件事**不许被藏起来**（v27 特意给那条告警加了自助指引）。
    做法：摘要行尾部一个紧凑标记，展开态不显示它（完整文案那一行就在下面，展开态一字不动）。
    层级照 .bh-note.warn：红色系、加粗，在整行摘要里一眼能看见。 */

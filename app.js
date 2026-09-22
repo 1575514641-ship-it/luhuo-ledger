@@ -94,6 +94,28 @@
   // v37：状态提示的「每批每会话只首判一次」记号 —— batchId 的内存 Set（不落库、不进同步包，刷新即清）。
   // 首判＝本会话对该批的第一次提交编辑；**无论是否弹出都记为已看过**（见 commitProfitEdit 内注释）。
   const statusHintSeen = new Set();
+  // v38：状态提示里「完整点名」那一行（内存，不落库、不进同步包）—— batchId → { generation, ids }。
+  // 短 toast 只陈述关键事实（项名一旦变长，两个 120 字的名字曾把提示撑到 527px 高），
+  // 完整清单落在这里、在批次表头里常驻可查（关掉编辑框之后仍然查得到）。见 commitProfitEdit。
+  // v38 收尾（F1）：记的是**项的 id**、不是名字——条件会变（恢复默认分摊 / 退批 / 整批重摊 /
+  // 整包换数据），一份存下来的名字清单过了那一刻就可能替一个已经退出本批的成员说话；
+  // 渲染时按 id 现查账本、现算「它还偏离默认吗」，见 batchDetailNames。
+  const statusHintDetail = new Map();
+
+  // ---- v38（报告 B1/B2/B7）：账本代次 + 各类「打开时记账本、稍后才写回」的会话 ----
+  // **账本代次**（内存、不落库）：整包替换（导入 JSON / 云端拉取）、重置身份、导入同步码时 +1。
+  // 它回答的问题不是「钱守恒吗」而是「用户手上这份意图还是不是当前这本账」——旧拉取在重置后
+  // 落库、换包后仍开着的编辑框把新金额覆盖回旧值，都属于这一类。
+  let ledgerGeneration = 0;
+  // 会话快照（内存、不落库）：打开弹窗那一刻记下这一单/这一批长什么样，写回前按 id 与账本现值对表。
+  // 对不上就**拒绝落库并说明**、草稿留给用户核对，绝不自动挑一边的值（旧值或新值）。
+  let formSession = null;      // { generation, id, snap }                  记单/编辑表单
+  let paySession = null;       // { generation, id, snap }                  回款 / 改回款弹窗
+  let batchSession = null;     // { generation, snaps: Map(id → snap) }     批量结算弹窗
+  let baodanSession = null;    // { generation, snaps: Map(id → snap) }     报单面板
+  // **拉取序号**（内存）：同一个身份可能有两次拉取在飞（启动那次 + 配对那次），后发起的才算数。
+  // 只比金额或订单 id 分辨不出「哪一次是新意图」，所以另设一个单调递增的序号（见 pullFromCloud）。
+  let pullSeq = 0;
 
   // 报表
   let reportMode = "month";
@@ -217,6 +239,22 @@
   function nonNegative(v) { const n = numberValue(v); return n < 0 ? 0 : n; }
   // 份额字段（分，整数）：负值归 0 + 取整，保证「分摊在分的层面算」这条不变量
   function shareCents(v) { return Math.max(0, Math.round(numberValue(v))); }
+
+  // v38：一单在**这一刻**的账本快照（内存态，只用来对表；不落库、不进同步包）。
+  // 逐键 JSON 比对之所以稳定：normalizeData 与各处写入（submitForm / 收入单 / 分项编辑）
+  // 用的是同一套键顺序，Object.assign 就地改也不会改变已有键的位置。
+  function orderSnap(o) { return o ? JSON.stringify(o) : ""; }
+
+  // v38：**唯一**的「接纳了一本新账」入口（报告 B2/B7/B9 同一处）：账本代次 +1，并把只活在内存里、
+  // 指向旧账本的状态全部作废——手改锁（v36）、状态提示首判记号与它的详情行（v37）。
+  // 刻意只在**真的换了账本**时调用（导入 JSON / 云端拉取成功落库 / 重置身份 / 换同步码）：
+  // 一次失败的云端读取不算换账本，不许把首判额度白白复位。
+  function invalidateForNewLedger() {
+    ledgerGeneration += 1;
+    profitLocks.clear();
+    statusHintSeen.clear();
+    statusHintDetail.clear();
+  }
 
   function normalizeData(source) {
     const out = { version: 1, orders: [] };
@@ -532,6 +570,14 @@
     profitLockSnapshot: () => [...profitLocks].map(([bid, m]) => [bid, [...m]]),
     // v37 只读探针：状态提示的首判记号（测试断言「每批每会话只首判一次」用；无写入口）
     statusHintSeenKeys: () => [...statusHintSeen],
+    // v38 只读探针：状态提示的**完整点名**那一行（短 toast 不再带项名之后，「详情项数准确」这条
+    // 得能被断言）。同样只暴露读取视图——没有任何写入口，业务代码一律走 statusHintDetail 本体。
+    statusHintDetailFor: (batchId) => {
+      const d = statusHintDetail.get(batchId);
+      // v38 收尾（F1）：报的是**这一刻真的会渲染出来的那份清单**（batchDetailNames 现算）——
+      // 探针与 DOM 不能各说一套，否则「断言详情行内容」时两边会分叉。
+      return d ? { generation: d.generation, names: batchDetailNames(batchId) } : null;
+    },
     batchProfitInfoFor: (batchId) => {
       const g = batchGroups().get(batchId);
       const members = data.orders.filter((o) => o.batchId === batchId);
@@ -600,12 +646,14 @@
     const flowStats = s.months.map((m) => ({ cost: m.cost, income: m.income }));
     $("#dashFlow").innerHTML = chartFlowSVG(flowBuckets, flowStats, 118);
 
+    // v38（报告 C 节）：最右一列补一个短标识「差」——它一直**没有列名**，只有脚注在讲它是什么，
+    // 而脚注在卡片底部、与数字隔了好几行。标识走小字号 + 紧贴数字，金额口径一个字没动。
     $("#monthList").innerHTML = s.months.map((m) => `
       <div class="month-row">
         <span class="month-name">${m.month}</span>
         <span class="month-cell">垫 ${money(m.cost)}</span>
         <span class="month-cell">回 ${money(m.income)}</span>
-        <span class="month-cell ${m.diff > 0 ? "pos" : m.diff < 0 ? "neg" : ""}">${money(m.diff)}</span>
+        <span class="month-cell ${m.diff > 0 ? "pos" : m.diff < 0 ? "neg" : ""}"><i class="mc-tag">差</i>${money(m.diff)}</span>
       </div>`).join("");
   }
 
@@ -689,14 +737,14 @@
       notes.push({ warn: false, text: `本批已有 ${batchCount - members.length} 单不在其中（退出或删除）` });
     }
     const diff = [];
-    if (g.feeCents > 0) {
-      const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
-      if (feeSum !== g.feeCents) diff.push(`邮费 ${money(feeSum / 100)}`);
-    }
-    if (g.incomeCents > 0) {
-      const incSum = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
-      if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
-    }
+    // v38（报告 B6）：金额对账**不以整批值 > 0 为前提**。原来两处 `> 0` 门槛让「整批为 0、成员上却有值」
+    // 这种分叉彻底静默——用户把某一单回款改成 1 元之后，表头既不报「待对账」、分项编辑入口又消失，
+    // 展开也看不到任何原因。这里只扩充异常可见性，**不重算**任何账本金额（判据与 batchProfitInfo
+    // 的 drift 那条逐字同源，所以「能编辑」与「亮红」永远互斥）。
+    const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
+    if (feeSum !== g.feeCents) diff.push(`邮费 ${money(feeSum / 100)}`);
+    const incSum = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
+    if (incSum !== g.incomeCents) diff.push(`回款 ${money(incSum / 100)}`);
     if (diff.length > 0) {
       // v27：把下一步点哪里写进同一行——删掉批内一单后整批口径**不会**自动扣（刻意的边界），
       // 只报数字的话用户会以为账坏了。指引就是那句自助修法：点「改本批邮费」按当前成员重摊一次
@@ -710,6 +758,29 @@
     return notes;
   }
 
+  // v38 收尾（F1，选定方案 ②「渲染时现算」）：状态提示那一行说明的**事实部分一律现算**。
+  // 记录（statusHintDetail）只回答一件事：「本会话对这批做过一次要报的编辑，当时该点名的是哪几个 id」。
+  // 显示与否、项数、名字三者全部按**当前账本**算：
+  //   · 只留仍是本批成员、且现值仍偏离默认分摊（±1 分容差与判偏离同款）的 id；
+  //   · 名字按当前成员顺序现取 —— 恢复默认分摊后清单自然为空、整行消失；退批的人不再是本批成员、
+  //     不会再被点名（旧实现存名字 + 只在 invalidateForNewLedger 清，于是这两件事都会说谎）；
+  //   · 项数就是这份清单的长度，不会出现「共 3 项却只点出 2 个名」。
+  // 为什么不用方案 ①（只在那三处补 delete）：删记录只治那几处，任何**别的**让条件消失的路径
+  // （手改回默认值、导入同 id 数据、将来新加的入口）都会重新说谎；现算构造上不会。
+  // 那三处仍然一并 delete（与 profitLocks 同寿命），但它是兜底而**不是**判据。
+  function batchDetailNames(batchId) {
+    const d = statusHintDetail.get(batchId);
+    if (!d || d.generation !== ledgerGeneration || d.ids.length === 0) return [];
+    const g = batchGroups().get(batchId);
+    const members = data.orders.filter((o) => o.batchId === batchId);
+    if (!g || members.length < 2) return [];
+    const defCents = splitByWeight(g.incomeCents, members.map((m) => Math.max(0, toCents(m.cost))));
+    const want = new Set(d.ids);
+    return members
+      .filter((m, i) => want.has(m.id) && Math.abs(toCents(m.income) - defCents[i]) > 1)
+      .map((m) => m.name || "未命名");
+  }
+
   function batchHeadHtml(g, visible) {
     const shownCount = visible.filter((o) => o.batchId === g.id).length;
     const members = data.orders.filter((o) => o.batchId === g.id);
@@ -719,6 +790,15 @@
     if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
     if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
     if (g.pending > 0) bits.push(`${g.pending} 单在途`);
+    // v38（报告 B8 / D4）：状态提示的**完整点名**放在这里（不再塞进短 toast）。只在「本会话对该批
+    // 首次提交编辑时确实存在非默认项」时才有这一行，且只认**当前账本代次**记下的那一份——整包换过
+    // 数据（导入/拉取）后它与手改锁、首判记号一起作废，不会拿旧账的名字说新账的事。
+    // 名字一个都不缩写、不靠 CSS 裁掉后半句：项数就是当时的项数，逐个商品名可定位。
+    // v38 收尾（F1）：清单与项数**渲染时现算**（见 batchDetailNames）——记录只提供 id。
+    const detailNames = batchDetailNames(g.id);
+    const detailNote = detailNames.length > 0
+      ? `<div class="bh-note bh-statusdetail">本批现值与默认分摊不同，共 ${detailNames.length} 项；本次编辑已把没钉住的项一并重算：${escapeHtml(detailNames.join("、"))}</div>`
+      : "";
     const drift = batchDrift(g, members, batchCount);
     const expanded = expandedBatches.has(g.id);
     // v32：收起态只留两行（第一行 + 整批摘要），所以告警**不能**只靠下面那几行 .bh-note 说话——
@@ -745,10 +825,12 @@
       : "";
     // v36：不开放编辑的两条**新**禁入（有人没记回款 / 有 income 却没归期）要给用户一句话——
     // 「按钮没了」本身不是解释（反静默）。既有两条各自已有说法：待回款看「总利润 待回款」，
-    // 待对账看下面那条 ⚠ 告警（那句本来就写着下一步点哪里），所以这两条**不重复渲染**：
+    // 待对账看下面那条 ⚠ 告警（那句本来就写着下一步点哪里），所以这些**不重复渲染**：
     // 同一个批次上不再叠一句同义的话，提示行条数保持与 v35 一致。
-    const lockNote = !pinfo.pending && !pinfo.editable && pinfo.reason !== "drift"
-      && !drift.some((n) => n.warn)
+    // v38（报告 B6）：这里**不再**按 reason 单独排除 drift —— 判据只留「下面已经有 warn 级告警」
+    // 这一条（drift 与 warn 告警现在是逐字同源的判据，所以排除 drift 是死条件；留着它反而会
+    // 在将来两处判据走岔时把「入口为什么不可用」的唯一解释吞掉）。
+    const lockNote = !pinfo.pending && !pinfo.editable && !drift.some((n) => n.warn)
       ? `<div class="bh-note">${escapeHtml(batchReasonText(pinfo.reason))}</div>`
       : "";
     // v32：第一行整行是折叠开关。必须是真 <button> —— div 在手机上拿不到正确的键盘/触摸语义；
@@ -776,6 +858,7 @@
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
       ${lockNote}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
+      ${detailNote}
     </div>`;
   }
 
@@ -1286,6 +1369,19 @@
   function openForm(order, prefill) {
     const src = order || prefill || null;
     editingId = order ? order.id : null;
+    // v38（报告 B2）：**编辑会话**（内存）——记下这次编辑依赖的账本代次 + 原单快照，写回前对表。
+    // 整包换过账本（导入/云端拉取/重置/换身份，代次变）或原单被别的入口改过/删掉（快照变），
+    // 这一次保存就**整笔拒绝**并保留草稿，绝不自动挑一边的值（旧表单值 vs 新账本值）。
+    // v38 收尾（F4）：新建（无 order）不建会话。「再来一单」也落在这条分支里（duplicateOrder 走
+    // openForm(null, o)），两件事必须说清——
+    //   · 它**有**原单：prefill 的各值确实可能来自换包**前**的那本账（弹窗不会被换包关掉，
+    //     render() 只重绘列表），所以旧注释「它没有『原单』可对表」不成立。
+    //   · 但保存走的是 push（写一条**新**记录），不覆盖任何既有记录，也不会把旧值写回原单；
+    //     这类错值的代价只是用户自己看得见、可以删掉的一条新草稿。所以这里**不设**拒绝门槛
+    //     （加了会改变「再来一单」的手感：一次拒绝＋要求重开）。要拦是产品决定，不在这轮自作主张。
+    formSession = order
+      ? { generation: ledgerGeneration, id: order.id, snap: orderSnap(order) }
+      : null;
     prefillPlatform = !order && prefill ? String(prefill.platform || "") : "";
     // v25：编辑既有记录一律按货单形态回显（不判别它"是不是收入单"——没有类型字段可判）；
     // 打开时把模式与两个"默认值"标记复位，渠道带过来就算用户已经定过，切类型不该把它改掉
@@ -1363,6 +1459,7 @@
   function closeForm() {
     $("#formModal").classList.remove("show");
     editingId = null;
+    formSession = null;   // v38：编辑会话随弹窗关闭一起作废（下次「编辑」会重新记一份）
   }
 
   function submitForm(ev) {
@@ -1413,13 +1510,27 @@
 
     const cost = numberValue(f.cost.value);
     if (cost < 0) { toast("垫付金额不能是负数"); return; }
+    // v38（报告 B2）：编辑会话先对表再往下走 —— 三条失效路各说各的话，**都在任何写入之前**：
+    //   ① 原单已不在账本里（被别的入口删掉）：**必须拒绝**，绝不能落进下面那条「新建」分支
+    //      ——那等于拿一份旧表单的草稿凭空造一条新记录；
+    //   ② 账本整包被换过（代次变）或原单已被改过（快照对不上）：拒绝落库、草稿留在表单里供核对。
+    // 对表放在「0 元购确认框」之前：失效的编辑连确认都不该弹（点完再报「没保存」是骗点击）。
+    const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
+    if (editingId && !existing) {
+      toast("这一单已不在账本里，这次编辑没保存，请关掉重新核对");
+      return;
+    }
+    if (formSession && (formSession.generation !== ledgerGeneration
+      || formSession.id !== existing.id || formSession.snap !== orderSnap(existing))) {
+      toast("账本已更新，这次编辑没保存，请重新打开核对");
+      return;
+    }
     // 垫付 0 的确认框（v26 起文案同时覆盖两种情形）：它服务货单的「0 元购/白嫖」，也是
     // **编辑一条纯收入单**时必然走到的那一格（编辑一律按货单路径回显、垫付恒为 0），
     // 老文案「确认这是 0 元购/白嫖的单子吗？」在后一条路上读起来不通，所以改成中性措辞。
     // 刻意**不做**「这条是不是收入单」的判断：任何靠 cost===0 / 字段缺省去识别的写法都会把
     // 「垫付 0 的已回款老货单」误判成收入单（v25 已定为禁止项），这次点击原样保留。
     if (cost === 0 && !confirm("这一单垫付金额为 0（白嫖单或纯收入单），确认保存吗？")) return;
-    const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
     // v27：把状态存成「在途」而这一条自己还留着回款 → 先问一声（v27 起两处口径统一为
     // 「回款非空即收入」，所以这条记录存成在途后**回款照旧计入收入统计**——文案必须讲这条实话）。
     // 判据只有两个：这一条记录自己的 status 选择 + 它自己的 income 字段，
@@ -1479,6 +1590,9 @@
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
     payTargetId = id;
+    // v38（报告 B2）：回款/改回款也是「打开时记账本、稍后才写」的会话——预填的金额与利润预览
+    // 都建立在打开那一刻这一单的样子上；代次变了或这一单被改过，提交必须整笔拒绝并说明。
+    paySession = { generation: ledgerGeneration, id: o.id, snap: orderSnap(o) };
     // v26：「已回款的单」从这里进来是**改回款**——预填它现在记着的金额与回款日期（而不是
     // 「垫付价 + 今天」），提交时也只写回这两个字段（见 submitPay）。判据就是这一条记录自己的
     // status，与「它是不是收入单」无关（收入单不落任何类型字段，也不许去猜）。
@@ -1499,6 +1613,7 @@
     $("#payModal").classList.remove("show");
     payTargetId = null;
     payEditMode = false;
+    paySession = null;   // v38：会话随弹窗关闭一起作废（下次打开重新记一份）
   }
 
   function updatePayPreview() {
@@ -1515,6 +1630,15 @@
     const f = ev.target;
     const o = data.orders.find((x) => x.id === payTargetId);
     if (!o) return closePayForm();
+    // v38（报告 B2）：写回前对表——这一单被别的入口改过、或整包换过账本（代次变），
+    // 就拒绝落库。**刻意不关弹窗**：用户刚打的金额留在框里供核对（关掉就等于把草稿也丢了）。
+    // 原来这里是无条件写：云端把同 id 的垫付从 100 改成 777 之后，用户只改备注保存，
+    // 结算预览是按旧垫付算的、写进去的也是旧垫付下的决定。
+    if (paySession && (paySession.generation !== ledgerGeneration
+      || paySession.id !== o.id || paySession.snap !== orderSnap(o))) {
+      toast("账本已更新，这次回款没保存，请重新打开核对");
+      return;
+    }
     const income = numberValue(f.income.value);
     // v26：改回款 = 只改这一条记录自己的 income 与 incomeDate 两个字段，
     // 状态保持「已回款」（**不产生第二条记录**、不动 cost/fee/qty/批次字段/其它任何一格）。
@@ -1594,6 +1718,12 @@
     persist();
     scheduleSync();
     rerenderBatchBlock(batchId);
+    // v38（报告 B5）：这一批的钱变了，**派生视图**（看板 / 报表）必须跟着刷。原来只重绘当前批次块，
+    // 于是「改进分项利润 → 不刷新、切报表」看到的还是旧商品榜与旧环图（账本已经是对的，两页对不上；
+    // 恢复默认分摊那条路同样）。局部重绘照旧保留（避免滚动位置跳动），这里只补两个派生页；
+    // 统计公式一个字不动。
+    renderDash();
+    renderReport();
   }
 
   // 点一下利润数字 → 原地换成行内输入框（预填当前利润，元、两位小数），聚焦全选方便直接打新值。
@@ -1607,6 +1737,9 @@
     input.inputMode = "decimal";
     input.className = "profit-input";
     input.dataset.id = id;
+    // v38 收尾（F3）：行内编辑也要带上自己的**账本代次**（与 formSession / paySession / batchSession 同款）。
+    // 输入框里这个值是用户在**旧账本**上下文里形成的；提交时账本若已整包换过，绝不许按旧意图写。
+    input.dataset.generation = String(ledgerGeneration);
     // v36：格式白名单（可选负号 + 整数/两位小数 + 可选指数）。**必须有**——commitProfitEdit
     // 提交前那句 `input.checkValidity()` 就是靠它兜住 "abc" 这类值；没有它，toCents("abc") 会
     // 静默返回 0、isSafeInteger(0) 又为真，「清空/打错再点到别处」就把那一项钉成 0 元并整批重摊
@@ -1641,6 +1774,15 @@
   // v36 补强两处，都是为了「不许静默」：① 输入非法值先校验再结算（空 ≠ 0、格式/范围不对就不写库）；
   // ② 读锁时与账本现值对表，陈旧的锁当作没锁并按现值重摊，且把失效项的名字报给用户。
   function commitProfitEdit(input) {
+    // v38 收尾（F3）：**显式**代次守门——这是本轮之前唯一没有守门的写入口。它当时之所以打不进去，
+    // 只是因为「每次换包都恰好伴随 render() → renderList() 整块 innerHTML 把行内输入框销毁」，
+    // 靠实现细节遮蔽：将来谁去掉那次重绘，就会重开 B2 那一类「拿旧账本的意图改新账本」的缺陷，
+    // 而现有断言一条都抓不到。守门位置刻意在 `!o` 早退**之前**：换包后按 id 找不到这一单时走的正是
+    // 这条，不许靠「找不到就当没事」。
+    if (input.dataset.generation !== String(ledgerGeneration)) {
+      toast("账本已更新，这次编辑没保存，请重新打开核对");
+      return;
+    }
     const id = input.dataset.id || "";
     const o = data.orders.find((x) => x.id === id);
     if (!o || !o.batchId) return;   // 散单/找不到：没有批次块要动，直接收工
@@ -1659,8 +1801,19 @@
     // 去掉首尾空白后再验格式：toCents 本来就接受 " 50 "，别因为加了校验反而把它拒掉
     input.value = rawVal;
     if (!input.checkValidity()) { toast("金额格式不对，这一项没改"); rerenderBatchBlock(batchId); return; }
-    const newProfit = toCents(rawVal);   // 界面收「元」两位小数 → 转分；负数照收（允许负利润）
-    if (!Number.isSafeInteger(newProfit) || Math.abs(newProfit) > 50000000) {
+    // v38（报告 B4）：**不许用带默认值的容错转换**判数值范围。`toCents()` 走 `numberValue()`，
+    // 而它把 Infinity/NaN 一律收成 0 ⇒ `1e999`（JS 里的 Infinity）会以「本金 0 元」的身份通过
+    // 后面每一道检查、被当成 0 元利润静默写进账本（另两项随之被重摊），全程没有一句提示。
+    // 这里用 `Number(rawVal)` 原样转 + `Number.isFinite` 严格判，再把「元」落成整数「分」；
+    // 上限仍是 ¥500,000（＝50,000,000 分）——**不动 numberValue() 本体**，避免连带改变导入兼容口径。
+    const numeric = Number(rawVal);
+    if (!Number.isFinite(numeric) || Math.abs(numeric) > 500000) {
+      toast("这个数超出合理范围，这一项没改");
+      rerenderBatchBlock(batchId);
+      return;
+    }
+    const newProfit = Math.round(numeric * 100);
+    if (!Number.isSafeInteger(newProfit)) {
       toast("这个数超出合理范围，这一项没改");
       rerenderBatchBlock(batchId);
       return;
@@ -1699,9 +1852,15 @@
     // 也会因本次写入把各项掰离默认而误弹，正好破坏「正常分配流程零提示」。
     const preIncomes = members.map((m) => toCents(m.income));
     const defCents = splitByWeight(g.incomeCents, members.map((m) => Math.max(0, toCents(m.cost))));
-    const offNames = members
-      .filter((m, i) => preIncomes[i] !== defCents[i])
-      .map((m) => m.name || "未命名");
+    // v38（报告 B9 ①）：判偏离加 **±1 分容差**——1 分的归属是分币规则的噪音（结算弹窗里的成员
+    // 数组顺序与「恢复默认分摊」用的账本顺序曾经不同，`splitByWeight` 的尾差按下标发，于是那一分
+    // 会落在不同人头上），不是用户意图；实测 3 单同价、整批回款 ¥3.34 时每次首判都误报一次。
+    // **这条容差只用于这条提示**：金额守恒、入库、对账（batchProfitInfo / batchDrift）一律仍按分币
+    // 严格相等判。代价是它会漏掉「真实的 1 分手动偏离」——这是已选口径的明确代价。
+    // v38 收尾（F1）：这里只收集**项的 id**（名字留到渲染时现取）——存名字会让「退批之后还点名
+    // 已离开的成员」变成一条存量事实；存 id 才能让渲染那一刻重新对表（见 batchDetailNames）。
+    const offMembers = members.filter((m, i) => Math.abs(preIncomes[i] - defCents[i]) > 1);
+    const offIds = offMembers.map((m) => m.id);
     let changed = false;
     members.forEach((m, i) => {
       const incCents = r.shares[i] + toCents(m.cost) + toCents(m.fee);  // 利润 = 回款 − 垫付 − 邮费 反推回款
@@ -1725,7 +1884,7 @@
     // 判定时机＝本会话对该批的第一次提交编辑；**无论是否弹出都记为已看过**（内存 Set，不落库）。
     // 触发条件＝该批存在「现值 ≠ 默认值」的成员（默认值按 3.1：splitByWeight(g.incomeCents, cost)；
     // 判偏离用 m.income，禁用 batchIncomeShare——后者经 shareCents 把负值夹成 0，是有损视图）。
-    // offNames 在写回前算好（见上方 preIncomes）。
+    // offIds 在写回前算好（见上方 preIncomes）；名字**不存**，渲染时按 id 现取（见 batchDetailNames）。
     //
     // 为什么不要「逐次报被吃掉的手改值」（选 1）也不要「首次满足条件时才弹」（选 2）：
     // - 选 1：A 手感下第一次编辑之后，未钉住项就全是非默认值 ⇒ 从第二次编辑起几乎每次都弹 ⇒
@@ -1738,18 +1897,23 @@
     // 再叠一句状态陈述是冗余；而「两者同现」在真实操作里不可达——陈旧锁要求本会话先前编辑过该批，
     // 而那次编辑就是首判点，当时各项还是默认值。
     if (dropped.length) {
-      // 反静默：失效必须说人话，且带上**被失效那些项的项名**（手机 360px 下也不能只报「N 项」）。
-      // 名字超过 3 个就省略号收尾——一整批十几项时 toast 会连成一条挤爆屏幕。
-      const names = dropped.map((m) => m.name || "未命名");
-      toast(`本批已重摊，${names.slice(0, 3).join("、")}${names.length > 3 ? "…" : ""} 这 ${names.length} 项的手改锁定失效（已按现值重算）`);
+      // 反静默：失效必须说人话。v38 收尾（F2）：这一支原来把**项名**拼进 toast（`names.slice(0, 3)`），
+      // 而项名长度不受限（normalizeData 的上限是 120 字）——4 个长名实测 toast 256 字、盒子
+      // 195×449px；3 个 120 字的名约 390 字会到 700px+，而 `.toast` 锚在 bottom:124px 且没有高度上限，
+      // 长过半个视口就从**顶部**跑出屏幕：那不是「挤坏版面」，是点名本身静默失效。
+      // 改法与状态提示**同一套**（两条提示的呈现必须一致）：短 toast 只说条数与事实、一个项名都不带，
+      // 完整清单落到本批那行常驻说明（复用同一个 .bh-statusdetail）。
+      statusHintDetail.set(batchId, { generation: ledgerGeneration, ids: dropped.map((m) => m.id) });
+      toast(`本批已重摊：共 ${dropped.length} 项的手改锁定失效（已按现值重算）· 完整清单见本批说明`);
     } else if (!statusHintSeen.has(batchId)) {
       statusHintSeen.add(batchId);   // 无论是否弹出都记为已看过（内存态，reload 清零）
-      if (offNames.length) {
-        // 措辞：前向陈述、不出现「手改」二字、不报金额；名字最多 2 个 +「等 N 项」，整条 ≤2 行
-        const namePart = offNames.length > 2
-          ? `（${offNames.slice(0, 2).join("、")} 等 ${offNames.length} 项）`
-          : `（${offNames.join("、")}）`;
-        toast(`本批现值与默认分摊不同${namePart}：本次编辑会把没钉住的项一并重算（钉住只在刷新前有效）`);
+      if (offIds.length) {
+        // v38（报告 B8 / D4）：短 toast **只陈述关键事实与本次重算范围**，项名一个都不进 toast。
+        // 起因：项名长度不受限，两个 120 字的合法商品名把这条提示撑到 360px 下 527px 高
+        // （实测），「没越界」不等于「可读」。完整点名落到批次表头那行常驻说明（statusHintDetail）：
+        // 关掉编辑框之后仍查得到、项数就是当时的项数、逐个商品名可定位（不许用 CSS 裁掉后半句）。
+        statusHintDetail.set(batchId, { generation: ledgerGeneration, ids: offIds.slice() });
+        toast("本批现值与默认分摊不同：本次编辑会把没钉住的项一并重算（钉住只在刷新前有效）· 完整清单见本批说明");
       }
     }
     if (changed) touchBatchAndRerender(batchId);
@@ -1786,15 +1950,6 @@
     if (!o || !o.batchId) return;
     const mates = data.orders.filter((x) => x.batchId === o.batchId);
     const others = mates.filter((x) => x.id !== id);
-    const title = `一起寄出 · ${o.batchDate || o.date}`;
-    const tail = others.length === 0
-      ? "它本来就是这一批里唯一的一单，退出后这一批就没了。"
-      : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款会按份额扣掉它那部分）。`}`;
-    if (!confirm(`「${o.name}」退出「${title}」这一批？\n${tail}\n`
-      + `已经分摊到它头上的邮费 ${money(o.fee)}${o.income === null ? "" : "、回款 " + money(o.income)} 不改动，留在这一单上继续算利润。`)) return;
-    // 退出者（以及「只剩它自己」时一并退出那一单）清空全部批次字段；留着的成员**不动 batchCount**——
-    // 它记的是「结算那一刻有几个人」，正是表头区分「有人退出」与「金额被改过」的依据。
-    // 剩下的人之后若原班人马再结一次，batchCount 会被重写成当时的人数，提示随之消失。
     const g = batchGroups().get(o.batchId);
     const idx = mates.findIndex((x) => x.id === id);
     const outFee = idx < 0 ? 0 : batchShares(mates, "batchFeeShare", g ? g.feeCents : 0)[idx];
@@ -1805,13 +1960,36 @@
     const outIncome = idx < 0 ? 0 : toCents(mates[idx].income);
     const leavers = [o].concat(others.length === 1 ? others : []);
     const leaverIds = new Set(leavers.map((x) => x.id));
+    const staying = mates.filter((x) => !leaverIds.has(x.id));
+    // v38（报告 B3 / D1）：留批成员的整批回款扣完若是负数，现行模型表示不了（batchIncome 会被
+    // 白名单夹成 0）——**在任何写入之前**整笔拒绝，原账一分不动并说明原因。
+    // 原来只把负剩余 `Math.max(0, …)` 夹成 0（实测：留批明细回款合计 −¥100，整批口径却写 ¥0），
+    // 于是留在批里的人「整批口径 vs 成员明细」当场分叉、表头亮红——而钱已经被改了一半。
+    const remainingIncome = (g ? g.incomeCents : 0) - outIncome;
+    if (staying.length > 0 && remainingIncome < 0) {
+      toast(`退出后剩下这几单的回款合计会是 ${money(remainingIncome / 100)}（负数），账本表示不了负的整批回款，本次没退批`);
+      return;
+    }
+    const title = `一起寄出 · ${o.batchDate || o.date}`;
+    const tail = others.length === 0
+      ? "它本来就是这一批里唯一的一单，退出后这一批就没了。"
+      : `退出后它不再和另外 ${others.length} 单绑在一起${others.length === 1 ? "，那单也只剩自己、一并退出批次。" : `，该批还剩 ${others.length} 单（整批邮费/回款会按份额扣掉它那部分）。`}`;
+    if (!confirm(`「${o.name}」退出「${title}」这一批？\n${tail}\n`
+      + `已经分摊到它头上的邮费 ${money(o.fee)}${o.income === null ? "" : "、回款 " + money(o.income)} 不改动，留在这一单上继续算利润。`)) return;
+    // 退出者（以及「只剩它自己」时一并退出那一单）清空全部批次字段；留着的成员**不动 batchCount**——
+    // 它记的是「结算那一刻有几个人」，正是表头区分「有人退出」与「金额被改过」的依据。
+    // 剩下的人之后若原班人马再结一次，batchCount 会被重写成当时的人数，提示随之消失。
     // v36：退批＝这一批的成员构成变了，指向这一批的手改锁（按成员 id 钉的）随之作废。
     // **必须在下面 leavers.forEach 清空 x.batchId 之前**取一次原 batchId —— 位置写错（挪到清空
     // 之后）就等于没清：那时 o.batchId 已经是 ""，删的是一个不存在的键，旧锁原地留着重摊下一批。
-    const oldBatchId = o.batchId;
-    profitLocks.delete(oldBatchId);
-    mates.filter((x) => !leaverIds.has(x.id)).forEach((x) => {
+    profitLocks.delete(o.batchId);
+    staying.forEach((x) => {
       x.batchFee = Math.max(0, toCents(x.batchFee) - outFee) / 100;
+      // v38 收尾（F5）：这条 `Math.max(0, …)` **保留**，它是兜底、不是判据——原注释写「这里不再夹负」，
+      // 紧邻的代码却仍在夹，两句互相打脸。如实说法：负剩余在**上面那道门**已经被整笔拒绝（拦的是
+      // 「用户这次退批的意图」）；这里的夹子只兜「账本里本来就存的负数 / 半截写入的旧数据」——
+      // normalizeData 的白名单本来就会在每次刷新时把 batchIncome 再夹一次，不夹反而会造成
+      // 「存进去负数、读出来 0」的字节漂移。扣减本身按退出者的**实际回款**做（v36 口径，不动）。
       x.batchIncome = Math.max(0, toCents(x.batchIncome) - outIncome) / 100;
     });
     leavers.forEach((x) => {
@@ -1863,6 +2041,15 @@
       id: o.id, name: o.name, cost: o.cost, batchId: o.batchId,
       checked: preselectBatchId ? o.batchId === preselectBatchId : true,
     }));
+    // v38（报告 B2）：结算会话的快照——勾选、金额预期与分摊权重都建立在**打开这一刻**的账本上；
+    // 提交前对表（代次 + 所选成员逐单），对不上就拒绝落库。
+    batchSession = {
+      generation: ledgerGeneration,
+      snaps: new Map(batchItems.map((it) => {
+        const cur = data.orders.find((o) => o.id === it.id);
+        return [it.id, orderSnap(cur)];
+      })),
+    };
     $("#batchFee").value = "";
     $("#batchIncome").value = "";
     $("#batchDate").value = todayStr();
@@ -1909,6 +2096,7 @@
   function closeBatchModal() {
     $("#batchModal").classList.remove("show");
     batchItems = [];
+    batchSession = null;   // v38：会话随弹窗关闭一起作废
   }
 
   function renderBatchList() {
@@ -1964,8 +2152,28 @@
 
   function submitBatch() {
     const sel = selectedBatchInfo();
-    const orders = sel.orders;
+    const selIds = new Set(sel.orders.map((o) => o.id));
+    // v38（报告 B10 / D3）：**分摊一律用当前 data.orders 里的成员顺序** —— 与「恢复默认分摊」
+    // （resetBatchShares）和分项利润编辑（commitProfitEdit）三处同源。原来这里用的是弹窗排过序的
+    // 成员数组，而 splitByWeight 的尾差是**按下标**发的 ⇒ 同一批钱在「结算」与「恢复默认分摊」
+    // 两处会把那 1 分发给不同的人（同日三单、整批 ¥3.34 实测：结算 111/111/112、恢复默认 112/111/111）。
+    // 只改分摊顺序，**不动弹窗的显示排序**（那是另一码事）。
+    const orders = data.orders.filter((o) => selIds.has(o.id));
     if (orders.length === 0) { toast("先勾选要结算的在途单"); return; }
+
+    // v38（报告 B2）：批量结算弹窗同样绑账本代次 + 所选成员的快照。所选单任一在这期间被别的入口
+    // 改过（或账本整包换过），这一批的分摊预期就不成立——整笔拒绝并说明，绝不按旧预期写。
+    if (batchSession) {
+      if (batchSession.generation !== ledgerGeneration) {
+        toast("账本已更新，这次结算没保存，请重新打开核对");
+        return;
+      }
+      const moved = orders.filter((o) => batchSession.snaps.get(o.id) !== orderSnap(o));
+      if (moved.length > 0) {
+        toast("勾选的单里有内容已变，这次结算没保存，请重新打开核对");
+        return;
+      }
+    }
 
     // 结算按钮不在 form 中，min/step 不会自动拦住提交。
     // 先校验再分摊，避免把负数等非法输入静默当成 0 写回整批。
@@ -1992,34 +2200,52 @@
     const batchId = sel.reuseId || uid();
     const batchDate = (prev && prev.date) || $("#batchDate").value || todayStr();
 
-    // 原批次被带走的份额：必须在改动任何单之前算完（改完再算读到的就是已经写过的值）。
+    // ---- v38（报告 B3 / D1 / D2）：先把整笔写入计划算完、校验通过，再动一个字节 ----
+    // 原批次被带走的份额必须在改动任何单之前算完（改完再算读到的就是已经写过的值）。
     // 只勾了某一批的一部分人、或几个批混着一起结 → 这些单会进新批次，它们从原批次带走的份额
-    // 同样要从原批次**剩余成员**的整批口径里扣掉（v23·D-3 的另一半：重组成批）
+    // 同样要从原批次**剩余成员**的整批口径里扣掉（v23·D-3 的另一半：重组成批）。
+    const deduct = new Map();          // 原批次 id → { fee, income }（单位：分）
     if (!sel.reuseId) {
-      const takenIds = new Set(orders.map((o) => o.id));
       const groups = batchGroups();
-      const deduct = new Map();
       new Set(orders.map((o) => o.batchId).filter(Boolean)).forEach((sid) => {
         const g = groups.get(sid);
         if (!g) return;
         const members = data.orders.filter((o) => o.batchId === sid);
         const feeShares = batchShares(members, "batchFeeShare", g.feeCents);
-        const incomeShares = batchShares(members, "batchIncomeShare", g.incomeCents);
         let fee = 0, income = 0;
         members.forEach((m, i) => {
-          if (!takenIds.has(m.id)) return;
+          if (!selIds.has(m.id)) return;
           fee += feeShares[i];
-          income += incomeShares[i];
+          // v38：回款按**成员账本里的实际 income** 扣（含 0 与负数），不再用 batchIncomeShare——
+          // 那个字段经 shareCents 把负值夹成 0（负回款是可达状态），按它扣会让原批次的整批口径
+          // 多留一截、与剩余成员的实际合计当场分叉。也**不再以 income > 0 作入选条件**
+          // （拿走一个 0 回款的成员同样要从原批次里记一笔 0 的扣减计划）。
+          income += toCents(m.income);
         });
-        if (fee > 0 || income > 0) deduct.set(sid, { fee, income });
+        deduct.set(sid, { fee, income });
       });
-      deduct.forEach((d, sid) => {
-        data.orders.forEach((m) => {
-          if (m.batchId !== sid || takenIds.has(m.id)) return;
-          m.batchFee = Math.max(0, toCents(m.batchFee) - d.fee) / 100;
-          m.batchIncome = Math.max(0, toCents(m.batchIncome) - d.income) / 100;
-        });
-      });
+      // D1：扣完之后原批次**剩下的整批回款**若为负，现行模型表示不了（batchIncome 经白名单被
+      // 夹成 0）——在**任何写入之前**整笔拒绝，原账一分不动并说明原因（不新增字段、不放宽模型）。
+      for (const [sid, d] of deduct) {
+        const g = groups.get(sid);
+        const staying = data.orders.filter((o) => o.batchId === sid && !selIds.has(o.id));
+        const remainingIncome = g.incomeCents - d.income;
+        if (staying.length > 0 && remainingIncome < 0) {
+          toast(`原批剩下的成员回款合计会是 ${money(remainingIncome / 100)}（负数），账本表示不了负的整批回款，本次没拆分`);
+          return;
+        }
+      }
+    }
+    // D2：新批（或续用原批）的整批口径——填了就是这次填的数；**留空时按被带入成员的实际合计建立**
+    // （成员该字段一个字不动，口径得跟它对得上；否则「一组在途单留空直接成批」会当场报出对账告警）。
+    // 合计为负 → 现行模型表示不了，在任何写入前拒绝（D1 的另一半）。
+    const broughtFee = orders.reduce((a, o) => a + toCents(o.fee), 0);
+    const broughtIncome = orders.reduce((a, o) => a + toCents(o.income), 0);
+    const batchFeeCents = feeGiven ? feeCents : (prev ? prev.feeCents : broughtFee);
+    const batchIncomeCents = incomeGiven ? incomeCents : (prev ? prev.incomeCents : broughtIncome);
+    if (batchIncomeCents < 0) {
+      toast(`这一批的回款合计是 ${money(batchIncomeCents / 100)}（负数），账本表示不了负的整批回款，本次没结算`);
+      return;
     }
 
     // 邮费／回款：**纯重摊**（v24 定的模型：一起寄的一批只有一笔邮费，整批金额是这一批的
@@ -2028,21 +2254,22 @@
     // 不再叠加任何「这一单入批前自己记过多少」——那样会算出越改越大、填 0 还留残值的一套账
     // （用户实测「8 单各 ¥4、整批只录了 ¥1，填 0 之后总额还是 ≈¥31.8」就是这么来的）。
     // 纯赋值天然幂等：同样的数字连填两遍，结果一模一样。
+    // v38：份额**按 id 写回**（不是「算完再按下标赋给另一个顺序的数组」）——顺序只由一份
+    // 权威来源（上面的 data.orders 过滤结果）决定，id 映射保证写回的每一项都对得上人。
     if (feeGiven) {
       const feeShares = splitByWeight(feeCents, weights);
-      orders.forEach((o, i) => {
-        o.fee = feeShares[i] / 100;
-        o.batchFeeShare = feeShares[i];
-      });
+      const feeById = new Map(orders.map((o, i) => [o.id, feeShares[i]]));
+      orders.forEach((o) => { o.fee = feeById.get(o.id) / 100; o.batchFeeShare = feeById.get(o.id); });
     }
 
     // 回款同理。总回款 > 0 才把单子置为已回款；填 0 是「删掉这一批的回款」（金额归 0，
     // 状态不因此回退——那一单收没收到钱是另一回事，要改状态去「编辑」里改）。
     if (incomeGiven) {
       const incomeShares = splitByWeight(incomeCents, weights);
-      orders.forEach((o, i) => {
-        o.income = incomeShares[i] / 100;
-        o.batchIncomeShare = incomeShares[i];
+      const incById = new Map(orders.map((o, i) => [o.id, incomeShares[i]]));
+      orders.forEach((o) => {
+        o.income = incById.get(o.id) / 100;
+        o.batchIncomeShare = incById.get(o.id);
         if (incomeCents > 0) {
           o.incomeDate = $("#batchDate").value || todayStr();
           o.status = "已回款";
@@ -2054,9 +2281,18 @@
       profitLocks.delete(batchId);
     }
 
-    // 整批口径：填了就是这次填的总额；留空就是原值（新批次没有原值 → 0），一个字不动
-    const batchFeeCents = feeGiven ? feeCents : (prev ? prev.feeCents : 0);
-    const batchIncomeCents = incomeGiven ? incomeCents : (prev ? prev.incomeCents : 0);
+    // 原批次扣减（照上面算好的计划一次落库）。回款那一项可能为负（被带走的成员自己回款是负的），
+    // 那是**加**回留在批里的人的整批口径，与 D1 的拒绝路径配套；两边都是 0 时一个字节都不动
+    // （「两框留空只记一下成员与日期」那趟照旧不写任何金额字段）。
+    deduct.forEach((d, sid) => {
+      if (d.fee === 0 && d.income === 0) return;
+      data.orders.forEach((m) => {
+        if (m.batchId !== sid || selIds.has(m.id)) return;
+        m.batchFee = Math.max(0, toCents(m.batchFee) - d.fee) / 100;
+        m.batchIncome = Math.max(0, toCents(m.batchIncome) - d.income) / 100;
+      });
+    });
+
     orders.forEach((o) => {
       o.batchId = batchId;
       o.batchDate = batchDate;
@@ -2073,8 +2309,10 @@
     if (incomeGiven) amounts.push(`回款 ${money(incomeCents / 100)}`);
     // 直接把结果报出来：改的是已有的那一批（prev 存在）就说「已改成」，新建批次说「已结算」。
     // 纯重摊之后成员明细必然等于整批金额，没有「成员上另有…」这种残值要交代了。
+    // v38：留空那两趟也不再写 0 —— 整批口径按**被带入成员的实际合计**建立（D2），
+    // 所以措辞说「成员金额没动」（成员那一格确实一个字没动，整批口径跟它们对齐）。
     let msg;
-    if (!feeGiven && !incomeGiven) msg = "这一批的成员与日期已记下，金额没动";
+    if (!feeGiven && !incomeGiven) msg = "这一批的成员与日期已记下，成员金额没动";
     else if (prev) msg = `已改成本批${amounts.join(" · ")} · ${orders.length} 单`;
     else msg = `已结算 ${orders.length} 单${orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : ""} · ${amounts.join(" · ")}`;
     toast(msg);
@@ -2224,11 +2462,38 @@
   // 复制，第二次一个字节都不写（updatedAt 不被平白改掉、不多发一次同步），这就是「值没变不写」那条断言
   // 钉的东西。清空那一格＝把这几单的单号去掉（value 为空也照写，别当成「没填就不动」）。
   // **调用方必须先确认「用户真的动过那一格」**（baodanTrackingTouched）——本函数只管值比不比得上。
+  // v38（报告 B7）：报单会话是否仍然对应当前账本 —— 代次没换 + 候选单逐 id 仍与账本现值一致。
+  // 「按 id 重新 find」**不够**：那只是找到新对象，写进去的仍是旧面板的意图（把新账本覆盖掉）。
+  // 整包换数据（云端拉取 / 导入）后候选单对象与账本脱钩，这里必须判死，随后禁用写入与复制。
+  function baodanSessionAlive() {
+    if (!baodanSession) return false;
+    if (baodanSession.generation !== ledgerGeneration) return false;
+    for (const [id, snap] of baodanSession.snaps) {
+      const cur = data.orders.find((o) => o.id === id);
+      if (!cur || orderSnap(cur) !== snap) return false;
+    }
+    return true;
+  }
+
   function baodanApplyTracking(value) {
     const targets = baodanCompute().orders;
     if (targets.length === 0) return false;
-    if (!targets.some((o) => cleanTracking(o.tracking) !== value)) return false;
-    targets.forEach((o) => { o.tracking = value; });   // 就地改：候选单与账本里是同一批对象，快照不会脱钩
+    // v38（报告 B7）：按 id 从**当前账本**取，并与「打开面板那一刻的快照」逐单对表；任一单对不上
+    // （面板里的意图已经不是这一份账了）就整笔不写。原注释「候选单与账本里是同一批对象、快照不会
+    // 脱钩」不成立——云端换包之后候选单指向的就是被换掉的那份旧账。
+    const live = [];
+    for (const t of targets) {
+      const cur = data.orders.find((o) => o.id === t.id);
+      if (!cur) return false;
+      if (baodanSession && baodanSession.snaps.get(cur.id) !== orderSnap(cur)) return false;
+      live.push(cur);
+    }
+    if (!live.some((o) => cleanTracking(o.tracking) !== value)) return false;
+    live.forEach((o) => {
+      o.tracking = value;
+      // 刚写进去的值就是新的对表基准（否则这次写入自己会让会话立刻「失效」）
+      if (baodanSession) baodanSession.snaps.set(o.id, orderSnap(o));
+    });
     saveData();
     return true;
   }
@@ -2246,12 +2511,18 @@
     baodanTrackingTouched = true;
     const box = $("#baodanTracking");
     box.value = cleanTracking(box.value);       // 界面也收敛：超 40 字的当场截断，三处（格/文本/账本）同一个值
+    // v38（报告 B7）：账本在面板开着的时候被换过包 ⇒ 这一次写入与随后的复制都不做，也**不许**
+    // 再报「单号已改」——那是拿旧面板的意图冒充已经写进当前账本（实测：文本 USER / 账本 REMOTE /
+    // 提示「单号已改，但复制失败」）。
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
     const written = baodanApplyTracking(box.value);
     renderBaodan();                             // 文本第 2 行跟着这一格走
     // 范围里一单都没有（空范围面板）：这一格改了也没账本可写、没有文本可复制，如实说一句就走
     // （不拦的话会复制一个空串、还报「已重新复制」——那是句假话）
     if (!$("#baodanText").value.trim()) { toast("这个范围里没有可报的单"); return; }
     const ok = await writeBaodanClipboard($("#baodanText").value, $("#baodanText"));
+    // 异步复制期间账本又变过（云端换包）：反馈也不许按旧会话说话（不许宣称成功、也不许宣称已改）
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
     if (!ok) { toast("单号已改，但复制失败：长按上面的文本框手动全选"); return; }
     toast(written
       ? `单号已记到 ${baodanCompute().orders.length} 单 · 已重新复制`
@@ -2308,6 +2579,12 @@
       : filteredOrders();
     // 默认全选：常规「寄出一批 → 报单 → 去微信粘贴」。要拆两次报或剔掉赠品就在清单里取消勾选
     baodanSel = new Set(baodanCandidates.map((o) => o.id));
+    // v38（报告 B7）：报单会话绑账本代次 + 候选单快照。云端换包之后候选单与账本脱钩，继续用旧面板
+    // 的意图写回就是「文本改了、账本没改、提示还说已改」——代次变了就禁用写入与复制，提示重新生成。
+    baodanSession = {
+      generation: ledgerGeneration,
+      snaps: new Map(baodanCandidates.map((o) => [o.id, orderSnap(o)])),
+    };
     const head = baodanCandidates[0];
     if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : "";
     baodanScope.title = fromBatch
@@ -2318,7 +2595,7 @@
     baodanTrackingTouched = false;      // 新开一次面板＝这一格还没被用户动过（写账本的必要条件）
     const tkBox = $("#baodanTracking");
     if (tkBox) tkBox.value = bdTrackingPick(baodanCandidates).value;
-    const { qty, kinds, text, orders } = renderBaodan();
+    const { text } = renderBaodan();
     $("#baodanModal").classList.add("show");
     // 范围里没有单：面板会写「这个范围里没有可报的单」，但也得给一句 toast —— 点完什么都没发生很像坏了
     if (!text) {
@@ -2327,14 +2604,21 @@
       return;
     }
     const ok = await writeBaodanClipboard(text, $("#baodanText"));
+    // v38 收尾（F8）：复制是 await —— 这期间用户可能改了勾选（勾选 handler 会重绘面板、重写
+    // #baodanText，而兜底那条 execCommand 路复制的正是**盒子里当时的内容**），账本也可能整包换过。
+    // 所以件数/种数必须在 await **之后**现取一次：旧代码用的是复制之前解构出来的 qty/kinds，
+    // 慢复制 + 中途改勾选时会报一个与面板/剪贴板对不上的件数。
+    // 顺带核一次会话（只读）：账本换过包就只说「重新打开核对」，绝不宣称复制成功。
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
+    const after = renderBaodan();
     // v31：本次报的单里单号不止一种时，这一下自动复制出去的文本用的是**预填的那个号**（众数）——少数派那几单
     // 的号并不在文本里。这一下**不写账本**（见 commitBaodanTracking 的说明），但必须当场说清「单号不止一个」，
     // 否则用户点完直接切微信粘贴，收货商拿到的是别的包裹的号（v28 那类「静默报错单」的老毛病）。
-    const tkKinds = bdTrackingPick(orders).list.length;
+    const tkKinds = bdTrackingPick(after.orders).list.length;
     toast(ok
       ? (tkKinds > 1
-        ? `已复制报单 · ${qty} 件 / ${kinds} 种 · 单号有 ${tkKinds} 种，先核对面板里的提示再报`
-        : `已复制报单 · ${qty} 件 / ${kinds} 种 · 直接去微信粘贴`)
+        ? `已复制报单 · ${after.qty} 件 / ${after.kinds} 种 · 单号有 ${tkKinds} 种，先核对面板里的提示再报`
+        : `已复制报单 · ${after.qty} 件 / ${after.kinds} 种 · 直接去微信粘贴`)
       : "复制失败：长按面板里的文本框手动全选");
   }
 
@@ -2344,6 +2628,7 @@
     baodanCandidates = [];
     baodanSel = new Set();
     baodanTrackingTouched = false;
+    baodanSession = null;   // v38：报单会话随面板关闭一起作废
   }
 
   function renderBaodan() {
@@ -2387,7 +2672,10 @@
       return;
     }
     const edited = box.value !== res.text;
+    // v38（报告 B7）：会话失效时既不写也不复制，明确让用户重新生成（不许返回「没变化」冒充成功）
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
     const ok = await writeBaodanClipboard(box.value, box);
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
     if (!ok) { toast("复制失败：长按上面的文本框手动全选"); return; }
     // v31：复制这一刻**不再无条件写库**，只在「用户真的动过那一格（touched）且值仍与账本里存的不同」时兜一道底。
     // touched 是必要条件：面板一打开就自动复制过一次，那一刻那一格是预填的**众数**，少数派单与它必然不同——
@@ -2456,8 +2744,16 @@
 
   async function pullFromCloud() {
     if (!window.luhuoSync || !window.luhuoSync.isConfigured()) return;
+    // v38（报告 B1）：拉取前先取身份代次 + 拉取序号，await 回来后两者都没变才算这次结果还有效。
+    // 推送路径本来就有代次检查（见 syncToCloud），拉取这一侧原来一个都没有——于是「启动时云端
+    // 还没返回 → 用户重置成新账本 → 旧读取才返回」会把旧账原样写进新身份，并报「已从云端取回最新账本」。
+    const epoch = syncEpoch;
+    const seq = ++pullSeq;
+    const stale = () => epoch !== syncEpoch || seq !== pullSeq;
     try {
       const remote = await window.luhuoSync.loadRecord();
+      // 旧身份 / 已被更新的一次拉取取代：结果与错误一律丢弃，账本、meta、身份与当前 UI 都不许被它改动
+      if (stale()) return;
       if (!remote || !remote.data) {
         if (data.orders.length > 0) syncToCloud();
         window.luhuoSync.setStatus("online", "云端暂无数据");
@@ -2484,7 +2780,10 @@
           else declined = localOnly.length;
         }
         data = incoming;
-        profitLocks.clear();   // v36：整包换掉了账本，锁指向的成员 id 已不存在，全部作废
+        // v38：整包换掉了账本 —— 代次 +1、手改锁与状态提示首判记号（含它的详情行）一起作废
+        // （报告 B9：原来只清 profitLocks，于是首判额度被提前烧掉、真正需要时不再响；
+        //  **失败的读取不走这里**，额度不会被白复位）。
+        invalidateForNewLedger();
         meta.updatedAt = remoteAt;
         persist();
         render();
@@ -2495,9 +2794,14 @@
       } else {
         syncToCloud();
       }
+      // v38 收尾（F6）：防御性；正常路径**不可达**——这一段与上面那次 `stale()` 之间没有 await
+      //（中间只有 persist/render/toast 与一次不 await 的 syncToCloud），epoch/seq 不可能在中间变。
+      // 留着是给将来在中间插 await 的人兜底，别再把它当成一条**当前**承担了保护作用的判据。
+      if (stale()) return;
       meta.lastSyncError = "";
       renderSyncBadge();
     } catch (error) {
+      if (stale()) return;   // 旧身份的错误不许覆盖当前身份的状态（它已经不指向这本账了）
       meta.lastSyncError = error && error.message ? error.message : String(error);
       renderSyncBadge();
     }
@@ -2529,7 +2833,8 @@
         const incoming = normalizeData(parsed);
         if (!confirm(`导入 ${incoming.orders.length} 单，覆盖当前账本（${data.orders.length} 单）？\n建议先导出备份。`)) return;
         data = incoming;
-        profitLocks.clear();   // v36：导入是整本覆盖，锁指向的成员 id 已不存在，全部作废
+        // v38：导入也是整本覆盖 —— 代次 +1、手改锁与状态提示首判记号（含详情行）一起作废（报告 B9）。
+        invalidateForNewLedger();
         saveData();
         toast("导入完成");
       } catch {
@@ -2729,7 +3034,9 @@
       if (!confirm("导入同步码后，本机将与对方共用同一本账。\n首次同步以最新的一份数据为准，继续？")) return;
       try {
         syncEpoch += 1;                       // 作废旧身份在途的同步
+        invalidateForNewLedger();             // v38：换身份＝账本代次也换代（旧编辑会话/报单会话一并失效）
         syncPending = false; clearTimeout(syncTimer);
+        const epoch = syncEpoch;              // v38：这一趟配对自己的代次（下面拉取期间可能又被换过）
         const localOnly = data.orders.slice(); // 本机订单先留底，导入后按 id 并回，防覆盖丢失
         window.luhuoSync.applySyncCode(code);
         meta.updatedAt = null;
@@ -2740,6 +3047,10 @@
         // 所以这次拉取不弹「并入还是放弃」（suppressPullMerge，见它的声明）
         suppressPullMerge = true;
         try { await pullFromCloud(); } finally { suppressPullMerge = false; }
+        // v38（报告 B1）：拉取期间身份又被换代（用户又按了一次配对、或重置了身份）⇒ 这次配对的
+        // 收尾（把本机留底的旧单并回、保存、报「已配对」）已经没有意义，原样丢掉——
+        // 原来这里是无条件继续，等于把旧身份的单并进新账本。
+        if (epoch !== syncEpoch) return;
         syncEpoch += 1;
         // 合并：本机有、云端没有的订单不丢
         const ids = new Set(data.orders.map((o) => o.id));
@@ -2764,6 +3075,7 @@
       if (!confirm("重置后本机将生成全新空账本（云端旧账不受影响，但没有同步码就再也连不上）。\n确定重置？")) return;
       if (!confirm("再次确认：旧账本数据将无法从本机再访问，确定？")) return;
       syncEpoch += 1;
+      invalidateForNewLedger();   // v38：重置＝换代（代次 +1、手改锁与状态提示首判记号一并作废）
       syncPending = false; clearTimeout(syncTimer);
       window.luhuoSync.resetIdentity();
       data = { version: 1, orders: [] };
