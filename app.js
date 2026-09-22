@@ -480,12 +480,14 @@
   //   总利润 := 整批回款 − Σ各单垫付 − 整批邮费（＝ batchGroups 的录入值口径，与表头「整批：」同源）。
   // pending：整批回款**为空**（没有任何成员记过回款，income 全 null）——不显示成一笔确定亏损，
   //   按 v34 卡片「待记回款」的同一条道理显示「待回款」；明确填过 0（income===0）不算空，照常算。
-  // editable 为 false 的三种情形（总利润仍只读显示，**不开放**分项编辑）：
+  // editable 为 false 的情形（总利润仍只读显示，**不开放**分项编辑）：
   //   ① 未回款（没有可分摊的回款）；
-  //   ② 不守恒（Σ成员回款 ≠ 整批回款、或 Σ成员邮费 ≠ 整批邮费——即「⚠ 待对账」那类分叉，
+  //   ② 有人没记回款（v36 补：池子会摊到那个没回款的人头上，而它的 incomeDate 是空的 ⇒ 归期口径分裂）；
+  //   ③ 不守恒（Σ成员回款 ≠ 整批回款、或 Σ成员邮费 ≠ 整批邮费——即「⚠ 待对账」那类分叉，
   //      含 batchDrift 漏报的「整批为 0 但成员有值」；两边合不上时分摊基准不唯一）；
-  //   ③ 成员回款日期不一致（重摊会把钱在月份之间搬家）。
-  // ②③ 都是可达状态（事后单独改过某一单），任务书要求动手前报出来：这里按安全默认**不开放**，
+  //   ④ 成员回款日期不一致，或**有 income 却没有归期**（v36 补：手改利润会把回款写到没有归期的
+  //      成员头上，报表按回款日期归期时这笔钱就落错位置）。
+  // ②③④ 都是可达状态（事后单独改过某一单），任务书要求动手前报出来：这里按安全默认**不开放**，
   // 总利润照常按整批录入值显示（卡片与表头同一个数）。
   function batchProfitInfo(g, members) {
     const anyIncome = members.some(hasIncome);
@@ -495,14 +497,42 @@
     members.forEach((o) => { if (hasIncome(o)) dates.add(o.incomeDate || ""); });
     const total = g.incomeCents - g.costCents - g.feeCents;
     if (!anyIncome) return { pending: true, editable: false, reason: "no-income", total };
+    // v36：只要有人没记回款就不开放编辑（必须在守恒那条**前面**判——「3 人有回款 + 1 人没记回款」
+    // 时 Σincome 可能正好等于整批回款，守恒那条查不出来）
+    if (members.some((o) => !hasIncome(o))) {
+      return { pending: false, editable: false, reason: "partial-income", total };
+    }
     if (incSum !== g.incomeCents || feeSum !== g.feeCents) {
       return { pending: false, editable: false, reason: "drift", total };
     }
-    if (dates.size > 1) return { pending: false, editable: false, reason: "date", total };
+    // v36：把「有 income 但无归期」当成一个**独立事实**（dates 里那个 "" 就是它）。声明：
+    // **手改利润不改归期**——commitProfitEdit 只写 income 与 batchIncomeShare，一个字都不碰
+    // incomeDate，所以无归期的成员根本不该出现在编辑集合里（而不是替它编一个日期）。
+    if (dates.size > 1 || dates.has("")) return { pending: false, editable: false, reason: "date", total };
     return { pending: false, editable: true, reason: "", total };
   }
-  // 给冒烟测试的纯函数出口（A 语义要「不经过 DOM 直接喂数据断言」）；不是公共 API，别在业务代码里用
-  window.luhuoPure = { batchProfitSplit };
+
+  // 批次「不开放编辑」的原因 → 给用户看的那一句话（表头的提示行与「恢复默认分摊」的提示共用一支）。
+  // 前三条沿用 v35 的既有措辞，一个字不改；partial-income 是 v36 新增的那句。
+  function batchReasonText(reason) {
+    if (reason === "no-income") return "整批还没记回款，没有可分摊的钱";
+    if (reason === "partial-income") return "这一批还有人没记回款，先补齐回款再分摊";
+    return "这一批账目有分叉，先按「改本批邮费」对齐再分摊";   // drift / date 都走这句（v35 口径）
+  }
+
+  // 给冒烟测试的纯函数出口（A 语义要「不经过 DOM 直接喂数据断言」）；不是公共 API，别在业务代码里用。
+  // v36 补两个**只读**探针：手改锁是内存态、禁入理由是 batchProfitInfo 的返回值，两者在页面外
+  // 本来都看不见，而测试必须能断言「退批 / 整批重摊 / 整包换数据之后锁真的没了」与「新禁入的 reason」。
+  // 只暴露读取视图——没有任何写入口，业务代码一律走 profitLocks 本体与 batchProfitInfo。
+  window.luhuoPure = {
+    batchProfitSplit,
+    profitLockSnapshot: () => [...profitLocks].map(([bid, m]) => [bid, [...m]]),
+    batchProfitInfoFor: (batchId) => {
+      const g = batchGroups().get(batchId);
+      const members = data.orders.filter((o) => o.batchId === batchId);
+      return g && members.length > 0 ? batchProfitInfo(g, members) : null;
+    },
+  };
 
   // ---- 渲染 ----
   function render() {
@@ -708,6 +738,14 @@
     const resetBtn = pinfo.editable
       ? `<button type="button" class="bh-act" data-act="breset" data-batch="${escapeHtml(g.id)}">恢复默认分摊</button>`
       : "";
+    // v36：不开放编辑的两条**新**禁入（有人没记回款 / 有 income 却没归期）要给用户一句话——
+    // 「按钮没了」本身不是解释（反静默）。既有两条各自已有说法：待回款看「总利润 待回款」，
+    // 待对账看下面那条 ⚠ 告警（那句本来就写着下一步点哪里），所以这两条**不重复渲染**：
+    // 同一个批次上不再叠一句同义的话，提示行条数保持与 v35 一致。
+    const lockNote = !pinfo.pending && !pinfo.editable && pinfo.reason !== "drift"
+      && !drift.some((n) => n.warn)
+      ? `<div class="bh-note">${escapeHtml(batchReasonText(pinfo.reason))}</div>`
+      : "";
     // v32：第一行整行是折叠开关。必须是真 <button> —— div 在手机上拿不到正确的键盘/触摸语义；
     // 样式在 styles.css 里抹平成「和以前那个 div 一样」（整行宽、左对齐、无边框背景）。
     // 箭头只有 ▾ 一个字符，收起态靠 CSS 转 -90° 变成 ▸ —— 这样切态只改类、不用重渲染。
@@ -731,6 +769,7 @@
         ${resetBtn}
       </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
+      ${lockNote}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
     </div>`;
   }
@@ -1563,6 +1602,13 @@
     input.inputMode = "decimal";
     input.className = "profit-input";
     input.dataset.id = id;
+    // v36：格式白名单（可选负号 + 整数/两位小数 + 可选指数）。**必须有**——commitProfitEdit
+    // 提交前那句 `input.checkValidity()` 就是靠它兜住 "abc" 这类值；没有它，toCents("abc") 会
+    // 静默返回 0、isSafeInteger(0) 又为真，「清空/打错再点到别处」就把那一项钉成 0 元并整批重摊
+    // （v35 的缺陷）。指数那一段是刻意留的：1e307 这类要能走到「超出合理范围」那条判据，
+    // 而不是被格式判据拦下。写法注意：`[+\-]` 里的短横**必须转义**——HTML 的 pattern 走 v 模式
+    // 编译，`[+-]` 会编译失败、于是整条 pattern 被浏览器静默忽略（实测：那样 "abc" 会被放行）。
+    input.pattern = "-?(\\d+(\\.\\d{0,2})?|\\.\\d{1,2})([eE][+\\-]?\\d+)?";
     // 按整数分算当前利润再转回元显示（orderProfit 是浮点直减，喂给输入框前先落分，避免 0.1+0.2 类残差）
     input.value = ((toCents(o.income === null ? 0 : o.income) - toCents(o.cost) - toCents(o.fee)) / 100).toFixed(2);
     btn.replaceWith(input);
@@ -1575,6 +1621,8 @@
   //   已钉住项一个字节不动；Σ各项恒 = 总利润。全锁且 Σ≠总利润 → 拒绝并提示差多少。
   // 只写 income + batchIncomeShare（submitBatch 回款分支的同一对字段，元/分两份同一数值）；
   // cost / fee / batchFeeShare / incomeDate / status / 整批口径一个字不动（表头三个「整批：」不变）。
+  // v36 补强两处，都是为了「不许静默」：① 输入非法值先校验再结算（空 ≠ 0、格式/范围不对就不写库）；
+  // ② 读锁时与账本现值对表，陈旧的锁当作没锁并按现值重摊，且把失效项的名字报给用户。
   function commitProfitEdit(input) {
     const id = input.dataset.id || "";
     const o = data.orders.find((x) => x.id === id);
@@ -1585,9 +1633,37 @@
     if (!g || members.length < 2) { rerenderBatchBlock(batchId); return; }
     const info = batchProfitInfo(g, members);
     if (!info.editable) { rerenderBatchBlock(batchId); return; }
-    const newProfit = toCents(input.value);   // 界面收「元」两位小数 → 转分；负数照收（允许负利润）
-    const locks = profitLocks.get(batchId) || new Map();
-    const locked = members.map((m) => (m.id === id ? newProfit : (locks.has(m.id) ? locks.get(m.id) : null)));
+    // v36：先校验再结算（照批次弹窗那套「先 checkValidity 再分摊」的精神）。空串＝放弃编辑，
+    // **绝不是 0**；格式不对与超出合理范围一律不写库、不重摊，并说清是哪一种（v35 这里直接
+    // toCents(input.value)，把 "" 与 "abc" 都静默当成 0 写进去，1e307 则靠守恒自查撞下来、
+    // 提示还是句废话「差 ¥0.00」）。
+    const rawVal = (input.value || "").trim();
+    if (rawVal === "") { rerenderBatchBlock(batchId); return; }
+    // 去掉首尾空白后再验格式：toCents 本来就接受 " 50 "，别因为加了校验反而把它拒掉
+    input.value = rawVal;
+    if (!input.checkValidity()) { toast("金额格式不对，这一项没改"); rerenderBatchBlock(batchId); return; }
+    const newProfit = toCents(rawVal);   // 界面收「元」两位小数 → 转分；负数照收（允许负利润）
+    if (!Number.isSafeInteger(newProfit) || Math.abs(newProfit) > 50000000) {
+      toast("这个数超出合理范围，这一项没改");
+      rerenderBatchBlock(batchId);
+      return;
+    }
+    // v36：读锁时**与账本现值对表**。锁记的是「钉住那一刻那一项的利润」，别的入口（改本批邮费/
+    // 回款、退批、导入、云端拉取、单条改 cost…）重写过这一批之后就与现值不等了 ⇒ 这条锁是
+    // **陈旧**的，当作没锁交给剩余池重摊，并收集起来报给用户。v35 无条件信锁，于是两种静默：
+    // ① 那几行被悄悄改回旧锁值（唯一未锁项吃下负剩余池）；② 编辑被误拒（弹「与总利润差 ¥X」）。
+    // 判据：现值 = toCents(income) − toCents(cost) − toCents(fee)，正是本函数写回时用的那三项。
+    const raw = profitLocks.get(batchId);
+    const kept = new Map();
+    const dropped = [];
+    const locked = members.map((m) => {
+      if (m.id === id) return newProfit;
+      const v = raw ? raw.get(m.id) : undefined;
+      if (v === null || v === undefined) return null;
+      if (toCents(m.income) - toCents(m.cost) - toCents(m.fee) === v) { kept.set(m.id, v); return v; }
+      dropped.push(m);            // 陈旧锁：以账本现值为准
+      return null;
+    });
     const weights = members.map((m) => Math.max(0, toCents(m.cost)));
     const r = batchProfitSplit(info.total, weights, locked);
     if (!r.ok) {
@@ -1612,10 +1688,18 @@
       m.income = incCents / 100;
       m.batchIncomeShare = shareVal;
     });
-    // 钉住被改项（新值即新锁）；此前钉住的保持。没钉过的项即使被剩余池重摊过也不算钉住
-    const next = locks.size ? new Map(locks) : new Map();
+    // 钉住被改项（新值即新锁），并只保留**刚验过的新鲜锁**——陈旧的那些在构 locked 时就丢了；
+    // 没钉过的项即使被剩余池重摊过也不算钉住。锁表空了（没有新鲜锁 + 被改项是唯一那把）也照常建键，
+    // 键下就只留被改项这一把新锁。
+    const next = new Map(kept);
     next.set(id, newProfit);
     profitLocks.set(batchId, next);
+    if (dropped.length) {
+      // 反静默：失效必须说人话，且带上**被失效那些项的项名**（手机 360px 下也不能只报「N 项」）。
+      // 名字超过 3 个就省略号收尾——一整批十几项时 toast 会连成一条挤爆屏幕。
+      const names = dropped.map((m) => m.name || "未命名");
+      toast(`本批已重摊，${names.slice(0, 3).join("、")}${names.length > 3 ? "…" : ""} 这 ${names.length} 项的手改锁定失效（已按现值重算）`);
+    }
     if (changed) touchBatchAndRerender(batchId);
     else rerenderBatchBlock(batchId);   // 值没变（比如原样确认）：只收起输入框，不碰账本、不触发同步
   }
@@ -1628,7 +1712,7 @@
     const members = data.orders.filter((x) => x.batchId === batchId);
     if (!g || members.length < 2) return;
     const info = batchProfitInfo(g, members);
-    if (!info.editable) { toast(info.pending ? "整批还没记回款，没有可分摊的钱" : "这一批账目有分叉，先按「改本批邮费」对齐再分摊"); return; }
+    if (!info.editable) { toast(batchReasonText(info.reason)); return; }
     const weights = members.map((o) => Math.max(0, toCents(o.cost)));
     const shares = splitByWeight(g.incomeCents, weights);
     members.forEach((o, i) => {
@@ -1662,9 +1746,18 @@
     const g = batchGroups().get(o.batchId);
     const idx = mates.findIndex((x) => x.id === id);
     const outFee = idx < 0 ? 0 : batchShares(mates, "batchFeeShare", g ? g.feeCents : 0)[idx];
-    const outIncome = idx < 0 ? 0 : batchShares(mates, "batchIncomeShare", g ? g.incomeCents : 0)[idx];
+    // v36：退出者带走的**回款**按它自己账本里的 income 扣，不再走 batchIncomeShare 反推——
+    // 那个字段经 shareCents 把负值夹成 0，于是「允许负利润 + 某成员 income 为负」时它实际
+    // 带走的是负收入、而 outIncome 记 0，留批人的整批回款被**抬高**（差额＝被夹掉的负数之和），
+    // 对账告警随即亮起。outFee 不用改：batchFeeShare 非负，没有夹值问题。
+    const outIncome = idx < 0 ? 0 : toCents(mates[idx].income);
     const leavers = [o].concat(others.length === 1 ? others : []);
     const leaverIds = new Set(leavers.map((x) => x.id));
+    // v36：退批＝这一批的成员构成变了，指向这一批的手改锁（按成员 id 钉的）随之作废。
+    // **必须在下面 leavers.forEach 清空 x.batchId 之前**取一次原 batchId —— 位置写错（挪到清空
+    // 之后）就等于没清：那时 o.batchId 已经是 ""，删的是一个不存在的键，旧锁原地留着重摊下一批。
+    const oldBatchId = o.batchId;
+    profitLocks.delete(oldBatchId);
     mates.filter((x) => !leaverIds.has(x.id)).forEach((x) => {
       x.batchFee = Math.max(0, toCents(x.batchFee) - outFee) / 100;
       x.batchIncome = Math.max(0, toCents(x.batchIncome) - outIncome) / 100;
@@ -1903,6 +1996,10 @@
           o.status = "已回款";
         }
       });
+      // v36：整批回款重摊＝用户明确要「按垫付重新分一遍」，这一批的手改锁定随之作废
+      // （旧钉住是按上一次分摊的账本值记的，留着只会把刚重摊的钱按旧锁再掰回去）。
+      // 只填邮费那趟不算（fee 重摊不改 income，锁的新鲜度由 commitProfitEdit 的对表自己判）。
+      profitLocks.delete(batchId);
     }
 
     // 整批口径：填了就是这次填的总额；留空就是原值（新批次没有原值 → 0），一个字不动
@@ -2335,6 +2432,7 @@
           else declined = localOnly.length;
         }
         data = incoming;
+        profitLocks.clear();   // v36：整包换掉了账本，锁指向的成员 id 已不存在，全部作废
         meta.updatedAt = remoteAt;
         persist();
         render();
@@ -2379,6 +2477,7 @@
         const incoming = normalizeData(parsed);
         if (!confirm(`导入 ${incoming.orders.length} 单，覆盖当前账本（${data.orders.length} 单）？\n建议先导出备份。`)) return;
         data = incoming;
+        profitLocks.clear();   // v36：导入是整本覆盖，锁指向的成员 id 已不存在，全部作废
         saveData();
         toast("导入完成");
       } catch {
