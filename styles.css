@@ -228,7 +228,9 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   font-size: 11px;
   color: var(--muted);
 }
-.order-profit > b {
+/* 用后代选择器而不是 > b：v35 起可编辑时 b 包在 button.profit-edit 里（抹平的行内按钮），
+   两态（纯展示 / 可点）共用同一套字号与颜色 */
+.order-profit b {
   display: block;
   font-size: 16px;
   line-height: 1.25;
@@ -236,8 +238,24 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   color: var(--ink);
   overflow-wrap: anywhere;
 }
-.order-profit > b.pos { color: var(--accent); }
-.order-profit > b.neg { color: var(--neg); }
+.order-profit b.pos { color: var(--accent); }
+.order-profit b.neg { color: var(--neg); }
+/* v35：可点的利润数字 —— 按钮抹平成与纯文本一模一样（照 .bh-top 的手法），
+   只留 pointer 表示「点一下能改」。点击区跟着 b 的行高走，不额外撑高卡片 */
+.order-profit.editable .profit-edit {
+  display: block; width: 100%; padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; text-align: right; cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.order-profit.editable .profit-edit:active { opacity: .6; }
+/* 行内输入框：点数字后原地替换，宽度固定够放六位数金额，提交/放弃后由局部重渲染换回按钮 */
+.order-profit .profit-input {
+  display: block; width: 104px; max-width: 100%; margin-left: auto;
+  padding: 2px 6px; font-size: 15px; font-weight: 700; text-align: right;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--accent); border-radius: 7px;
+  background: var(--card); color: var(--ink); outline: none;
+}
 /* 未填回款只是待补记录，不使用盈利或亏损色。 */
 .order-income-pending {
   font-size: 11px;
@@ -281,6 +299,16 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .bh-title { font-size: 13px; font-weight: 700; color: var(--hero-ink); }
 .bh-right { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; }
+/* v35：总利润（只读锚点）—— 收起态也挂在第一行右侧，「折叠不许藏信息」。
+   正/负/待回款三态各自着色；nowrap + flex:0 0 auto 与 .bh-count 同待遇（不被标题挤扁） */
+.bh-profit {
+  flex: 0 0 auto; white-space: nowrap;
+  font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
+  color: var(--hero-value);
+}
+.bh-profit.pos { color: var(--accent); }
+.bh-profit.neg { color: var(--neg); }
+.bh-profit.pending { color: var(--muted); font-weight: 600; }
 .bh-count { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: var(--hero-value); font-variant-numeric: tabular-nums; }
 /* 箭头只有 ▾ 一个字符：收起态靠 CSS 转 -90° 变成 ▸。切态只改类，不再重渲染 DOM */
 .bh-caret { flex: 0 0 auto; font-size: 11px; line-height: 1; color: var(--hero-value); transition: transform .15s; }

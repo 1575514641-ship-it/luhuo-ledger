@@ -86,6 +86,11 @@
   // 它是展开态的唯一真相（重渲染也照它还原），但**刻意只活在内存里**：不落库、不进同步包、
   // 不写 localStorage，刷新页面回到默认收起（用户确认过的默认态）。
   const expandedBatches = new Set();
+  // v35：分项利润编辑的「钉住」状态 —— batchId → Map(orderId → 该单被手改过的利润, 分)。
+  // 与 expandedBatches 同一待遇：**只活在页面内存里**（不落库、不进同步包，刷新即清）——
+  // 锁定的值本身不需要持久化，它已经写进各单的 income；刷新后重置锁＝回到「全员未锁定」，
+  // 下一次编辑按 A 语义从当前分摊重新钉住（不新增任何账本字段）。
+  const profitLocks = new Map();
 
   // 报表
   let reportMode = "month";
@@ -415,6 +420,90 @@
     return splitByWeight(totalCents, members.map((o) => Math.max(0, toCents(o.cost))));
   }
 
+  // ---- v35：批次「总利润 + 分项可编辑」----
+  // 用户选定的手感是 **A**：改过的那项**钉住数值**，剩余池按默认规则分给**还没改过**的项；
+  // 只剩一项未锁定时那一项就是余数；「恢复默认分摊」解开全部钉住。
+  // **不是** B（每次把其余项含改过的全重摊——那样再改 B 时 A 会从 100 变回 37.5，与用户要的语义相反）。
+  // 默认规则＝照 splitByWeight 那一套（别自己发明）：按垫付占比 floor(pool×w_i/Σw)，
+  // 余数**逐分**补给权重最大的那几项（排序键 w[b]-w[a] || a-b，并列时**数组下标小的优先**）——
+  // 不是把整笔尾差全给一个人；Σw=0 时退化成「floor 按项均分、多的几分给前几项」。
+  // 这一支是**纯函数**：给定总利润 + 各项锁定值 → 返回各项最终分配，不碰 DOM、不碰账本，
+  // 冒烟测试直接从 window.luhuoPure 喂数据断言（100/56/84 → 100/90/50 那组例子 + 第三方 48 组向量）。
+  // 与 splitByWeight 的差别只有一处：那一支总额 ≤0 **早退返回全 0**（「填 0 删掉回款」那条路用的），
+  // 拿它摊负剩余池会静默摊成全 0、Σ≠总利润、每批亮「待对账」——所以这里自实现一条
+  // **正负池同规则**的分配（floor 向下取整，余数恒 ≥0 且 < 项数，逐分补给最重的几项，
+  // 正负池都自动守恒）。恢复默认那条路（resetBatchShares）摊的是整批回款（≥0），照旧复用 splitByWeight。
+  // 全部锁定且 Σ≠总利润 → { ok:false, diff }（拒绝并说清差多少），绝不静默凑数。
+  // 数组顺序：调用方一律传 data.orders.filter(batchId) 的同序数组——并列按下标时顺序决定谁拿那 1 分，
+  // 各入口必须同源（表头/卡片/编辑/恢复/测试都是这一个 filter）。
+  function batchProfitSplit(totalCents, weights, locked) {
+    const n = weights.length;
+    const shares = new Array(n).fill(0);
+    const free = [];
+    let lockedSum = 0;
+    for (let i = 0; i < n; i++) {
+      const v = locked[i];
+      if (v === null || v === undefined) free.push(i);
+      else { shares[i] = v; lockedSum += v; }
+    }
+    if (free.length === 0) {
+      return lockedSum === totalCents
+        ? { ok: true, shares }
+        : { ok: false, diff: totalCents - lockedSum };
+    }
+    const remaining = totalCents - lockedSum;
+    const w = free.map((i) => Math.max(0, Math.round(weights[i] || 0)));
+    const sumW = w.reduce((a, b) => a + b, 0);
+    const parts = new Array(free.length).fill(0);
+    if (sumW <= 0) {
+      // 全 0 垫付：按项数均分（与 splitByWeight 的 Σw=0 分支同规则），余数给靠前的项
+      const base = Math.floor(remaining / free.length);
+      const rem = remaining - base * free.length;
+      for (let k = 0; k < free.length; k++) parts[k] = base + (k < rem ? 1 : 0);
+    } else {
+      let used = 0;
+      for (let k = 0; k < free.length; k++) {
+        parts[k] = Math.floor((remaining * w[k]) / sumW);
+        used += parts[k];
+      }
+      // floor 使 used ≤ remaining，余数（必 < 项数）**逐分**补给权重最大的那几项、
+      // 并列时下标小的优先（r 每加 1 换下一项 —— 与 splitByWeight 的 byWeight[r] 同款，不是整笔给一个人）
+      let rem = remaining - used;
+      const byWeight = w.map((_, k) => k).sort((a, b) => w[b] - w[a] || a - b);
+      for (let r = 0; r < rem && r < free.length; r++) parts[byWeight[r]] += 1;
+    }
+    free.forEach((i, k) => { shares[i] = parts[k]; });
+    return { ok: true, shares };
+  }
+
+  // 这一批的「总利润」唯一口径（表头、卡片、编辑基准共用这一支）：
+  //   总利润 := 整批回款 − Σ各单垫付 − 整批邮费（＝ batchGroups 的录入值口径，与表头「整批：」同源）。
+  // pending：整批回款**为空**（没有任何成员记过回款，income 全 null）——不显示成一笔确定亏损，
+  //   按 v34 卡片「待记回款」的同一条道理显示「待回款」；明确填过 0（income===0）不算空，照常算。
+  // editable 为 false 的三种情形（总利润仍只读显示，**不开放**分项编辑）：
+  //   ① 未回款（没有可分摊的回款）；
+  //   ② 不守恒（Σ成员回款 ≠ 整批回款、或 Σ成员邮费 ≠ 整批邮费——即「⚠ 待对账」那类分叉，
+  //      含 batchDrift 漏报的「整批为 0 但成员有值」；两边合不上时分摊基准不唯一）；
+  //   ③ 成员回款日期不一致（重摊会把钱在月份之间搬家）。
+  // ②③ 都是可达状态（事后单独改过某一单），任务书要求动手前报出来：这里按安全默认**不开放**，
+  // 总利润照常按整批录入值显示（卡片与表头同一个数）。
+  function batchProfitInfo(g, members) {
+    const anyIncome = members.some(hasIncome);
+    const incSum = members.reduce((a, o) => a + (hasIncome(o) ? toCents(o.income) : 0), 0);
+    const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
+    const dates = new Set();
+    members.forEach((o) => { if (hasIncome(o)) dates.add(o.incomeDate || ""); });
+    const total = g.incomeCents - g.costCents - g.feeCents;
+    if (!anyIncome) return { pending: true, editable: false, reason: "no-income", total };
+    if (incSum !== g.incomeCents || feeSum !== g.feeCents) {
+      return { pending: false, editable: false, reason: "drift", total };
+    }
+    if (dates.size > 1) return { pending: false, editable: false, reason: "date", total };
+    return { pending: false, editable: true, reason: "", total };
+  }
+  // 给冒烟测试的纯函数出口（A 语义要「不经过 DOM 直接喂数据断言」）；不是公共 API，别在业务代码里用
+  window.luhuoPure = { batchProfitSplit };
+
   // ---- 渲染 ----
   function render() {
     renderDash();
@@ -606,6 +695,19 @@
     // 同一套做法：本页可见成员 < 本批成员时，在摘要行尾部补一个短标记（收起态才显示，展开态照旧是完整那句）。
     // 与告警标记刻意分开：这个走弱色（只是「本页没显示全」的事实），告警那个走 --neg 红粗（真要动手对账）。
     const filterFlag = shownCount < g.count ? `<span class="bh-filterflag">· 本页 ${shownCount} 单</span>` : "";
+    // v35：总利润（只读锚点）挂在第一行右侧 —— **收起态也要看得见**（「折叠不许藏信息」是 v32 的红线）。
+    // 口径与表头「整批：」同源（batchProfitInfo 的 total＝整批录入值），待回款时显示「待回款」
+    // 而不是 −Σ垫付−邮费 那笔确定亏损；负数照实上红色（允许负利润，不拦不警告）。
+    const pinfo = members.length > 0 ? batchProfitInfo(g, members) : { pending: true, editable: false, total: 0 };
+    const profitHtml = pinfo.pending
+      ? `<span class="bh-profit pending">总利润 待回款</span>`
+      : `<span class="bh-profit ${pinfo.total > 0 ? "pos" : pinfo.total < 0 ? "neg" : ""}">总利润 ${money(pinfo.total / 100)}</span>`;
+    // 「恢复默认分摊」＝按垫付占比把整批回款重摊一次（与「改本批回款」那条路径等价：纯赋值、幂等、
+    // 尾差规则一致），同时解开这一批的全部钉住。只在可编辑的批次上渲染（收起态与「改本批邮费」
+    // 同属 .bh-act，本来就只在展开态可见）。
+    const resetBtn = pinfo.editable
+      ? `<button type="button" class="bh-act" data-act="breset" data-batch="${escapeHtml(g.id)}">恢复默认分摊</button>`
+      : "";
     // v32：第一行整行是折叠开关。必须是真 <button> —— div 在手机上拿不到正确的键盘/触摸语义；
     // 样式在 styles.css 里抹平成「和以前那个 div 一样」（整行宽、左对齐、无边框背景）。
     // 箭头只有 ▾ 一个字符，收起态靠 CSS 转 -90° 变成 ▸ —— 这样切态只改类、不用重渲染。
@@ -615,6 +717,7 @@
       <button type="button" class="bh-top" data-act="btoggle" data-batch="${escapeHtml(g.id)}" title="点一下展开/收起这一批的单子" aria-expanded="${expanded ? "true" : "false"}">
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
         <span class="bh-right">
+          ${profitHtml}
           <span class="bh-count">${g.count} 单</span>
           <span class="bh-caret" aria-hidden="true">▾</span>
         </span>
@@ -625,6 +728,7 @@
         ${warnFlag}
         <button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批邮费</button>
         <button type="button" class="bh-act" data-act="baodan" data-batch="${escapeHtml(g.id)}">报单</button>
+        ${resetBtn}
       </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
       ${drift.map((n) => `<div class="bh-note${n.warn ? " warn" : ""}">${n.text}</div>`).join("")}
@@ -668,6 +772,18 @@
     // 只改显示；旧自留、统计公式和账本字段保持原样。
     const pendingIncome = o.status === "已回款" && !hasIncome(o);
     const showProfit = !pendingIncome && (o.income !== null || settled);
+    // v35：这一单的利润可不可以行内编辑（点数字变输入框）。前提：多成员批次 + 该批当前可编辑
+    // （batchProfitInfo 的三条禁入都过了）。单成员批次没有表头也没有「分项」，散单不涉及，
+    // 一律保持原样（利润只是展示）。mates 按**数据全量**取——被筛选只显示部分成员时，
+    // 分摊仍按整批算（页面显示几个不影响钱）。
+    let profitEditable = false;
+    if (showProfit && o.batchId && !soloBatch) {
+      const mates = data.orders.filter((x) => x.batchId === o.batchId);
+      if (mates.length > 1) {
+        const pg = batchGroups().get(o.batchId);
+        if (pg && batchProfitInfo(pg, mates).editable) profitEditable = true;
+      }
+    }
     const actions = [];
     // v26：已回款的单也要能改回款金额——那个按钮以前只在未结算时渲染，一旦「已回款」，
     // 回款金额与回款日期就**没有任何入口**可改，只能删了重记；v25 的收入单天生就是已回款，
@@ -703,9 +819,11 @@
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
         <div class="order-side">
           ${pendingIncome ? `<span class="order-income-pending">待记回款</span>` : ""}
-          ${showProfit ? `<div class="order-profit">
+          ${showProfit ? `<div class="order-profit${profitEditable ? " editable" : ""}">
             <span>利润</span>
-            <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>
+            ${profitEditable
+              ? `<button type="button" class="profit-edit" data-act="pedit" data-id="${escapeHtml(o.id)}" title="点一下改这一项的利润（整批总利润不变）"><b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></button>`
+              : `<b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>`}
           </div>` : ""}
           <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
         </div>
@@ -1408,6 +1526,118 @@
     data.orders = data.orders.filter((x) => x.id !== id);
     saveData();
     toast("已删除");
+  }
+
+  // ---- v35：分项利润编辑的三个写/渲染动作 ----
+  // 只重渲染这一个批次块（照 v32 折叠的手法）：整列表 renderList() 会把滚动位置和
+  // 用户手上的状态打飞；.batch-block 本身的类（展开/收起）不碰，所以切态结果保留。
+  // 批次已经不存在（极端：刚被删单解散）时才兜底整表重绘。
+  function rerenderBatchBlock(batchId) {
+    const blocks = $$("#orderList .batch-block");
+    const blk = blocks.find((x) => x.dataset.batch === batchId);
+    const g = batchGroups().get(batchId);
+    if (!blk || !g) { renderList(); return; }
+    const orders = filteredOrders();
+    const members = orders.filter((o) => o.batchId === batchId);
+    blk.innerHTML = batchHeadHtml(g, orders) + members.map((o) => orderCardHtml(o, "in-batch", false)).join("");
+  }
+
+  // 写库 + 触发既有 450ms 防抖同步 + 局部重渲染（**不走 saveData**：那会 render() 整页）。
+  // meta.updatedAt / meta.filter 与 saveData 保持同一套写法（同步包靠 updatedAt 判新旧）。
+  function touchBatchAndRerender(batchId) {
+    meta.updatedAt = new Date().toISOString();
+    meta.filter = currentFilter;
+    persist();
+    scheduleSync();
+    rerenderBatchBlock(batchId);
+  }
+
+  // 点一下利润数字 → 原地换成行内输入框（预填当前利润，元、两位小数），聚焦全选方便直接打新值。
+  // 不弹窗、不加确认（用户偏好「点点就完事」）；提交走 change，放弃走 Escape。
+  function startProfitEdit(btn) {
+    const id = btn.dataset.id || "";
+    const o = data.orders.find((x) => x.id === id);
+    if (!o) return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "decimal";
+    input.className = "profit-input";
+    input.dataset.id = id;
+    // 按整数分算当前利润再转回元显示（orderProfit 是浮点直减，喂给输入框前先落分，避免 0.1+0.2 类残差）
+    input.value = ((toCents(o.income === null ? 0 : o.income) - toCents(o.cost) - toCents(o.fee)) / 100).toFixed(2);
+    btn.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  // 提交一项利润编辑（行内输入框 change/Enter 时进来）。语义是 A：
+  //   被改项按新值**钉住**（进 profitLocks），剩余池按垫付占比分给还没钉住的项；
+  //   已钉住项一个字节不动；Σ各项恒 = 总利润。全锁且 Σ≠总利润 → 拒绝并提示差多少。
+  // 只写 income + batchIncomeShare（submitBatch 回款分支的同一对字段，元/分两份同一数值）；
+  // cost / fee / batchFeeShare / incomeDate / status / 整批口径一个字不动（表头三个「整批：」不变）。
+  function commitProfitEdit(input) {
+    const id = input.dataset.id || "";
+    const o = data.orders.find((x) => x.id === id);
+    if (!o || !o.batchId) return;   // 散单/找不到：没有批次块要动，直接收工
+    const batchId = o.batchId;
+    const g = batchGroups().get(batchId);
+    const members = data.orders.filter((x) => x.batchId === batchId);
+    if (!g || members.length < 2) { rerenderBatchBlock(batchId); return; }
+    const info = batchProfitInfo(g, members);
+    if (!info.editable) { rerenderBatchBlock(batchId); return; }
+    const newProfit = toCents(input.value);   // 界面收「元」两位小数 → 转分；负数照收（允许负利润）
+    const locks = profitLocks.get(batchId) || new Map();
+    const locked = members.map((m) => (m.id === id ? newProfit : (locks.has(m.id) ? locks.get(m.id) : null)));
+    const weights = members.map((m) => Math.max(0, toCents(m.cost)));
+    const r = batchProfitSplit(info.total, weights, locked);
+    if (!r.ok) {
+      toast(`与总利润差 ${money(Math.abs(r.diff) / 100)}，这项改不动`);
+      rerenderBatchBlock(batchId);
+      return;
+    }
+    // 守恒自查（内部不变量，不该红）：Σ新利润必须等于总利润，否则拒绝写库
+    const sum = r.shares.reduce((a, b) => a + b, 0);
+    if (sum !== info.total) {
+      toast(`分摊异常（差 ${money(Math.abs(info.total - sum) / 100)}），未写入`);
+      rerenderBatchBlock(batchId);
+      return;
+    }
+    let changed = false;
+    members.forEach((m, i) => {
+      const incCents = r.shares[i] + toCents(m.cost) + toCents(m.fee);  // 利润 = 回款 − 垫付 − 邮费 反推回款
+      // 份额字段与 normalizeData 的白名单同一收敛（负值归 0 + 取整）：写进去的就等于刷新后留下的，
+      // 不制造「存 −400、刷新变 0」的字节漂移；income 本身白名单不收敛（负回款各处口径一致），照写。
+      const shareVal = shareCents(incCents);
+      if (toCents(m.income) !== incCents || shareCents(m.batchIncomeShare) !== shareVal) changed = true;
+      m.income = incCents / 100;
+      m.batchIncomeShare = shareVal;
+    });
+    // 钉住被改项（新值即新锁）；此前钉住的保持。没钉过的项即使被剩余池重摊过也不算钉住
+    const next = locks.size ? new Map(locks) : new Map();
+    next.set(id, newProfit);
+    profitLocks.set(batchId, next);
+    if (changed) touchBatchAndRerender(batchId);
+    else rerenderBatchBlock(batchId);   // 值没变（比如原样确认）：只收起输入框，不碰账本、不触发同步
+  }
+
+  // 「恢复默认分摊」＝按垫付占比把整批回款重摊一次 —— 与 submitBatch 的回款分支**等价**
+  // （纯赋值、幂等、尾差规则一致；任务书实现提示：复用这条既有路径，这个按钮几乎是免费的）。
+  // 刻意不写 incomeDate / status（那是结算那一刻的语义，重摊不动日期与状态）；同时解开全部钉住。
+  function resetBatchShares(batchId) {
+    const g = batchGroups().get(batchId);
+    const members = data.orders.filter((x) => x.batchId === batchId);
+    if (!g || members.length < 2) return;
+    const info = batchProfitInfo(g, members);
+    if (!info.editable) { toast(info.pending ? "整批还没记回款，没有可分摊的钱" : "这一批账目有分叉，先按「改本批邮费」对齐再分摊"); return; }
+    const weights = members.map((o) => Math.max(0, toCents(o.cost)));
+    const shares = splitByWeight(g.incomeCents, weights);
+    members.forEach((o, i) => {
+      o.income = shares[i] / 100;
+      o.batchIncomeShare = shares[i];
+    });
+    profitLocks.delete(batchId);
+    touchBatchAndRerender(batchId);
+    toast("已恢复按垫付占比的默认分摊");
   }
 
   // 退出本批：结错批时的救回口子。解开这一单的批次归属，**不动它自己的钱**——
@@ -2223,7 +2453,24 @@
       else if (act === "batchfee") openBatchModal(btn.dataset.batch || "");
       // v28：批次表头上的「报单」——范围就是这一批的全部成员（不看在不在途：报单发生在寄出后）
       else if (act === "baodan") openBaodan({ type: "batch", batchId: btn.dataset.batch || "" });
+      // v35：分项利润行内编辑 + 恢复默认分摊（都只动这一批的回款分摊，整批总额不变）
+      else if (act === "pedit") startProfitEdit(btn);
+      else if (act === "breset") resetBatchShares(btn.dataset.batch || "");
       else if (act === "del") deleteOrder(id);
+    });
+
+    // v35：行内利润输入框 —— change（blur/回车）＝提交；Enter 只负责触发 change（blur）；
+    // Escape＝放弃本次输入、还原显示（不写库）。输入框由 startProfitEdit 动态插进利润块，
+    // 提交/放弃都由 rerenderBatchBlock 把它换回按钮，这里不需要自己收拾 DOM。
+    $("#orderList").addEventListener("change", (ev) => {
+      const inp = ev.target.closest("input.profit-input");
+      if (inp) commitProfitEdit(inp);
+    });
+    $("#orderList").addEventListener("keydown", (ev) => {
+      const inp = ev.target.closest("input.profit-input");
+      if (!inp) return;
+      if (ev.key === "Enter") { ev.preventDefault(); inp.blur(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); rerenderBatchBlock((data.orders.find((x) => x.id === inp.dataset.id) || {}).batchId || ""); }
     });
 
     $("#orderForm").addEventListener("submit", submitForm);
