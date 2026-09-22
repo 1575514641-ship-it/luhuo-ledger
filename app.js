@@ -120,7 +120,11 @@
 
   function pad2(n) { return String(n).padStart(2, "0"); }
 
-  function monthStr(dateStr) { return String(dateStr || "").slice(0, 7); }
+  function monthStr(dateStr) {
+    // 看板与报表共用真实日期校验；非法日期不归月，原始数据不改写。
+    const d = parseDate(dateStr);
+    return d ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}` : "";
+  }
   function currentMonth() { return todayStr().slice(0, 7); }
 
   function parseDate(dateStr) {
@@ -445,7 +449,7 @@
     // 本月邮费：归期同报表页（整批按批次日期、单寄按下单日期），挂在「本月垫出」下面当补充口径
     const cmParts = currentMonth().split("-").map(Number);
     const monthFee = reportFeeStats(new Date(cmParts[0], cmParts[1] - 1, 1), new Date(cmParts[0], cmParts[1], 1));
-    $("#kpiMonthFee").textContent = `另有邮费 ${money(monthFee.totalCents / 100)}`;
+    $("#kpiMonthFee").textContent = `本月邮费 ${money(monthFee.totalCents / 100)}`;
     $("#kpiMonthIncome").textContent = money(s.monthIncome);
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
 
@@ -484,7 +488,8 @@
   // ---- 账本 ----
   function filteredOrders() {
     const orders = data.orders.slice();
-    orders.sort((a, b) => (a.date < b.date ? 1 : -1));
+    // 日期倒序；同日返回 0，保留账本数组里的先后，不制造互相矛盾的比较结果。
+    orders.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
     if (currentFilter === "全部") return orders;
     return orders.filter((o) => o.status === currentFilter);
   }
@@ -659,7 +664,10 @@
   function orderCardHtml(o, extraClass, soloBatch) {
     const settled = isSettled(o);
     const profit = orderProfit(o);
-    const showProfit = o.income !== null || settled;
+    // 已回款但金额未填，不在卡片上把未知回款显示成确定亏损。
+    // 只改显示；旧自留、统计公式和账本字段保持原样。
+    const pendingIncome = o.status === "已回款" && !hasIncome(o);
+    const showProfit = !pendingIncome && (o.income !== null || settled);
     const actions = [];
     // v26：已回款的单也要能改回款金额——那个按钮以前只在未结算时渲染，一旦「已回款」，
     // 回款金额与回款日期就**没有任何入口**可改，只能删了重记；v25 的收入单天生就是已回款，
@@ -688,11 +696,13 @@
     // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
     // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
     // v33：利润从金额格里挪到卡片右上的 .order-side（状态下面），金额格只留垫付/回款/邮费三格。
-    // 判据（showProfit / profit 的计算）一个字没动，只搬展示位置。
+    // 那一次判据（showProfit / profit 的计算）一个字没动，只搬展示位置；
+    // 判据本身后来为「待记回款」改过一次，见本函数上方的 pendingIncome。
     return `<div class="order-card ${extraClass || ""}">
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
         <div class="order-side">
+          ${pendingIncome ? `<span class="order-income-pending">待记回款</span>` : ""}
           ${showProfit ? `<div class="order-profit">
             <span>利润</span>
             <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>
@@ -952,7 +962,10 @@
       lines.push(`<b>${escapeHtml(range.label)}</b> 没有记录。`);
     } else {
       // v33：净亏时金额取绝对值——「净亏 ¥-120」是双负号读法，负号由文字承担。
-      lines.push(`<b>${escapeHtml(range.label)}</b> 下单 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，邮费 <b>${money(feeStats.totalCents / 100)}</b>，收回 <b>${money(s.income)}</b>，净${s.profit >= 0 ? "赚" : "亏"} <b class="${s.profit >= 0 ? "pos" : "neg"}">${money(Math.abs(s.profit))}</b>。`);
+      // 零值不称为“赚”；这里仍展示原有利润，不另扣本期邮费。
+      const profitWord = s.profit > 0 ? "净赚" : s.profit < 0 ? "净亏" : "盈亏";
+      const profitClass = s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : "";
+      lines.push(`<b>${escapeHtml(range.label)}</b> 下单 ${s.n} 单：垫出 <b>${money(s.cost)}</b>，邮费 <b>${money(feeStats.totalCents / 100)}</b>，回款 <b>${money(s.income)}</b>，${profitWord} <b class="${profitClass}">${money(Math.abs(s.profit))}</b>。`);
       const st = computeStats();
       if (st.outCount > 0) lines.push(`现在还有 ${st.outCount} 单 / ${money(st.outstanding)} 在途，回款了记得来销账。`);
       if (prev.n > 0 || prev.income > 0) {
@@ -1132,8 +1145,14 @@
     // 重建的是**那个唯一的渠道控件**本身（全表单只有一个 name="channel"）：收入模式下 applyKindUi
     // 把它整格搬到主区，选项跟着控件走，所以货单态与收入态都生效。
     const channelOpts = CHANNELS.slice();
-    if (src && src.channel && !channelOpts.includes(src.channel)) channelOpts.push(src.channel);
-    fillSelect(f.channel, channelOpts.map((c) => [c, c]), src ? (src.channel || "收货商") : "收货商");
+    const currentChannel = src ? String(src.channel || "") : "收货商";
+    // 空值也是原值：编辑和再来一单都不替用户补成“收货商”。
+    if (src && !channelOpts.includes(currentChannel)) channelOpts.push(currentChannel);
+    fillSelect(
+      f.channel,
+      channelOpts.map((c) => [c, c === "" ? "未填写" : c]),
+      currentChannel
+    );
     f.fee.value = src ? numberValue(src.fee) : "";      // 同上：0 写成 0（邮费可不填，留空仍按 0 算）
     // 状态下拉：现役两态；编辑遗留「自留」单时把该单自己的旧状态补进去（只读项），
     // 否则下拉会因没有匹配项而回空、保存时把状态静默改写掉——v21 的红线就是不许改写旧状态
@@ -1572,6 +1591,21 @@
     const sel = selectedBatchInfo();
     const orders = sel.orders;
     if (orders.length === 0) { toast("先勾选要结算的在途单"); return; }
+
+    // 结算按钮不在 form 中，min/step 不会自动拦住提交。
+    // 先校验再分摊，避免把负数等非法输入静默当成 0 写回整批。
+    for (const [selector, label] of [
+      ["#batchFee", "本批邮费"],
+      ["#batchIncome", "对方总回款"],
+      ["#batchDate", "回款日期"],
+    ]) {
+      const input = $(selector);
+      if (!input.checkValidity()) {
+        input.reportValidity();
+        toast(`${label}填写有误，请检查后再结算`);
+        return;
+      }
+    }
     // 留空＝这一项一个字不动（保住「先只摊邮费、回款到了再补一趟」的两趟打法）；
     // 填数字＝把这一项**改成这个数**（不是加上去）；填 0＝删掉这一项。
     const feeGiven = String($("#batchFee").value || "").trim() !== "";
@@ -1779,9 +1813,8 @@
       const key = skuKey(o.name) || ("\u0000" + o.id);   // 名称全空白的单各算一组，不互相并
       let g = map.get(key);
       if (!g) { g = { name: "", nameKey: null, qty: 0, count: 0, raw: new Set() }; map.set(key, g); }
-      // 组内「代表写法」= **最早那条单的原始 name**。不能取「数组里第一单」：候选顺序被
-      // filteredOrders 的日期排序打乱过（同一天的多单顺序不稳定），那样同一份报单每次会显示成
-      // 不同的写法。createdAt 相同（同一毫秒 / 导入的老数据）时用 id 兜底 —— 老数据没有 createdAt，
+      // 组内「代表写法」= **最早那条单的原始 name**。不能取「数组里第一单」：候选顺序取决于
+      // 排序、筛选与入口（批次表头 / 工具条），同一份报单可能因此显示成不同的写法。createdAt 相同（同一毫秒 / 导入的老数据）时用 id 兜底 —— 老数据没有 createdAt，
       // 补 "~"（比十六进制字符都大）让它排在最后，仍然唯一确定。归一化串永不显示。
       const k = candKey(o);
       if (g.nameKey === null || k < g.nameKey) { g.name = bdName(o.name); g.nameKey = k; }
@@ -1839,7 +1872,7 @@
     // 范围里一单都没有（空范围面板）：这一格改了也没账本可写、没有文本可复制，如实说一句就走
     // （不拦的话会复制一个空串、还报「已重新复制」——那是句假话）
     if (!$("#baodanText").value.trim()) { toast("这个范围里没有可报的单"); return; }
-    const ok = await writeClipboard($("#baodanText").value, $("#baodanText"));
+    const ok = await writeBaodanClipboard($("#baodanText").value, $("#baodanText"));
     if (!ok) { toast("单号已改，但复制失败：长按上面的文本框手动全选"); return; }
     toast(written
       ? `单号已记到 ${baodanCompute().orders.length} 单 · 已重新复制`
@@ -1872,6 +1905,17 @@
     }
   }
 
+  // 正常复制成功时保留原说明；失败提示留在面板里，不随 toast 消失。
+  async function writeBaodanClipboard(text, box) {
+    const hint = $("#baodanModal .batch-sub");
+    hint.textContent = "正在复制报单，请稍候。";
+    const ok = await writeClipboard(text, box);
+    hint.textContent = ok
+      ? "点「报单」时已经复制好了，直接去微信粘贴；要改动就先改下面的内容再点一次复制"
+      : "复制失败：请长按下面的文本框手动全选复制，核对后再去微信粘贴。";
+    return ok;
+  }
+
   // scope：{ type:"batch", batchId } 从批次表头进（报这一次寄出的货）；
   //        省略 / { type:"filter" } 从账本工具条进（报账本当前筛选下看得见的单）
   // v28 关键交互：**点一下就进剪贴板**——用户的原话是「点一下报单，它就自动整理好并粘贴到我的
@@ -1898,8 +1942,12 @@
     const { qty, kinds, text, orders } = renderBaodan();
     $("#baodanModal").classList.add("show");
     // 范围里没有单：面板会写「这个范围里没有可报的单」，但也得给一句 toast —— 点完什么都没发生很像坏了
-    if (!text) { toast("这个范围里没有可报的单"); return; }
-    const ok = await writeClipboard(text, $("#baodanText"));
+    if (!text) {
+      $("#baodanModal .batch-sub").textContent = "这个范围里没有可报的单，未复制任何内容。";
+      toast("这个范围里没有可报的单");
+      return;
+    }
+    const ok = await writeBaodanClipboard(text, $("#baodanText"));
     // v31：本次报的单里单号不止一种时，这一下自动复制出去的文本用的是**预填的那个号**（众数）——少数派那几单
     // 的号并不在文本里。这一下**不写账本**（见 commitBaodanTracking 的说明），但必须当场说清「单号不止一个」，
     // 否则用户点完直接切微信粘贴，收货商拿到的是别的包裹的号（v28 那类「静默报错单」的老毛病）。
@@ -1960,7 +2008,7 @@
       return;
     }
     const edited = box.value !== res.text;
-    const ok = await writeClipboard(box.value, box);
+    const ok = await writeBaodanClipboard(box.value, box);
     if (!ok) { toast("复制失败：长按上面的文本框手动全选"); return; }
     // v31：复制这一刻**不再无条件写库**，只在「用户真的动过那一格（touched）且值仍与账本里存的不同」时兜一道底。
     // touched 是必要条件：面板一打开就自动复制过一次，那一刻那一格是预填的**众数**，少数派单与它必然不同——
@@ -2274,9 +2322,8 @@
     // 设置
     $("#copySyncCode").addEventListener("click", async () => {
       const box = $("#syncCodeText");
-      box.select();
-      try { await navigator.clipboard.writeText(box.value); toast("同步码已复制"); }
-      catch { try { document.execCommand("copy"); toast("同步码已复制"); } catch { toast("请手动全选复制"); } }
+      const ok = await writeClipboard(box.value, box);
+      toast(ok ? "同步码已复制" : "复制失败，请手动全选复制");
     });
     $("#applySyncBtn").addEventListener("click", async () => {
       const code = $("#applySyncInput").value.trim();
