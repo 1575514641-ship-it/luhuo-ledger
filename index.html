@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=38">
+  <link rel="stylesheet" href="./styles.css?v=39">
 </head>
 <body>
   <header class="topbar">
@@ -27,6 +27,14 @@
   </header>
 
   <main>
+    <div id="ledgerNotice" class="ledger-notice card" role="status" hidden>
+      <p id="ledgerNoticeText"></p>
+      <div class="notice-actions">
+        <button id="reloadLedgerBtn" type="button" class="btn ghost">重新载入</button>
+        <button id="retrySyncBtn" type="button" class="btn ghost">重试同步</button>
+        <button id="noticeExportBtn" type="button" class="btn ghost">导出当前账本</button>
+      </div>
+    </div>
     <!-- 看板 -->
     <section id="view-dash" class="view">
       <div class="hero card">
@@ -205,6 +213,7 @@
         <button type="button" data-add="50">+50</button>
         <button type="button" data-add="100">+100</button>
       </div>
+      <p id="payNegativeHint" class="foot-note" hidden>本单回款为负数，本次可修正日期；金额保留原值，需要调整时请回到批次的分项利润。</p>
       <label class="fld">回款日期<input name="incomeDate" type="date" required></label>
       <p class="profit-preview" id="payPreview"></p>
       <div class="sheet-actions">
@@ -292,6 +301,8 @@
           <button type="button" id="exportBtn" class="btn">导出 JSON 备份</button>
           <label class="btn btn-label">导入 JSON<input type="file" id="importFile" accept="application/json" hidden></label>
         </div>
+        <button type="button" id="exportRecoveryBtn" class="btn" hidden>导出冲突 / 原始数据核对副本</button>
+        <button type="button" id="restoreSnapshotBtn" class="btn" hidden>采用最近完整快照</button>
       </div>
       <div class="set-block">
         <h3>危险操作</h3>
@@ -303,9 +314,9 @@
     </div>
   </div>
 
-  <div id="toast" class="toast"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=38"></script>
-  <script src="./app.js?v=38"></script>
+  <script src="./sync.js?v=39"></script>
+  <script src="./app.js?v=39"></script>
 </body>
 </html>

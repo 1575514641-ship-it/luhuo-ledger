@@ -42,6 +42,10 @@
   // ---- 常量 ----
   const DATA_KEY = "luhuo-ledger-data-v1";
   const META_KEY = "luhuo-ledger-meta-v1";
+  const SNAPSHOT_KEY = "luhuo-ledger-snapshot-v1";
+  const SYNC_BASE_KEY = "luhuo-ledger-sync-base-v1";
+  const RECOVERY_KEY = "luhuo-ledger-recovery-v1";
+  const IDENTITY_KEY = "luhuo-sync-identity-v1";
 
   // v21 起「自留」退出模型：能创建的状态只有在途/已回款（货自己留着用就不算生意，用户宁可删单）。
   // 但旧账本里已经存在的「自留」（含更老的「翻车自留」）**原样保留、绝不静默改写**：
@@ -59,6 +63,16 @@
   // ---- 状态 ----
   let data = { version: 1, orders: [] };
   let meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
+  let storageBaseline = null;
+  let localIssue = "";
+  let syncBlocked = "";
+  let syncBase = null;
+  let activeWrite = null;
+  let durableData = null;
+  let durableMeta = null;
+  let pairingEpoch = null;
+  let ledgerViewIndex = null;
+  let storageLockHeld = false;
   let editingId = null;
   let prefillPlatform = "";   // 「再来一单」预填时暂存原单平台（表单里没有平台输入框）
   // v25：记单表单的模式（"order" 货单 / "income" 收入）。**只是表单形态**，不落库、不是类型字段。
@@ -81,6 +95,8 @@
   // 它是「写账本」的**必要条件**——预填值是范围里的众数，少数派单与它必然不同，
   // 只比字符串会让「点一下复制、什么都没改」顺手改掉那些单的正确单号（静默串单）。
   let baodanTrackingTouched = false;
+  let baodanRevision = 0, baodanCopySeq = 0;
+  let clipboardQueue = Promise.resolve();
   let currentFilter = "在途";
   // v32：「一起寄出」批次块折叠 —— 只记「被用户手动展开过的那些批次 id」。
   // 它是展开态的唯一真相（重渲染也照它还原），但**刻意只活在内存里**：不落库、不进同步包、
@@ -133,7 +149,8 @@
   }
 
   function money(value) {
-    const n = numberValue(value);
+    const raw = numberValue(value);
+    const n = Number.isSafeInteger(Math.round(raw * 100)) ? displayedAmount(raw) : raw;
     const abs = Math.abs(n);
     const s = new Intl.NumberFormat("zh-CN", {
       style: "currency", currency: "CNY",
@@ -158,7 +175,7 @@
   function currentMonth() { return todayStr().slice(0, 7); }
 
   function parseDate(dateStr) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr || ""));
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.exec(String(dateStr || ""));
     if (!m) return null;
     // v33：**回读校验**——`new Date(y, m-1, d)` 会把不存在的日期静默进位（`2026-02-30` → 3 月 2 日、
     // `2026-13-45` → 2027 年 2 月 14 日）。旧版这里只验格式，于是那种日子会悄悄落进**别的期**：
@@ -184,6 +201,42 @@
   // 金额换算成“分”（整数）：分摊一律在分的层面算，严禁浮点直加
   function toCents(v) { return Math.round(numberValue(v) * 100); }
 
+  // Validate before conversion: a finite yuan value can overflow in cents.
+  function safeAmount(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && Number.isSafeInteger(Math.round(n * 100));
+  }
+
+  function displayedAmount(v) {
+    const cents = Math.round(v * 100);
+    return cents === 0 ? 0 : cents / 100;
+  }
+
+  function validAmountInputs(inputs) {
+    for (const input of inputs) {
+      if (!input || input.disabled || input.value === "") continue;
+      if (!safeAmount(input.value)) {
+        toast("金额超出可安全计算的范围，请修改后再保存");
+        input.focus();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function floorWeighted(total, weight, sum) {
+    const product = total * weight;
+    if (Number.isSafeInteger(product)) return Math.floor(product / sum);
+    const numerator = BigInt(total) * BigInt(weight), denominator = BigInt(sum);
+    const quotient = numerator / denominator;
+    return Number(numerator < 0n && numerator % denominator !== 0n ? quotient - 1n : quotient);
+  }
+
+  function validShares(shares, total) {
+    return shares.every((value) => Number.isSafeInteger(value) && value >= 0)
+      && shares.reduce((sum, value) => sum + value, 0) === total;
+  }
+
   // 把 totalCents（整数分）按 weights 拆成整数份：
   // 先 floor(total×w_i/Σw)，余数（必小于单数）逐分补给权重最大的单；Σw=0（全是 0 元购）按单数均分
   function splitByWeight(totalCents, weights) {
@@ -199,7 +252,7 @@
     }
     let used = 0;
     for (let i = 0; i < n; i++) {
-      shares[i] = Math.floor((totalCents * weights[i]) / sum);
+      shares[i] = floorWeighted(totalCents, weights[i], sum);
       used += shares[i];
     }
     const rem = totalCents - used;
@@ -208,10 +261,233 @@
     return shares;
   }
 
-  // ---- 持久化 ----
+  // ---- Local commit boundary ----
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const identityRaw = () => localStorage.getItem(IDENTITY_KEY) || "";
+  const identityOwner = () => {
+    try { return JSON.parse(identityRaw()).userId || ""; } catch { return ""; }
+  };
+
+  function captureStorageBaseline() {
+    storageBaseline = {
+      identity: identityRaw(),
+      data: localStorage.getItem(DATA_KEY),
+      snapshot: localStorage.getItem(SNAPSHOT_KEY),
+    };
+  }
+
+  function showLedgerIssue(message) {
+    localIssue = message;
+    clearTimeout(syncTimer);
+    syncPending = false;
+    renderLedgerNotice();
+  }
+
+  function renderLedgerNotice() {
+    const box = $("#ledgerNotice");
+    if (!box) return;
+    const issue = localIssue || ledgerProblem(data) || syncBlocked;
+    box.hidden = !issue;
+    $("#ledgerNoticeText").textContent = issue;
+    $("#reloadLedgerBtn").hidden = !localIssue;
+    $("#retrySyncBtn").hidden = !!localIssue || !!ledgerProblem(data) || !syncBlocked;
+    $("#retrySyncBtn").textContent = syncBlocked.includes("配对") ? "重试配对" : "重试同步";
+    const writeIssue = localIssue || ledgerProblem(data);
+    $$(".modal .save-error").forEach((line) => {
+      line.textContent = writeIssue ? `保存已暂停，输入内容仍保留。${writeIssue}` : "";
+      line.hidden = !writeIssue;
+    });
+    if (issue && window.luhuoSync) window.luhuoSync.setStatus("error", issue);
+  }
+
+  function checkWriteBoundary() {
+    if (localIssue) { toast(localIssue); return false; }
+    try {
+      if (!storageBaseline || identityRaw() !== storageBaseline.identity
+        || localStorage.getItem(DATA_KEY) !== storageBaseline.data
+        || localStorage.getItem(SNAPSHOT_KEY) !== storageBaseline.snapshot) {
+        showLedgerIssue("其他页面已更换或更新账本。本页已停止写入，请先保留草稿，再重新载入。");
+        toast("账本已在其他页面更新，本次没有保存");
+        return false;
+      }
+      return true;
+    } catch {
+      showLedgerIssue("无法读取本机存储，已停止保存和同步。请保留草稿并检查浏览器存储权限。");
+      return false;
+    }
+  }
+
+  function ledgerProblem(source, structural = false) {
+    if (!source || typeof source !== "object" || Array.isArray(source) || !Array.isArray(source.orders)) {
+      return "账本格式不正确：需要包含 orders 数组，原账本未改动。";
+    }
+    if (source.version !== undefined && source.version !== 1) return "暂不支持这个账本版本，请保留原文件。";
+    const ids = new Set();
+    const sums = { cost: 0, fee: 0, income: 0 };
+    for (const order of source.orders) {
+      if (!order || typeof order !== "object" || Array.isArray(order)) return "账本含无效的订单结构，请先核对原文件。";
+      const id = String(order.id || "");
+      if (id && ids.has(id)) return "账本存在重复订单 ID，已停止有歧义的写入与同步。请先导出核对，不会自动删单。";
+      ids.add(id);
+      for (const key of ["cost", "fee", "income", "batchFee", "batchIncome", "batchFeeShare", "batchIncomeShare", "qty", "batchCount"]) {
+        const value = order[key];
+        if (value === null || value === undefined || value === "") continue;
+        const unit = key.endsWith("Share") || key === "qty" || key === "batchCount" ? 1 : 100;
+        if ((typeof value !== "number" && typeof value !== "string") || !Number.isFinite(Number(value))
+          || !Number.isSafeInteger(Math.round(Number(value) * unit))) {
+          return "账本金额或数量超出安全计算范围，已停止写入。请保留原数据并核对。";
+        }
+        if (Object.prototype.hasOwnProperty.call(sums, key)) {
+          sums[key] += Math.abs(Math.round(Number(value) * 100));
+          if (!Number.isSafeInteger(sums[key])) return "账本累计金额超出安全计算范围，请先导出核对。";
+        }
+      }
+      if (!structural && !id) return "订单缺少唯一 ID，请先核对账本。";
+    }
+    return "";
+  }
+
+  function restoreMemory() {
+    if (durableData) data = clone(durableData);
+    if (durableMeta) meta = clone(durableMeta);
+  }
+
+  function ensureLocalSnapshot() {
+    if (localStorage.getItem(SNAPSHOT_KEY)) return true;
+    try {
+      localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ version: 1, owner: identityOwner(), revision: uid(),
+        data: durableData || data, updatedAt: durableMeta ? durableMeta.updatedAt : meta.updatedAt }));
+      captureStorageBaseline();
+      return true;
+    } catch {
+      if (activeWrite) activeWrite.failed = true;
+      showLedgerIssue("无法建立完整保存快照，本次未改动账本。请检查存储空间或权限并保留草稿。");
+      toast("保存失败，本次没有提交；请保留草稿");
+      return false;
+    }
+  }
+
   function persist() {
-    localStorage.setItem(DATA_KEY, JSON.stringify(data));
-    localStorage.setItem(META_KEY, JSON.stringify(meta));
+    if (!checkWriteBoundary()) { if (activeWrite) activeWrite.failed = true; return false; }
+    const problem = ledgerProblem(data);
+    if (problem) { if (activeWrite) activeWrite.failed = true; toast(problem); renderLedgerNotice(); return false; }
+    if (!ensureLocalSnapshot()) return false;
+    const previous = new Map([DATA_KEY, META_KEY, SNAPSHOT_KEY].map((key) => [key, localStorage.getItem(key)]));
+    try {
+      const snapshot = { version: 1, owner: identityOwner(), revision: uid(), data, updatedAt: meta.updatedAt };
+      // Legacy mirrors remain compatible; the final single-key write is the commit point.
+      localStorage.setItem(DATA_KEY, JSON.stringify(data));
+      localStorage.setItem(META_KEY, JSON.stringify(meta));
+      localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snapshot));
+      captureStorageBaseline();
+      durableData = clone(data);
+      durableMeta = clone(meta);
+      if (activeWrite) activeWrite.committed = true;
+      return true;
+    } catch {
+      let rollbackFailed = false;
+      for (const [key, value] of previous) {
+        try {
+          if (localStorage.getItem(key) === value) continue;
+          if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value);
+        } catch { rollbackFailed = true; }
+      }
+      if (activeWrite) activeWrite.failed = true;
+      restoreMemory();
+      showLedgerIssue(rollbackFailed
+        ? "保存未完成，本机存储状态需要核对。最近完整快照已保留，请保留草稿后重新载入。"
+        : "这次没有保存，草稿仍在。请检查存储空间或权限，保留草稿后重新载入。");
+      toast("保存失败，本次没有提交；请保留草稿");
+      return false;
+    }
+  }
+
+  function persistMeta() {
+    if (!checkWriteBoundary()) return false;
+    try {
+      localStorage.setItem(META_KEY, JSON.stringify(meta));
+      durableMeta = clone(meta);
+      return true;
+    } catch {
+      toast("本机状态暂时无法保存，账本金额未改动");
+      return false;
+    }
+  }
+
+  function withStorageLock(action) {
+    if (storageLockHeld) return action();
+    if (!navigator.locks || !navigator.locks.request) return action();
+    return navigator.locks.request("luhuo-ledger-local-write", { mode: "exclusive" }, () => {
+      storageLockHeld = true;
+      try { return action(); } finally { storageLockHeld = false; }
+    });
+  }
+
+  function controlState(root) {
+    return JSON.stringify([...root.querySelectorAll("input, select, textarea")]
+      .map((input) => [input.name || input.id, input.value, input.checked, input.disabled]));
+  }
+
+  function withFormIntent(root, session, currentSession, action) {
+    const state = controlState(root);
+    return withLedgerWrite(() => {
+      if (session !== currentSession() || state !== controlState(root)) {
+        toast("等待期间输入已变化，本次没有保存，请重新确认"); return false;
+      }
+      return action();
+    });
+  }
+
+  function withLedgerWrite(action) { return withStorageLock(() => withLedgerWriteNow(action)); }
+
+  function withLedgerWriteNow(action) {
+    if (pairingEpoch !== null) { toast("正在配对，请稍候再保存"); return false; }
+    if (!checkWriteBoundary()) return false;
+    const problem = ledgerProblem(data);
+    if (problem) { toast(problem); renderLedgerNotice(); return false; }
+    if (activeWrite) return action();
+    const previous = { data, meta, locks: new Map([...profitLocks].map(([id, locks]) => [id, new Map(locks)])),
+      seen: new Set(statusHintSeen), detail: new Map(statusHintDetail) };
+    data = clone(data); meta = clone(meta);
+    const transaction = { committed: false, failed: false };
+    activeWrite = transaction;
+    try { return action(); }
+    finally {
+      activeWrite = null;
+      if (!transaction.committed) { data = previous.data; meta = previous.meta; }
+      if (transaction.failed) {
+        profitLocks.clear(); previous.locks.forEach((value, id) => profitLocks.set(id, value));
+        statusHintSeen.clear(); previous.seen.forEach((id) => statusHintSeen.add(id));
+        statusHintDetail.clear(); previous.detail.forEach((value, id) => statusHintDetail.set(id, value));
+      }
+      if (!transaction.committed) renderLedgerNotice();
+    }
+  }
+
+  function setLedger(incoming, updatedAt, options = {}) {
+    const expected = storageBaseline && { ...storageBaseline, epoch: syncEpoch };
+    return withStorageLock(() => {
+      if (!expected || expected.epoch !== syncEpoch || expected.identity !== identityRaw()
+        || expected.data !== storageBaseline.data || expected.snapshot !== storageBaseline.snapshot) {
+        toast("核对期间账本已更新，本次没有覆盖，请重新操作"); return false;
+      }
+      return setLedgerNow(incoming, updatedAt, options);
+    });
+  }
+
+  function setLedgerNow(incoming, updatedAt, options = {}) {
+    const problem = ledgerProblem(incoming);
+    if (problem) { toast(problem); return false; }
+    const previousData = data, previousMeta = meta;
+    const previousIssue = localIssue;
+    if (options.recovery) localIssue = "";
+    data = incoming;
+    meta = Object.assign({}, meta, options.meta || {}, { updatedAt });
+    if (!persist()) { data = previousData; meta = previousMeta; localIssue = localIssue || previousIssue; return false; }
+    invalidateForNewLedger();
+    render();
+    if (options.sync) scheduleSync();
+    return true;
   }
 
   // 旧状态（待发货/待寄出/已寄出/退货中/翻车自留）→ 现役状态
@@ -304,13 +580,38 @@
 
   function loadLocal() {
     try {
-      const raw = JSON.parse(localStorage.getItem(DATA_KEY) || "null");
-      if (raw) data = normalizeData(raw);
-      const rawMeta = JSON.parse(localStorage.getItem(META_KEY) || "null");
-      if (rawMeta) meta = Object.assign(meta, rawMeta);
+      if (window.luhuoSync) window.luhuoSync.getSyncCode();
+      const rawText = localStorage.getItem(DATA_KEY);
+      const snapshotText = localStorage.getItem(SNAPSHOT_KEY);
+      const raw = JSON.parse(rawText || "null");
+      const snapshot = JSON.parse(snapshotText || "null");
+      try {
+        const rawMeta = JSON.parse(localStorage.getItem(META_KEY) || "null");
+        if (rawMeta && typeof rawMeta === "object") meta = Object.assign(meta, rawMeta);
+      } catch { meta.lastSyncError = "本机同步状态无法读取，账本数据仍保留"; }
+      const source = snapshot && snapshot.version === 1 && snapshot.data ? snapshot.data : raw;
+      if (source) { localIssue = ledgerProblem(source, true); data = normalizeData(source); }
+      if (snapshot) {
+        if (snapshot.version !== 1 || !snapshot.data || snapshot.owner !== identityOwner()) {
+          localIssue = "本机身份与完整快照不一致，已停止写入和同步。请先导出核对或重新配对。";
+        } else {
+          meta.updatedAt = snapshot.updatedAt;
+          if (rawText !== JSON.stringify(snapshot.data)) localIssue = "本机旧版数据与最近完整快照不同，已停止自动写入。请在设置中导出两份数据核对。";
+        }
+      }
+      try {
+        const base = JSON.parse(localStorage.getItem(SYNC_BASE_KEY) || "null");
+        syncBase = base && base.owner === identityOwner() && !ledgerProblem(base.data) ? base.data : null;
+      } catch { syncBase = null; }
       if (!FILTERS.includes(meta.filter)) meta.filter = "在途";
       currentFilter = meta.filter;
-    } catch { /* 损坏则从空账本开始 */ }
+      captureStorageBaseline();
+      durableData = clone(data); durableMeta = clone(meta);
+    } catch {
+      localIssue = "本机账本或存储无法读取，原数据未覆盖。请在设置中导出原始数据核对。";
+      try { captureStorageBaseline(); } catch { storageBaseline = null; }
+      durableData = clone(data); durableMeta = clone(meta);
+    }
   }
 
   // ---- 统计口径 ----
@@ -377,13 +678,29 @@
       const row = byMonth[key] || { cost: 0, income: 0 };
       months.push({ month: key, cost: row.cost, income: row.income, diff: row.income - row.cost });
     }
+    settledProfit = displayedAmount(settledProfit);
     return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, byStatus, statusKeys: keys, months, count: orders.length };
   }
 
   // ---- 批次（一起寄出的一批单子）----
   // 一批一起寄出的单子共用一个 batchId，整批邮费/回款冗余存在每张单上：
   // 删单不会留下孤儿批次，也不需要额外维护一张批次表。
-  function batchGroups() {
+  function viewIndex() {
+    if (ledgerViewIndex && ledgerViewIndex.source === data) return ledgerViewIndex;
+    const members = new Map();
+    data.orders.forEach((order) => {
+      if (!order.batchId) return;
+      if (!members.has(order.batchId)) members.set(order.batchId, []);
+      members.get(order.batchId).push(order);
+    });
+    ledgerViewIndex = { source: data, groups: buildBatchGroups(), members, profitInfo: new Map() };
+    return ledgerViewIndex;
+  }
+
+  function batchGroups() { return viewIndex().groups; }
+  function batchMembers(id) { return viewIndex().members.get(id) || []; }
+
+  function buildBatchGroups() {
     const map = new Map();
     data.orders.forEach((o) => {
       if (!o.batchId) return;
@@ -392,18 +709,22 @@
         g = {
           id: o.batchId, date: o.batchDate || o.date,
           feeCents: 0, incomeCents: 0, costCents: 0,
-          count: 0, pending: 0, names: [],
+          count: 0, pending: 0, names: [], variants: { date: new Set(), fee: new Set(), income: new Set() }, conflictFields: [],
         };
         map.set(o.batchId, g);
       }
       g.count += 1;
       g.costCents += toCents(o.cost);
       g.names.push(o.name || "未命名");
+      g.variants.date.add(o.batchDate || "");
+      g.variants.fee.add(toCents(o.batchFee));
+      g.variants.income.add(toCents(o.batchIncome));
       if (!isSettled(o)) g.pending += 1;
       // 整批口径同值冗余，取最大可容忍半截写入的旧数据
       g.feeCents = Math.max(g.feeCents, toCents(o.batchFee));
       g.incomeCents = Math.max(g.incomeCents, toCents(o.batchIncome));
     });
+    map.forEach((g) => { g.conflictFields = Object.keys(g.variants).filter((key) => g.variants[key].size > 1); });
     return map;
   }
 
@@ -418,7 +739,7 @@
     batchGroups().forEach((g) => {
       const d = parseDate(g.date);
       if (!d || d < startD || d >= endD) return;
-      const members = data.orders.filter((o) => o.batchId === g.id);
+      const members = batchMembers(g.id);
       const feeCents = members.reduce((a, o) => a + toCents(o.fee), 0);
       if (feeCents <= 0) return;
       const incomeCents = members.reduce((a, o) => a + (o.income === null ? 0 : toCents(o.income)), 0);
@@ -504,7 +825,7 @@
     } else {
       let used = 0;
       for (let k = 0; k < free.length; k++) {
-        parts[k] = Math.floor((remaining * w[k]) / sumW);
+        parts[k] = floorWeighted(remaining, w[k], sumW);
         used += parts[k];
       }
       // floor 使 used ≤ remaining，余数（必 < 项数）**逐分**补给权重最大的那几项、
@@ -531,12 +852,22 @@
   // ②③④ 都是可达状态（事后单独改过某一单），任务书要求动手前报出来：这里按安全默认**不开放**，
   // 总利润照常按整批录入值显示（卡片与表头同一个数）。
   function batchProfitInfo(g, members) {
+    const index = viewIndex();
+    if (members === index.members.get(g.id)) {
+      if (!index.profitInfo.has(g.id)) index.profitInfo.set(g.id, computeBatchProfitInfo(g, members));
+      return index.profitInfo.get(g.id);
+    }
+    return computeBatchProfitInfo(g, members);
+  }
+
+  function computeBatchProfitInfo(g, members) {
     const anyIncome = members.some(hasIncome);
     const incSum = members.reduce((a, o) => a + (hasIncome(o) ? toCents(o.income) : 0), 0);
     const feeSum = members.reduce((a, o) => a + toCents(o.fee), 0);
     const dates = new Set();
     members.forEach((o) => { if (hasIncome(o)) dates.add(o.incomeDate || ""); });
     const total = g.incomeCents - g.costCents - g.feeCents;
+    if (g.conflictFields && g.conflictFields.length) return { pending: !anyIncome, editable: false, reason: "metadata", total };
     if (!anyIncome) return { pending: true, editable: false, reason: "no-income", total };
     // v36：只要有人没记回款就不开放编辑（必须在守恒那条**前面**判——「3 人有回款 + 1 人没记回款」
     // 时 Σincome 可能正好等于整批回款，守恒那条查不出来）
@@ -549,15 +880,17 @@
     // v36：把「有 income 但无归期」当成一个**独立事实**（dates 里那个 "" 就是它）。声明：
     // **手改利润不改归期**——commitProfitEdit 只写 income 与 batchIncomeShare，一个字都不碰
     // incomeDate，所以无归期的成员根本不该出现在编辑集合里（而不是替它编一个日期）。
-    if (dates.size > 1 || dates.has("")) return { pending: false, editable: false, reason: "date", total };
+    if (dates.size > 1 || [...dates].some((date) => !parseDate(date))) return { pending: false, editable: false, reason: "date", total };
     return { pending: false, editable: true, reason: "", total };
   }
 
   // 批次「不开放编辑」的原因 → 给用户看的那一句话（表头的提示行与「恢复默认分摊」的提示共用一支）。
   // 前三条沿用 v35 的既有措辞，一个字不改；partial-income 是 v36 新增的那句。
   function batchReasonText(reason) {
+    if (reason === "metadata") return "同批成员记录的整批口径不一致，已停止重摊；请先导出核对，再导入修正版本";
     if (reason === "no-income") return "整批还没记回款，没有可分摊的钱";
     if (reason === "partial-income") return "这一批还有人没记回款，先补齐回款再分摊";
+    if (reason === "date") return "本批回款日期缺失、无效或不一致，请用各单的「改回款」核对日期";
     return "这一批账目有分叉，先按「改本批邮费」对齐再分摊";   // drift / date 都走这句（v35 口径）
   }
 
@@ -566,6 +899,7 @@
   // 本来都看不见，而测试必须能断言「退批 / 整批重摊 / 整包换数据之后锁真的没了」与「新禁入的 reason」。
   // 只暴露读取视图——没有任何写入口，业务代码一律走 profitLocks 本体与 batchProfitInfo。
   window.luhuoPure = {
+    ledgerSnapshot: () => clone(data),
     batchProfitSplit,
     profitLockSnapshot: () => [...profitLocks].map(([bid, m]) => [bid, [...m]]),
     // v37 只读探针：状态提示的首判记号（测试断言「每批每会话只首判一次」用；无写入口）
@@ -587,14 +921,20 @@
 
   // ---- 渲染 ----
   function render() {
+    ledgerViewIndex = null;
     renderDash();
     renderList();
     renderReport();
     renderSyncBadge();
+    renderLedgerNotice();
   }
 
   function renderSyncBadge() {
     if (!window.luhuoSync) return;
+    if (localIssue || syncBlocked || ledgerProblem(data)) {
+      window.luhuoSync.setStatus("error", localIssue || syncBlocked || ledgerProblem(data));
+      return;
+    }
     if (meta.lastSyncError) window.luhuoSync.setStatus("error", meta.lastSyncError);
     else if (meta.lastSyncedAt) window.luhuoSync.setStatus("online", "上次同步：" + meta.lastSyncedAt);
     else if (data.orders.length === 0) window.luhuoSync.setStatus("offline", "本地空账本");
@@ -729,6 +1069,7 @@
   // 返回一个数组（0～3 条），warn=true 的那条用红棕色显示。
   function batchDrift(g, members, batchCount) {
     const notes = [];
+    if (g.conflictFields && g.conflictFields.length) notes.push({ warn: true, text: batchReasonText("metadata") });
     if (batchCount > 0 && members.length < batchCount) {
       // v23 起不再断言「整批口径仍含它们」：退出本批的人带走的份额会从剩余成员的整批口径里
       // **扣掉**（见 leaveBatch），录入值因此恒等于当前成员的份额合计。措辞保持中性——
@@ -772,7 +1113,7 @@
     const d = statusHintDetail.get(batchId);
     if (!d || d.generation !== ledgerGeneration || d.ids.length === 0) return [];
     const g = batchGroups().get(batchId);
-    const members = data.orders.filter((o) => o.batchId === batchId);
+    const members = batchMembers(batchId);
     if (!g || members.length < 2) return [];
     const defCents = splitByWeight(g.incomeCents, members.map((m) => Math.max(0, toCents(m.cost))));
     const want = new Set(d.ids);
@@ -783,12 +1124,15 @@
 
   function batchHeadHtml(g, visible) {
     const shownCount = visible.filter((o) => o.batchId === g.id).length;
-    const members = data.orders.filter((o) => o.batchId === g.id);
+    const members = batchMembers(g.id);
     // 结算时的成员数冗余在每张单上（取最大，容忍半截写入的旧数据）；老数据没有这个字段就是 0
     const batchCount = members.reduce((a, o) => Math.max(a, Math.round(numberValue(o.batchCount))), 0);
     const bits = [`垫付 ${money(g.costCents / 100)}`];
-    if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
-    if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
+    if (g.conflictFields.length) bits.push("整批口径待核对");
+    else {
+      if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
+      if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
+    }
     if (g.pending > 0) bits.push(`${g.pending} 单在途`);
     // v38（报告 B8 / D4）：状态提示的**完整点名**放在这里（不再塞进短 toast）。只在「本会话对该批
     // 首次提交编辑时确实存在非默认项」时才有这一行，且只认**当前账本代次**记下的那一份——整包换过
@@ -814,7 +1158,7 @@
     // 口径与表头「整批：」同源（batchProfitInfo 的 total＝整批录入值），待回款时显示「待回款」
     // 而不是 −Σ垫付−邮费 那笔确定亏损；负数照实上红色（允许负利润，不拦不警告）。
     const pinfo = members.length > 0 ? batchProfitInfo(g, members) : { pending: true, editable: false, total: 0 };
-    const profitHtml = pinfo.pending
+    const profitHtml = pinfo.reason === "metadata" ? `<span class="bh-profit pending">总利润 待核对</span>` : pinfo.pending
       ? `<span class="bh-profit pending">总利润 待回款</span>`
       : `<span class="bh-profit ${pinfo.total > 0 ? "pos" : pinfo.total < 0 ? "neg" : ""}">总利润 ${money(pinfo.total / 100)}</span>`;
     // 「恢复默认分摊」＝按垫付占比把整批回款重摊一次（与「改本批回款」那条路径等价：纯赋值、幂等、
@@ -894,7 +1238,7 @@
   // 免得「退出本批」这个按钮看起来没有来由
   function orderCardHtml(o, extraClass, soloBatch) {
     const settled = isSettled(o);
-    const profit = orderProfit(o);
+    const profit = displayedAmount(orderProfit(o));
     // 已回款但金额未填，不在卡片上把未知回款显示成确定亏损。
     // 只改显示；旧自留、统计公式和账本字段保持原样。
     const pendingIncome = o.status === "已回款" && !hasIncome(o);
@@ -905,7 +1249,7 @@
     // 分摊仍按整批算（页面显示几个不影响钱）。
     let profitEditable = false;
     if (showProfit && o.batchId && !soloBatch) {
-      const mates = data.orders.filter((x) => x.batchId === o.batchId);
+      const mates = batchMembers(o.batchId);
       if (mates.length > 1) {
         const pg = batchGroups().get(o.batchId);
         if (pg && batchProfitInfo(pg, mates).editable) profitEditable = true;
@@ -1017,6 +1361,8 @@
         }
       }
     });
+    profit = displayedAmount(profit);
+    Object.values(byName).forEach((g) => { g.profit = displayedAmount(g.profit); });
     return { n, cost, income, profit, byName };
   }
 
@@ -1079,17 +1425,23 @@
     const n = buckets.length;
     const innerW = W - padL - padR, innerH = H - padT - padB;
     const maxV = Math.max(1, ...stats.map((s) => Math.max(s.cost, s.income)));
+    const minV = Math.min(0, ...stats.map((s) => Math.min(s.cost, s.income)));
     const x = (i) => padL + (n === 1 ? innerW / 2 : i * innerW / (n - 1));
-    const y = (v) => padT + innerH - (v / maxV) * innerH;
+    const y = (v) => padT + innerH - ((v - minV) / (maxV - minV)) * innerH;
+    const zeroY = y(0);
     let grid = "";
     [0, .5, 1].forEach((f) => {
       const gy = padT + innerH - f * innerH;
       grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" style="stroke:var(--line)" stroke-dasharray="3 4"/>`;
     });
     grid += `<text x="${padL + 2}" y="${padT + 4}" font-size="9" style="fill:var(--muted)">至多 ${money(maxV)}</text>`;
+    if (minV < 0) {
+      grid += `<line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${W - padR}" y2="${zeroY.toFixed(1)}" style="stroke:var(--muted)"/>`;
+      grid += `<text x="${padL + 2}" y="${(padT + innerH - 3).toFixed(1)}" font-size="9" style="fill:var(--muted)">最低 ${money(minV)}</text>`;
+    }
     const path = (key) => stats.map((s, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(s[key]).toFixed(1)}`).join(" ");
     const area = (key, gid) => n === 1 ? "" :
-      `<path d="${path(key)} L${x(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)} L${x(0).toFixed(1)},${(padT + innerH).toFixed(1)} Z" fill="url(#${gid})"/>`;
+      `<path d="${path(key)} L${x(n - 1).toFixed(1)},${zeroY.toFixed(1)} L${x(0).toFixed(1)},${zeroY.toFixed(1)} Z" fill="url(#${gid})"/>`;
     const dots = (key, color) => n <= 14 ? stats.map((s, i) =>
       `<circle cx="${x(i).toFixed(1)}" cy="${y(s[key]).toFixed(1)}" r="2.6" fill="#fff" stroke="${color}" stroke-width="1.6"/>`).join("") : "";
     const ticks = sparseTicks(n).map((i) =>
@@ -1248,11 +1600,12 @@
       // 那是「有人单独改过某单」或历史数据留下的痕迹（退出/重组会按份额扣减，合得上）。
       // 措辞把两个数各自是谁讲清楚，别让人以为同一批有两个邮费（v21 的「整批录入 邮费 ¥1」很容易
       // 被读成「这一批的邮费是 ¥1」，而上面明明写着成员合计 ¥32）。
-      if (b.entryFeeCents > 0 && b.entryFeeCents !== b.feeCents) {
-        nums.push(`整批录的是 邮费 ${money(b.entryFeeCents / 100)}，与成员合计不同（有单被单独改过）`);
+      if (b.conflictFields.length) nums.push("整批口径不一致，请核对；当前邮费按表列日期展示");
+      if (!b.conflictFields.length && b.entryFeeCents !== b.feeCents) {
+        nums.push(`整批录的是 邮费 ${money(b.entryFeeCents / 100)}，与成员合计不同`);
       }
-      if (b.entryIncomeCents > 0 && b.entryIncomeCents !== b.incomeCents) {
-        nums.push(`整批录的是 回款 ${money(b.entryIncomeCents / 100)}，与成员合计不同（有单被单独改过）`);
+      if (!b.conflictFields.length && b.entryIncomeCents !== b.incomeCents) {
+        nums.push(`整批录的是 回款 ${money(b.entryIncomeCents / 100)}，与成员合计不同`);
       }
       return `<div class="fee-row">
         <div class="fee-line">
@@ -1341,6 +1694,7 @@
     }
 
     f.classList.toggle("kind-income", income);
+    f.querySelectorAll(".kind-order input, .kind-order select").forEach((input) => { input.disabled = income; });
     $$("#formKind .seg").forEach((b) =>
       b.classList.toggle("on", b.dataset.kind === formKind));
     $("#formCostLabel").textContent = income ? "金额" : "垫付金额";
@@ -1452,17 +1806,18 @@
     // v25：编辑表单**不加**类型切换（一律按货单形态回显，用户在该形态下自由改）
     $("#formKind").hidden = !!order;
     applyKindUi();
-    $("#formModal").classList.add("show");
+    openModal("#formModal");
     setTimeout(() => f.goods.focus(), 120);
   }
 
   function closeForm() {
-    $("#formModal").classList.remove("show");
+    closeModal("#formModal");
     editingId = null;
     formSession = null;   // v38：编辑会话随弹窗关闭一起作废（下次「编辑」会重新记一份）
   }
 
-  function submitForm(ev) {
+  function submitForm(ev) { ev.preventDefault(); return withFormIntent(ev.target, formSession, () => formSession, () => submitFormImpl(ev)); }
+  function submitFormImpl(ev) {
     ev.preventDefault();
     const f = ev.target;
     // v25：保存后表单已经关了（连点保存的第二次、或事件晚到的那一下）一律丢弃，
@@ -1472,6 +1827,7 @@
     const name = String(f.goods.value || "").trim();
     const date = f.date.value || todayStr();
     if (!name) { toast(isIncome ? "先填名称" : "先填商品名称"); return; }
+    if (!validAmountInputs([f.cost, f.fee])) return;
 
     // —— v25 收入单：只填一个金额，没有垫付/邮费/数量，落库全部用**现有字段** ——
     if (isIncome) {
@@ -1501,8 +1857,8 @@
         createdAt: new Date().toISOString(),
       };
       data.orders.push(order);
+      if (!saveData()) return;
       closeForm();
-      saveData();
       toast("已记账");
       switchView("list");
       return;
@@ -1573,8 +1929,8 @@
     };
     if (existing) Object.assign(existing, order, { id: existing.id });
     else data.orders.push(order);
+    if (!saveData()) return;
     closeForm();
-    saveData();
     toast(existing ? "已更新" : "已记账");
     switchView("list");
   }
@@ -1602,15 +1958,22 @@
     // 「留空」会被那个 required 框拦下，点确认像卡住（v24 记过的坑）。0 也正是它在利润口径里的值。
     const curIncome = o.income === null || o.income === undefined ? 0 : o.income;
     f.income.value = payEditMode ? curIncome : (o.cost || "");
+    // Existing negative member income may keep its amount while correcting its date.
+    f.income.readOnly = payEditMode && curIncome < 0;
+    if (f.income.readOnly) f.income.removeAttribute("min");
+    else f.income.min = "0";
+    $("#payQuick").hidden = f.income.readOnly;
+    $("#payForm [data-clear='income']").hidden = f.income.readOnly;
+    $("#payNegativeHint").hidden = !f.income.readOnly;
     f.incomeDate.value = payEditMode ? (o.incomeDate || todayStr()) : todayStr();
     $("#payTitle").textContent = `${payEditMode ? "改回款" : "回款"} · ${o.name}`;
     updatePayPreview();
-    $("#payModal").classList.add("show");
+    openModal("#payModal");
     setTimeout(() => f.income.focus(), 120);
   }
 
   function closePayForm() {
-    $("#payModal").classList.remove("show");
+    closeModal("#payModal");
     payTargetId = null;
     payEditMode = false;
     paySession = null;   // v38：会话随弹窗关闭一起作废（下次打开重新记一份）
@@ -1625,7 +1988,8 @@
     $("#paySubmit").textContent = `${payEditMode ? "确认改回款" : "确认回款"} ${money(income)}`;
   }
 
-  function submitPay(ev) {
+  function submitPay(ev) { ev.preventDefault(); return withFormIntent(ev.target, paySession, () => paySession, () => submitPayImpl(ev)); }
+  function submitPayImpl(ev) {
     ev.preventDefault();
     const f = ev.target;
     const o = data.orders.find((x) => x.id === payTargetId);
@@ -1640,6 +2004,8 @@
       return;
     }
     const income = numberValue(f.income.value);
+    if (!validAmountInputs([f.income])) return;
+    if (o.income < 0 && income !== o.income) { toast("本次只修回款日期，负回款金额请在分项利润中核对"); return; }
     // v26：改回款 = 只改这一条记录自己的 income 与 incomeDate 两个字段，
     // 状态保持「已回款」（**不产生第二条记录**、不动 cost/fee/qty/批次字段/其它任何一格）。
     // 批内单改回款后批次表头会如实提示「≠ 成员明细合计」——那是预期的：批次口径属于另一个入口
@@ -1649,8 +2015,8 @@
     o.income = income;
     o.incomeDate = f.incomeDate.value || todayStr();
     if (!wasEdit) o.status = "已回款";
+    if (!saveData()) return;
     closePayForm();
-    saveData();
     toast(wasEdit ? `已改回款 ${money(income)}，利润 ${money(orderProfit(o))}` : `已回款 ${money(income)}，利润 ${money(orderProfit(o))}`);
   }
 
@@ -1682,7 +2048,8 @@
     $("#orderForm").fee.value = "";
   }
 
-  function deleteOrder(id) {
+  function deleteOrder(id) { return withLedgerWrite(() => deleteOrderImpl(id)); }
+  function deleteOrderImpl(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
     const mates = o.batchId ? data.orders.filter((x) => x.batchId === o.batchId) : [];
@@ -1692,7 +2059,7 @@
       : n === 1 ? "它是「一起寄出」那批的最后一单，删掉这一批就没了。\n" : "";
     if (!confirm(`删除「${o.name}」这一单？\n${batchLine}删除后无法恢复（云端也会删）。`)) return;
     data.orders = data.orders.filter((x) => x.id !== id);
-    saveData();
+    if (!saveData()) return;
     toast("已删除");
   }
 
@@ -1713,9 +2080,10 @@
   // 写库 + 触发既有 450ms 防抖同步 + 局部重渲染（**不走 saveData**：那会 render() 整页）。
   // meta.updatedAt / meta.filter 与 saveData 保持同一套写法（同步包靠 updatedAt 判新旧）。
   function touchBatchAndRerender(batchId) {
+    ledgerViewIndex = null;
     meta.updatedAt = new Date().toISOString();
     meta.filter = currentFilter;
-    persist();
+    if (!persist()) return false;
     scheduleSync();
     rerenderBatchBlock(batchId);
     // v38（报告 B5）：这一批的钱变了，**派生视图**（看板 / 报表）必须跟着刷。原来只重绘当前批次块，
@@ -1724,6 +2092,8 @@
     // 统计公式一个字不动。
     renderDash();
     renderReport();
+    renderLedgerNotice();
+    return true;
   }
 
   // 点一下利润数字 → 原地换成行内输入框（预填当前利润，元、两位小数），聚焦全选方便直接打新值。
@@ -1774,6 +2144,13 @@
   // v36 补强两处，都是为了「不许静默」：① 输入非法值先校验再结算（空 ≠ 0、格式/范围不对就不写库）；
   // ② 读锁时与账本现值对表，陈旧的锁当作没锁并按现值重摊，且把失效项的名字报给用户。
   function commitProfitEdit(input) {
+    const value = input.value;
+    return withLedgerWrite(() => {
+      if (!input.isConnected || value !== input.value) { toast("输入已变化，本次没有保存，请重新确认"); return; }
+      return commitProfitEditImpl(input);
+    });
+  }
+  function commitProfitEditImpl(input) {
     // v38 收尾（F3）：**显式**代次守门——这是本轮之前唯一没有守门的写入口。它当时之所以打不进去，
     // 只是因为「每次换包都恰好伴随 render() → renderList() 整块 innerHTML 把行内输入框销毁」，
     // 靠实现细节遮蔽：将来谁去掉那次重绘，就会重开 B2 那一类「拿旧账本的意图改新账本」的缺陷，
@@ -1923,7 +2300,8 @@
   // 「恢复默认分摊」＝按垫付占比把整批回款重摊一次 —— 与 submitBatch 的回款分支**等价**
   // （纯赋值、幂等、尾差规则一致；任务书实现提示：复用这条既有路径，这个按钮几乎是免费的）。
   // 刻意不写 incomeDate / status（那是结算那一刻的语义，重摊不动日期与状态）；同时解开全部钉住。
-  function resetBatchShares(batchId) {
+  function resetBatchShares(batchId) { return withLedgerWrite(() => resetBatchSharesImpl(batchId)); }
+  function resetBatchSharesImpl(batchId) {
     const g = batchGroups().get(batchId);
     const members = data.orders.filter((x) => x.batchId === batchId);
     if (!g || members.length < 2) return;
@@ -1931,12 +2309,13 @@
     if (!info.editable) { toast(batchReasonText(info.reason)); return; }
     const weights = members.map((o) => Math.max(0, toCents(o.cost)));
     const shares = splitByWeight(g.incomeCents, weights);
+    if (!validShares(shares, g.incomeCents)) { toast("分摊校验未通过，账本没有改动"); return; }
     members.forEach((o, i) => {
       o.income = shares[i] / 100;
       o.batchIncomeShare = shares[i];
     });
     profitLocks.delete(batchId);
-    touchBatchAndRerender(batchId);
+    if (!touchBatchAndRerender(batchId)) return;
     toast("已恢复按垫付占比的默认分摊");
   }
 
@@ -1945,12 +2324,14 @@
   // v23 补的那一半：它带走的份额要**从剩余成员的整批口径里扣掉**，整批录入值才恒等于
   // 「当前成员实际分摊之和」。v22 之前不扣，于是退出后表头永远报一句「整批口径仍含它们」式的
   // 假漂移（D-3），而这句陈述又把同一批的金额告警顶掉，用户分不清是退出还是钱被改坏了。
-  function leaveBatch(id) {
+  function leaveBatch(id) { return withLedgerWrite(() => leaveBatchImpl(id)); }
+  function leaveBatchImpl(id) {
     const o = data.orders.find((x) => x.id === id);
     if (!o || !o.batchId) return;
     const mates = data.orders.filter((x) => x.batchId === o.batchId);
     const others = mates.filter((x) => x.id !== id);
     const g = batchGroups().get(o.batchId);
+    if (g && g.conflictFields.length) { toast(batchReasonText("metadata")); return; }
     const idx = mates.findIndex((x) => x.id === id);
     const outFee = idx < 0 ? 0 : batchShares(mates, "batchFeeShare", g ? g.feeCents : 0)[idx];
     // v36：退出者带走的**回款**按它自己账本里的 income 扣，不再走 batchIncomeShare 反推——
@@ -1996,7 +2377,7 @@
       x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0; x.batchCount = 0;
       x.batchFeeShare = 0; x.batchIncomeShare = 0;
     });
-    saveData();
+    if (!saveData()) return;
     toast(others.length === 1 ? "已退出，那一批也解散了" : "已退出本批，这一单变成单寄");
   }
 
@@ -2054,7 +2435,7 @@
     $("#batchIncome").value = "";
     $("#batchDate").value = todayStr();
     renderBatchList();
-    $("#batchModal").classList.add("show");
+    openModal("#batchModal");
   }
 
   // 所勾选的单恰好是某个已存在批次的整批原班人马吗？→ 提交时复用该批次号（v19 的既有规则），
@@ -2094,7 +2475,7 @@
   }
 
   function closeBatchModal() {
-    $("#batchModal").classList.remove("show");
+    closeModal("#batchModal");
     batchItems = [];
     batchSession = null;   // v38：会话随弹窗关闭一起作废
   }
@@ -2150,7 +2531,8 @@
       : `已选 ${sel.length} 单 · 垫付合计 ${money(totalCents / 100)}`;
   }
 
-  function submitBatch() {
+  function submitBatch() { return withFormIntent($("#batchModal"), batchSession, () => batchSession, submitBatchImpl); }
+  function submitBatchImpl() {
     const sel = selectedBatchInfo();
     const selIds = new Set(sel.orders.map((o) => o.id));
     // v38（报告 B10 / D3）：**分摊一律用当前 data.orders 里的成员顺序** —— 与「恢复默认分摊」
@@ -2160,6 +2542,9 @@
     // 只改分摊顺序，**不动弹窗的显示排序**（那是另一码事）。
     const orders = data.orders.filter((o) => selIds.has(o.id));
     if (orders.length === 0) { toast("先勾选要结算的在途单"); return; }
+    if (orders.some((o) => o.batchId && batchGroups().get(o.batchId).conflictFields.length)) {
+      toast(batchReasonText("metadata")); return;
+    }
 
     // v38（报告 B2）：批量结算弹窗同样绑账本代次 + 所选成员的快照。所选单任一在这期间被别的入口
     // 改过（或账本整包换过），这一批的分摊预期就不成立——整笔拒绝并说明，绝不按旧预期写。
@@ -2168,7 +2553,11 @@
         toast("账本已更新，这次结算没保存，请重新打开核对");
         return;
       }
+      const wanted = batchItems.filter((it) => it.checked).map((it) => it.id);
       const moved = orders.filter((o) => batchSession.snaps.get(o.id) !== orderSnap(o));
+      if (wanted.some((id) => !orders.some((o) => o.id === id))) {
+        toast("所选订单已变动，这次结算没保存，请重新打开核对"); return;
+      }
       if (moved.length > 0) {
         toast("勾选的单里有内容已变，这次结算没保存，请重新打开核对");
         return;
@@ -2189,6 +2578,7 @@
         return;
       }
     }
+    if (!validAmountInputs([$("#batchFee"), $("#batchIncome")])) return;
     // 留空＝这一项一个字不动（保住「先只摊邮费、回款到了再补一趟」的两趟打法）；
     // 填数字＝把这一项**改成这个数**（不是加上去）；填 0＝删掉这一项。
     const feeGiven = String($("#batchFee").value || "").trim() !== "";
@@ -2256,8 +2646,12 @@
     // 纯赋值天然幂等：同样的数字连填两遍，结果一模一样。
     // v38：份额**按 id 写回**（不是「算完再按下标赋给另一个顺序的数组」）——顺序只由一份
     // 权威来源（上面的 data.orders 过滤结果）决定，id 映射保证写回的每一项都对得上人。
+    const feeShares = feeGiven ? splitByWeight(feeCents, weights) : null;
+    const incomeShares = incomeGiven ? splitByWeight(incomeCents, weights) : null;
+    if ((feeShares && !validShares(feeShares, feeCents)) || (incomeShares && !validShares(incomeShares, incomeCents))) {
+      toast("分摊校验未通过，账本没有改动"); return;
+    }
     if (feeGiven) {
-      const feeShares = splitByWeight(feeCents, weights);
       const feeById = new Map(orders.map((o, i) => [o.id, feeShares[i]]));
       orders.forEach((o) => { o.fee = feeById.get(o.id) / 100; o.batchFeeShare = feeById.get(o.id); });
     }
@@ -2265,7 +2659,6 @@
     // 回款同理。总回款 > 0 才把单子置为已回款；填 0 是「删掉这一批的回款」（金额归 0，
     // 状态不因此回退——那一单收没收到钱是另一回事，要改状态去「编辑」里改）。
     if (incomeGiven) {
-      const incomeShares = splitByWeight(incomeCents, weights);
       const incById = new Map(orders.map((o, i) => [o.id, incomeShares[i]]));
       orders.forEach((o) => {
         o.income = incById.get(o.id) / 100;
@@ -2302,8 +2695,8 @@
       o.batchCount = orders.length;
     });
 
+    if (!saveData()) return;
     closeBatchModal();
-    saveData();
     const amounts = [];
     if (feeGiven) amounts.push(`邮费 ${money(feeCents / 100)}`);
     if (incomeGiven) amounts.push(`回款 ${money(incomeCents / 100)}`);
@@ -2475,103 +2868,101 @@
     return true;
   }
 
-  function baodanApplyTracking(value) {
-    const targets = baodanCompute().orders;
-    if (targets.length === 0) return false;
-    // v38（报告 B7）：按 id 从**当前账本**取，并与「打开面板那一刻的快照」逐单对表；任一单对不上
-    // （面板里的意图已经不是这一份账了）就整笔不写。原注释「候选单与账本里是同一批对象、快照不会
-    // 脱钩」不成立——云端换包之后候选单指向的就是被换掉的那份旧账。
-    const live = [];
-    for (const t of targets) {
-      const cur = data.orders.find((o) => o.id === t.id);
-      if (!cur) return false;
-      if (baodanSession && baodanSession.snaps.get(cur.id) !== orderSnap(cur)) return false;
-      live.push(cur);
-    }
-    if (!live.some((o) => cleanTracking(o.tracking) !== value)) return false;
-    live.forEach((o) => {
-      o.tracking = value;
-      // 刚写进去的值就是新的对表基准（否则这次写入自己会让会话立刻「失效」）
-      if (baodanSession) baodanSession.snaps.set(o.id, orderSnap(o));
+  function baodanApplyTracking(value, targetIds) {
+    const ids = targetIds || baodanCompute().orders.map((o) => o.id);
+    const session = baodanSession, revision = baodanRevision;
+    return withLedgerWrite(() => {
+      if (session !== baodanSession || revision !== baodanRevision) { toast("报单内容已变，单号没有保存，请重新核对"); return { ok: false }; }
+      const live = ids.map((id) => data.orders.find((o) => o.id === id));
+      if (!baodanSessionAlive() || live.some((o) => !o || baodanSession.snaps.get(o.id) !== orderSnap(o))) return { ok: false };
+      const changed = live.some((o) => cleanTracking(o.tracking) !== value);
+      if (changed) {
+        live.forEach((o) => { o.tracking = value; });
+        if (!saveData()) return { ok: false };
+        live.forEach((o) => baodanSession.snaps.set(o.id, orderSnap(o)));
+        baodanCandidates = baodanCandidates.map((o) => data.orders.find((x) => x.id === o.id) || o);
+      }
+      return { ok: true, changed, count: live.length };
     });
-    saveData();
-    return true;
   }
 
-  // v31：**用户真的改过那一格之后的唯一提交口**（change 事件与「清空」按钮都走它）。
-  // 为什么写库挂在这里而不是「点复制」上：面板一打开就自动复制过一次，那一刻那一格还是预填的众数，
-  // 而少数派单（同一批里另一个包裹的号）与它必然不同——只比字符串的话，用户「什么都没改、只想再复制一遍」
-  // 就会把那些单的正确单号统一成众数，账本被静默改写且无处可撤。所以：
-  //   · 写库的**必要条件**是「用户动过这一格」（touched，见它的声明）；
-  //   · 复制那一下只在「动过且值仍然不同」时兜一道底（勾选集合在动过之后又变了的那种情形）。
-  // 顺序是四件事：收敛这一格的显示 → 写账本（值没变就不写）→ 重算文本 → **再复制一次剪贴板** → toast。
-  // 重复制不是锦上添花：不重复制的话，剪贴板里还是**打开面板那一刻**的旧文本（没有单号或旧单号），
-  // 而 toast 还在教用户「直接去微信粘贴」——他会粘出一份与面板所见不一致的报单。
+  function markBaodanChanged() {
+    baodanRevision += 1;
+    if (baodanScope) $("#baodanModal .batch-sub").textContent = "内容已变，请重新复制后再去粘贴。";
+  }
+
+  function captureBaodanCopy(text, res, edited) {
+    return { session: baodanSession, revision: baodanRevision, seq: ++baodanCopySeq,
+      generation: ledgerGeneration, text, ids: res.orders.map((o) => o.id), tracking: res.tracking,
+      qty: res.qty, kinds: res.kinds, trackingKinds: bdTrackingPick(res.orders).list.length, edited };
+  }
+
+  function baodanCopyAlive(copy) {
+    return copy.session === baodanSession && copy.revision === baodanRevision && copy.seq === baodanCopySeq
+      && copy.generation === ledgerGeneration && baodanSessionAlive();
+  }
+
   async function commitBaodanTracking() {
     baodanTrackingTouched = true;
+    markBaodanChanged();
     const box = $("#baodanTracking");
-    box.value = cleanTracking(box.value);       // 界面也收敛：超 40 字的当场截断，三处（格/文本/账本）同一个值
-    // v38（报告 B7）：账本在面板开着的时候被换过包 ⇒ 这一次写入与随后的复制都不做，也**不许**
-    // 再报「单号已改」——那是拿旧面板的意图冒充已经写进当前账本（实测：文本 USER / 账本 REMOTE /
-    // 提示「单号已改，但复制失败」）。
+    box.value = cleanTracking(box.value);
     if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
-    const written = baodanApplyTracking(box.value);
-    renderBaodan();                             // 文本第 2 行跟着这一格走
-    // 范围里一单都没有（空范围面板）：这一格改了也没账本可写、没有文本可复制，如实说一句就走
-    // （不拦的话会复制一个空串、还报「已重新复制」——那是句假话）
-    if (!$("#baodanText").value.trim()) { toast("这个范围里没有可报的单"); return; }
-    const ok = await writeBaodanClipboard($("#baodanText").value, $("#baodanText"));
-    // 异步复制期间账本又变过（云端换包）：反馈也不许按旧会话说话（不许宣称成功、也不许宣称已改）
-    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
-    if (!ok) { toast("单号已改，但复制失败：长按上面的文本框手动全选"); return; }
-    toast(written
-      ? `单号已记到 ${baodanCompute().orders.length} 单 · 已重新复制`
-      : "单号没变，账本没动 · 已重新复制");
+    const written = await baodanApplyTracking(box.value);
+    if (!written || !written.ok) return;
+    const res = renderBaodan();
+    if (!res.text.trim()) { toast("这个范围里没有可报的单"); return; }
+    const copy = captureBaodanCopy(res.text, res, false);
+    if (!await writeBaodanClipboard(copy)) return;
+    toast(written.changed ? `单号已记到 ${written.count} 单 · 已重新复制` : "单号没变，账本没动 · 已重新复制");
   }
 
-  // 写剪贴板：非安全上下文/旧 WebView/无权限时会抛错，回退 execCommand，两条路都给可见反馈。
-  // 返回 true/false 让调用方决定提示文案（面板与「点一下报单」两处共用这一支）
-  async function writeClipboard(text, box) {
-    try { await navigator.clipboard.writeText(text); return true; }
-    catch {
-      // 兜底路径（http / 旧 WebView / 权限被拒）：选中文本 + execCommand。
-      // **v28 修过的真缺陷**：这里原先只 `box.select()` 就无条件 `return true`，漏了 execCommand ——
-      // 于是复制没发生、却报「已复制报单」，用户到微信粘出来的是上一批货的内容，静默报错单。
-      // 现在两条路都拿 execCommand 的返回值说话，false 就如实报失败（面板里的文本框仍是手动兜底）。
-      let tmp = null;
-      try {
-        let target = box;
-        if (!target) {                                     // 没有现成文本框时临时造一个（同一个用户手势里）
-          tmp = document.createElement("textarea");
-          tmp.value = text; tmp.setAttribute("readonly", "");
-          tmp.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
-          document.body.appendChild(tmp);
-          target = tmp;
-        }
-        target.select();
-        return !!document.execCommand("copy");
-      } catch { return false; }
-      finally { if (tmp) tmp.remove(); }
-    }
+  function writeClipboard(text, box, stillCurrent = () => true) {
+    // Serialize requests so an older permission prompt cannot overwrite a newer copy.
+    const task = clipboardQueue.catch(() => {}).then(async () => {
+      if (!stillCurrent()) return false;
+      try { await navigator.clipboard.writeText(text); return true; }
+      catch {
+        if (!stillCurrent()) return false;
+        let temporary = null;
+        try {
+          let target = box && box.value === text ? box : null;
+          if (!target) {
+            temporary = document.createElement("textarea");
+            temporary.value = text; temporary.setAttribute("readonly", "");
+            temporary.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+            document.body.appendChild(temporary); target = temporary;
+          }
+          target.select();
+          return !!document.execCommand("copy");
+        } catch { return false; }
+        finally { if (temporary) temporary.remove(); }
+      }
+    });
+    clipboardQueue = task.then(() => {}, () => {});
+    return task;
   }
 
-  // 正常复制成功时保留原说明；失败提示留在面板里，不随 toast 消失。
-  async function writeBaodanClipboard(text, box) {
+  async function writeBaodanClipboard(copy) {
     const hint = $("#baodanModal .batch-sub");
     hint.textContent = "正在复制报单，请稍候。";
-    const ok = await writeClipboard(text, box);
+    const ok = await writeClipboard(copy.text, $("#baodanText"), () => baodanCopyAlive(copy));
+    if (!baodanCopyAlive(copy)) {
+      if (copy.session === baodanSession && copy.seq === baodanCopySeq) {
+        hint.textContent = "内容已变，请重新复制后再去粘贴。";
+        toast("内容已变，请重新复制");
+      }
+      return false;
+    }
     hint.textContent = ok
-      ? "点「报单」时已经复制好了，直接去微信粘贴；要改动就先改下面的内容再点一次复制"
+      ? "这份报单已复制，可以去微信粘贴；修改后请重新复制。"
       : "复制失败：请长按下面的文本框手动全选复制，核对后再去微信粘贴。";
+    if (!ok) toast("复制失败：长按面板里的文本框手动全选");
     return ok;
   }
 
-  // scope：{ type:"batch", batchId } 从批次表头进（报这一次寄出的货）；
-  //        省略 / { type:"filter" } 从账本工具条进（报账本当前筛选下看得见的单）
-  // v28 关键交互：**点一下就进剪贴板**——用户的原话是「点一下报单，它就自动整理好并粘贴到我的
-  // 剪贴板里，然后我直接在微信发给对方就好了」。所以这里开面板的同时就把文本复制好，
-  // 面板是「刚才复制了什么」的凭据 + 需要微调时的入口（改动后按「复制报单」再复制一次）。
   async function openBaodan(scope) {
+    baodanRevision += 1; baodanCopySeq += 1;
     const fromBatch = !!(scope && scope.type === "batch");
     baodanScope = { type: fromBatch ? "batch" : "filter", batchId: fromBatch ? scope.batchId : "" };
     baodanCandidates = fromBatch
@@ -2596,34 +2987,24 @@
     const tkBox = $("#baodanTracking");
     if (tkBox) tkBox.value = bdTrackingPick(baodanCandidates).value;
     const { text } = renderBaodan();
-    $("#baodanModal").classList.add("show");
+    openModal("#baodanModal");
     // 范围里没有单：面板会写「这个范围里没有可报的单」，但也得给一句 toast —— 点完什么都没发生很像坏了
     if (!text) {
       $("#baodanModal .batch-sub").textContent = "这个范围里没有可报的单，未复制任何内容。";
       toast("这个范围里没有可报的单");
       return;
     }
-    const ok = await writeBaodanClipboard(text, $("#baodanText"));
-    // v38 收尾（F8）：复制是 await —— 这期间用户可能改了勾选（勾选 handler 会重绘面板、重写
-    // #baodanText，而兜底那条 execCommand 路复制的正是**盒子里当时的内容**），账本也可能整包换过。
-    // 所以件数/种数必须在 await **之后**现取一次：旧代码用的是复制之前解构出来的 qty/kinds，
-    // 慢复制 + 中途改勾选时会报一个与面板/剪贴板对不上的件数。
-    // 顺带核一次会话（只读）：账本换过包就只说「重新打开核对」，绝不宣称复制成功。
-    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
-    const after = renderBaodan();
-    // v31：本次报的单里单号不止一种时，这一下自动复制出去的文本用的是**预填的那个号**（众数）——少数派那几单
-    // 的号并不在文本里。这一下**不写账本**（见 commitBaodanTracking 的说明），但必须当场说清「单号不止一个」，
-    // 否则用户点完直接切微信粘贴，收货商拿到的是别的包裹的号（v28 那类「静默报错单」的老毛病）。
-    const tkKinds = bdTrackingPick(after.orders).list.length;
-    toast(ok
-      ? (tkKinds > 1
-        ? `已复制报单 · ${after.qty} 件 / ${after.kinds} 种 · 单号有 ${tkKinds} 种，先核对面板里的提示再报`
-        : `已复制报单 · ${after.qty} 件 / ${after.kinds} 种 · 直接去微信粘贴`)
-      : "复制失败：长按面板里的文本框手动全选");
+    const res = baodanCompute();
+    const copy = captureBaodanCopy(text, res, false);
+    if (!await writeBaodanClipboard(copy)) return;
+    toast(copy.trackingKinds > 1
+      ? `已复制报单 · ${copy.qty} 件 / ${copy.kinds} 种 · 单号有 ${copy.trackingKinds} 种，先核对面板里的提示再报`
+      : `已复制报单 · ${copy.qty} 件 / ${copy.kinds} 种 · 直接去微信粘贴`);
   }
 
   function closeBaodan() {
-    $("#baodanModal").classList.remove("show");
+    baodanRevision += 1; baodanCopySeq += 1;
+    closeModal("#baodanModal");
     baodanScope = null;
     baodanCandidates = [];
     baodanSel = new Set();
@@ -2666,146 +3047,186 @@
   async function copyBaodan() {
     const box = $("#baodanText");
     const res = baodanCompute();
-    if (!box.value.trim()) {
-      // 两种「空」分开说：一单没勾 vs 勾了但用户把文本框清空了（后者叫他先填内容，别再让他去查勾选）
-      toast(res.orders.length === 0 ? "先勾选要报的单" : "文本框是空的，先写上要报的内容");
-      return;
+    if (!box.value.trim()) { toast(res.orders.length ? "文本框是空的，先写上要报的内容" : "先勾选要报的单"); return; }
+    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
+    const copy = captureBaodanCopy(box.value, res, box.value !== res.text);
+    const touched = baodanTrackingTouched;
+    if (!await writeBaodanClipboard(copy)) return;
+    if (touched) {
+      const result = await baodanApplyTracking(copy.tracking, copy.ids);
+      if (!result || !result.ok) { toast("文本已复制，单号未保存，请核对账本"); return; }
     }
-    const edited = box.value !== res.text;
-    // v38（报告 B7）：会话失效时既不写也不复制，明确让用户重新生成（不许返回「没变化」冒充成功）
-    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
-    const ok = await writeBaodanClipboard(box.value, box);
-    if (!baodanSessionAlive()) { toast("账本已更新，请重新打开报单核对"); return; }
-    if (!ok) { toast("复制失败：长按上面的文本框手动全选"); return; }
-    // v31：复制这一刻**不再无条件写库**，只在「用户真的动过那一格（touched）且值仍与账本里存的不同」时兜一道底。
-    // touched 是必要条件：面板一打开就自动复制过一次，那一刻那一格是预填的**众数**，少数派单与它必然不同——
-    // 只比字符串的话，用户「什么都没改、只想再复制一遍」就会把那几单的正确单号统一成众数（静默串单、无处可撤）。
-    // 正常路径下这一句其实没事可做：用户改完那一格时 change 已经把账本写了（commitBaodanTracking）；
-    // 它管的是「动过之后**勾选集合又变了**」——新勾进来的单可能不是这个号，这一下把它补上。
-    if (baodanTrackingTouched) baodanApplyTracking(res.tracking);
-    toast(edited ? "已复制 · 你改过的那份" : `已复制报单 · ${res.qty} 件 / ${res.kinds} 种 · 直接去微信粘贴`);
+    toast(copy.edited ? "已复制 · 你改过的那份" : `已复制报单 · ${copy.qty} 件 / ${copy.kinds} 种 · 直接去微信粘贴`);
   }
 
   // ---- 云同步（改动防抖推送，启动拉取）----
-  let syncTimer = null, syncPending = false, syncInFlight = false;
-  let syncEpoch = 0;   // 导入同步码/重置身份时换代：旧身份数据的晚到同步直接作废
-  // v27：**只有**「导入同步码」那条路会把它置 true——那条路自己已经按 id 把本机独有的单并回去了
-  // （applySyncBtn 里那段 localOnly 合并，且前面已经问过用户「首次同步以最新的一份数据为准」），
-  // 所以它触发的这次拉取不再弹「并入还是放弃」的确认框（两个确认框会互相矛盾）。
+  // ---- Cloud orchestration: requests own an identity and a queue slot ----
+  let syncTimer = null, syncPending = false, syncInFlight = null;
+  let syncEpoch = 0;
   let suppressPullMerge = false;
 
   function saveData() {
     meta.updatedAt = new Date().toISOString();
     meta.filter = currentFilter;
-    persist();
+    if (!persist()) return false;
     render();
     scheduleSync();
+    return true;
   }
 
   function scheduleSync() {
     syncPending = true;
     clearTimeout(syncTimer);
-    syncTimer = setTimeout(() => {
-      syncPending = false;
-      syncToCloud();
-    }, 450);
+    if (syncBlocked || localIssue) return;
+    syncTimer = setTimeout(flushPendingSync, 450);
   }
 
   function flushPendingSync() {
-    if (!syncPending) return;
+    if (!syncPending || syncBlocked || localIssue) return;
     clearTimeout(syncTimer);
-    syncPending = false;
     syncToCloud();
   }
 
-  async function syncToCloud() {
-    if (!window.luhuoSync || !window.luhuoSync.isConfigured()) return;
-    if (syncInFlight) { syncPending = true; return; }
-    syncInFlight = true;
-    const epoch = syncEpoch;
-    window.luhuoSync.setStatus("syncing");
+  function rememberSyncBase(value, owner = identityRaw()) {
+    if (owner !== identityRaw()) return;
+    syncBase = clone(value);
+    try { localStorage.setItem(SYNC_BASE_KEY, JSON.stringify({ owner: JSON.parse(owner).userId, data: syncBase })); }
+    catch { meta.lastSyncError = "云端已处理，本机同步基线未能保存；下次会重新核对"; }
+  }
+
+  function preserveConflict(incoming, reason) {
     try {
-      const record = await window.luhuoSync.saveData(data, meta.updatedAt || new Date().toISOString());
-      if (epoch !== syncEpoch) return;   // 身份已换代，丢弃本轮结果
+      localStorage.setItem(RECOVERY_KEY, JSON.stringify({ savedAt: new Date().toISOString(), reason,
+        local: clone(data), remote: clone(incoming), localRaw: localStorage.getItem(DATA_KEY),
+        snapshotRaw: localStorage.getItem(SNAPSHOT_KEY) }));
+      return true;
+    } catch {
+      syncBlocked = "无法保留冲突副本，已暂停同步。请先导出本机账本，再重试。";
+      renderLedgerNotice();
+      return false;
+    }
+  }
+
+  function conflictingIds(incoming) {
+    const local = new Map(data.orders.map((o) => [o.id, orderSnap(o)]));
+    const remote = new Map(incoming.orders.map((o) => [o.id, orderSnap(o)]));
+    const base = new Map((syncBase ? syncBase.orders : []).map((o) => [o.id, orderSnap(o)]));
+    const ids = [...new Set([...local.keys(), ...remote.keys(), ...base.keys()])];
+    // Whole-ledger replacement also loses disjoint edits; do not imply a per-record merge.
+    const bothChanged = syncBase && ids.some((id) => local.get(id) !== base.get(id))
+      && ids.some((id) => remote.get(id) !== base.get(id));
+    return ids.filter((id) => {
+      const left = local.get(id), right = remote.get(id), previous = base.get(id);
+      if (left === right) return false;
+      if (!syncBase) return left !== undefined && right !== undefined;
+      return bothChanged || (left !== previous && right !== previous);
+    });
+  }
+
+  async function syncToCloud() {
+    if (!window.luhuoSync || !window.luhuoSync.isConfigured() || localIssue || syncBlocked || ledgerProblem(data)) return;
+    if (!checkWriteBoundary()) return;
+    if (syncInFlight) { syncPending = true; return; }
+    const request = { epoch: syncEpoch, identity: identityRaw(), data: clone(data), updatedAt: meta.updatedAt };
+    syncInFlight = request;
+    syncPending = false;
+    window.luhuoSync.setStatus("syncing");
+    const stale = () => request.epoch !== syncEpoch || request.identity !== identityRaw();
+    try {
+      const record = await window.luhuoSync.saveData(request.data, request.updatedAt || new Date().toISOString());
+      if (stale() || !checkWriteBoundary()) return;
       meta.lastSyncedAt = (record.updatedAt || new Date().toISOString()).replace("T", " ").slice(0, 16);
       meta.lastSyncError = "";
-      persist();
-      window.luhuoSync.setStatus("online", "上次同步：" + meta.lastSyncedAt);
+      rememberSyncBase(request.data, request.identity);
+      persistMeta();
+      renderSyncBadge();
     } catch (error) {
-      if (epoch !== syncEpoch) return;
+      if (stale() || !checkWriteBoundary()) return;
       meta.lastSyncError = error && error.message ? error.message : String(error);
-      persist();
-      window.luhuoSync.setStatus("error", meta.lastSyncError);
+      persistMeta();
+      renderSyncBadge();
     } finally {
-      syncInFlight = false;
-      if (syncPending && epoch === syncEpoch) { syncPending = false; syncToCloud(); }
+      if (syncInFlight === request) syncInFlight = null;
+      // A stale request may release its slot, but must not discard the new owner's work.
+      if (syncPending && !localIssue && !syncBlocked) syncToCloud();
+    }
+  }
+
+  async function readCloudRecord() {
+    const epoch = syncEpoch, seq = ++pullSeq, owner = identityRaw();
+    const stale = () => epoch !== syncEpoch || seq !== pullSeq || owner !== identityRaw();
+    try {
+      const remote = await window.luhuoSync.loadRecord();
+      if (stale()) return { kind: "stale" };
+      if (remote === null || remote === undefined) return { kind: "empty" };
+      const problem = ledgerProblem(remote.data, true);
+      if (problem) return { kind: "failed", error: problem };
+      return { kind: "data", data: normalizeData(remote.data), updatedAt: remote.updatedAt || "", identity: owner };
+    } catch (error) {
+      if (stale()) return { kind: "stale" };
+      return { kind: "failed", error: error && error.message ? error.message : String(error) };
     }
   }
 
   async function pullFromCloud() {
-    if (!window.luhuoSync || !window.luhuoSync.isConfigured()) return;
-    // v38（报告 B1）：拉取前先取身份代次 + 拉取序号，await 回来后两者都没变才算这次结果还有效。
-    // 推送路径本来就有代次检查（见 syncToCloud），拉取这一侧原来一个都没有——于是「启动时云端
-    // 还没返回 → 用户重置成新账本 → 旧读取才返回」会把旧账原样写进新身份，并报「已从云端取回最新账本」。
-    const epoch = syncEpoch;
-    const seq = ++pullSeq;
-    const stale = () => epoch !== syncEpoch || seq !== pullSeq;
-    try {
-      const remote = await window.luhuoSync.loadRecord();
-      // 旧身份 / 已被更新的一次拉取取代：结果与错误一律丢弃，账本、meta、身份与当前 UI 都不许被它改动
-      if (stale()) return;
-      if (!remote || !remote.data) {
-        if (data.orders.length > 0) syncToCloud();
-        window.luhuoSync.setStatus("online", "云端暂无数据");
-        return;
-      }
-      const remoteAt = remote.updatedAt || "";
-      if (!meta.updatedAt || remoteAt > meta.updatedAt) {
-        // v27：远端更新时**先看一眼会不会丢东西**再整体覆盖——本机存在「云端没有的订单」（按 id 比对）
-        // 就弹一次确认，让用户选「并入（默认）还是放弃并采用云端版本」。
-        // 场景：手机信号差、几单没推上去，期间电脑端改完同步成功 → 手机下次打开，那几单会被静默抹掉。
-        // 不做时间戳/版本比较（那套在弱网下更容易出错）：只比 id 集合。
-        // 正常情况下本机的单云端都有（localOnly 为空），启动时一次都不会弹；
-        // 「另一台真删了单」也不会自动复活——用户在那里选「取消（放弃）」即可。
-        const incoming = normalizeData(remote.data);
-        const incomingIds = new Set(incoming.orders.map((o) => o.id));
-        const localOnly = data.orders.filter((o) => !incomingIds.has(o.id));
-        let merged = 0, declined = 0;
-        if (localOnly.length > 0 && !suppressPullMerge) {
-          const names = localOnly.slice(0, 3).map((o) => o.name || "未命名").join("、");
-          const keep = confirm(`云端有更新的账本，本机还有 ${localOnly.length} 单是云端没有的：\n`
-            + `${names}${localOnly.length > 3 ? "…" : ""}\n\n`
-            + "点「确定」＝把它们并进账本（推荐）；点「取消」＝放弃这几单，改用云端版本。");
-          if (keep) { incoming.orders = incoming.orders.concat(localOnly); merged = localOnly.length; }
-          else declined = localOnly.length;
-        }
-        data = incoming;
-        // v38：整包换掉了账本 —— 代次 +1、手改锁与状态提示首判记号（含它的详情行）一起作废
-        // （报告 B9：原来只清 profitLocks，于是首判额度被提前烧掉、真正需要时不再响；
-        //  **失败的读取不走这里**，额度不会被白复位）。
-        invalidateForNewLedger();
-        meta.updatedAt = remoteAt;
-        persist();
-        render();
-        // 并入后**不**立刻把整本推上去：下次启动那次拉取的 else 分支会自然把它推上去（干净、少一次写）
-        if (merged > 0) toast(`已并入本机 ${merged} 单`);
-        else if (declined > 0) toast(`已采用云端版本（本机 ${declined} 单未并入）`);
-        else toast("已从云端取回最新账本");
-      } else {
-        syncToCloud();
-      }
-      // v38 收尾（F6）：防御性；正常路径**不可达**——这一段与上面那次 `stale()` 之间没有 await
-      //（中间只有 persist/render/toast 与一次不 await 的 syncToCloud），epoch/seq 不可能在中间变。
-      // 留着是给将来在中间插 await 的人兜底，别再把它当成一条**当前**承担了保护作用的判据。
-      if (stale()) return;
-      meta.lastSyncError = "";
-      renderSyncBadge();
-    } catch (error) {
-      if (stale()) return;   // 旧身份的错误不许覆盖当前身份的状态（它已经不指向这本账了）
-      meta.lastSyncError = error && error.message ? error.message : String(error);
-      renderSyncBadge();
+    if (!window.luhuoSync || !window.luhuoSync.isConfigured() || !checkWriteBoundary() || ledgerProblem(data)) return { kind: "blocked" };
+    // Keep local edits queued until this read confirms what exists on the server.
+    syncBlocked = "正在核对云端账本，本机可继续记账，请稍候。";
+    window.luhuoSync.setStatus("syncing");
+    const result = await readCloudRecord();
+    if (result.kind === "stale") return result;
+    if (!checkWriteBoundary()) return { kind: "stale" };
+    if (result.kind === "failed") {
+      syncBlocked = "尚未确认云端账本，已暂停上传。本机可继续记账，联网后请重试同步。";
+      meta.lastSyncError = result.error;
+      renderSyncBadge(); renderLedgerNotice();
+      return result;
     }
+    syncBlocked = "";
+    meta.lastSyncError = "";
+    if (result.kind === "empty") {
+      if (data.orders.length) scheduleSync();
+      else window.luhuoSync.setStatus("online", "云端暂无数据");
+      renderLedgerNotice();
+      return result;
+    }
+    const incoming = clone(result.data);
+    const conflicts = conflictingIds(incoming);
+    let preferRemote = false;
+    if (conflicts.length) {
+      if (!preserveConflict(incoming, "本机与云端账本存在不同修改")) return { kind: "blocked" };
+      preferRemote = confirm(`本机与云端的账本不同，涉及 ${conflicts.length} 单，已保留两份核对副本。\n确定＝采用云端记录；本机原账仍在设置的核对副本中。云端没有的本机订单会另行询问是否并入。\n取消＝保留本机并暂停同步。`);
+      if (!preferRemote) {
+        syncBlocked = "账本有待核对的冲突，已保留两份副本并暂停同步。请到设置导出核对后重试。";
+        renderLedgerNotice(); return { kind: "blocked" };
+      }
+    }
+    if (preferRemote || !meta.updatedAt || result.updatedAt > meta.updatedAt) {
+      const incomingIds = new Set(incoming.orders.map((o) => o.id));
+      const localOnly = data.orders.filter((o) => !incomingIds.has(o.id));
+      let merged = 0, declined = 0;
+      if (localOnly.length && !suppressPullMerge) {
+        const names = localOnly.slice(0, 3).map((o) => o.name || "未命名").join("、");
+        const keep = confirm(`云端有更新的账本，本机还有 ${localOnly.length} 单是云端没有的：\n${names}${localOnly.length > 3 ? "…" : ""}\n\n点「确定」＝把它们并进账本（推荐）；点「取消」＝放弃这几单，改用云端版本。`);
+        if (keep) { incoming.orders = incoming.orders.concat(localOnly); merged = localOnly.length; }
+        else declined = localOnly.length;
+      }
+      const remoteBase = clone(result.data);
+      const updatedAt = merged ? new Date().toISOString() : result.updatedAt;
+      if (!await setLedger(incoming, updatedAt, { sync: merged > 0 })) return { kind: "blocked" };
+      rememberSyncBase(remoteBase, result.identity);
+      if (merged) toast(`已并入本机 ${merged} 单，正在安排同步`);
+      else if (declined) toast(`已采用云端版本（本机 ${declined} 单未并入）`);
+      else toast("已从云端取回最新账本");
+    } else {
+      rememberSyncBase(incoming, result.identity);
+      scheduleSync();
+    }
+    meta.lastSyncError = "";
+    persistMeta(); renderSyncBadge(); renderLedgerNotice();
+    return result;
   }
+
 
   // ---- 设置 ----
   function renderSettings() {
@@ -2813,6 +3234,116 @@
     $("#syncLast").textContent = meta.lastSyncedAt || "还没同步过";
     $("#syncErrLine").textContent = meta.lastSyncError || "";
     try { $("#syncCodeText").value = window.luhuoSync.getSyncCode(); } catch { $("#syncCodeText").value = ""; }
+    $("#exportRecoveryBtn").hidden = !localStorage.getItem(RECOVERY_KEY) && !localIssue;
+    let canRestore = false;
+    try {
+      const snapshot = JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || "null");
+      canRestore = !!localIssue && snapshot && snapshot.owner === identityOwner() && !ledgerProblem(snapshot.data);
+    } catch { /* The original raw data remains available for export. */ }
+    $("#restoreSnapshotBtn").hidden = !canRestore;
+  }
+
+  function exportRecovery() {
+    const recovery = { savedAt: new Date().toISOString(), current: data,
+      legacyRaw: localStorage.getItem(DATA_KEY), snapshotRaw: localStorage.getItem(SNAPSHOT_KEY),
+      conflictRaw: localStorage.getItem(RECOVERY_KEY) };
+    const blob = new Blob([JSON.stringify(recovery, null, 2)], { type: "application/json" });
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob); anchor.download = `luhuo-recovery-${todayStr()}.json`; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 2000);
+    toast("已导出核对副本，不含同步码");
+  }
+
+  async function applySyncCodeFromForm() {
+    const code = $("#applySyncInput").value.trim();
+    if (!code) { toast("先粘贴另一台设备的同步码"); return; }
+    if (!confirm("导入同步码后，本机将与对方共用同一本账。\n先读取并核对云端，读取失败不会上传，继续？")) return;
+    const context = await withStorageLock(() => {
+      if (!checkWriteBoundary() || !ensureLocalSnapshot()) return null;
+      const previousIdentity = identityRaw(), previousBase = syncBase, local = clone(data);
+      try { window.luhuoSync.applySyncCode(code); }
+      catch (error) { toast(error.message || "同步码无效"); return null; }
+      const appliedIdentity = identityRaw(), epoch = ++syncEpoch;
+      pairingEpoch = epoch; syncPending = false; clearTimeout(syncTimer);
+      syncBlocked = "正在配对，请稍候；此时不会上传本机账本。";
+      syncBase = null; captureStorageBaseline(); invalidateForNewLedger(); renderLedgerNotice();
+      return { previousIdentity, previousBase, local, appliedIdentity, epoch, baseline: { ...storageBaseline } };
+    });
+    if (!context) return;
+    const { previousIdentity, previousBase, local, appliedIdentity, epoch, baseline } = context;
+    const stale = () => epoch !== syncEpoch || appliedIdentity !== identityRaw();
+    const rollback = () => withStorageLock(() => {
+      if (stale()) return false;
+      if (localStorage.getItem(DATA_KEY) !== baseline.data || localStorage.getItem(SNAPSHOT_KEY) !== baseline.snapshot) {
+        showLedgerIssue("配对期间本机账本已变动，请保留草稿后重新载入核对。"); return false;
+      }
+      try { localStorage.setItem(IDENTITY_KEY, previousIdentity); captureStorageBaseline(); syncBase = previousBase; return true; }
+      catch { showLedgerIssue("配对未完成，身份状态未能恢复。请保留本机账本后重新载入核对。"); return false; }
+    });
+    let committed = false;
+    try {
+      const result = await readCloudRecord();
+      if (stale() || result.kind === "stale") return;
+      if (result.kind === "failed") {
+        if (!await rollback()) return;
+        meta.lastSyncError = result.error;
+        syncBlocked = "配对读取失败，未上传任何账本。原本机账本已保留，请重新配对。";
+        toast("配对未完成，未上传本机账本"); return;
+      }
+      if (!checkWriteBoundary()) { await rollback(); return; }
+      const incoming = result.kind === "data" ? clone(result.data) : { version: 1, orders: [] };
+      const conflicts = conflictingIds(incoming);
+      if (conflicts.length && (!preserveConflict(incoming, "配对时存在不同记录")
+        || !confirm(`有 ${conflicts.length} 单与云端不同。已保留两份恢复副本。\n确定采用云端对应记录并继续配对？取消会恢复原身份。`))) {
+        if (await rollback()) syncBlocked = "配对已暂停，两份记录可在设置中导出核对。";
+        return;
+      }
+      const ids = new Set(incoming.orders.map((o) => o.id));
+      const extra = local.orders.filter((o) => !ids.has(o.id)); incoming.orders.push(...extra);
+      syncBlocked = "";
+      if (!await setLedger(incoming, extra.length || result.kind === "empty" ? new Date().toISOString() : result.updatedAt,
+        { meta: { lastSyncedAt: null, lastSyncError: "" } })) { await rollback(); return; }
+      committed = true;
+      if (stale()) return;
+      rememberSyncBase(result.kind === "data" ? result.data : { version: 1, orders: [] }, appliedIdentity);
+      scheduleSync();
+      toast(extra.length ? `已配对，并找回本机 ${extra.length} 单` : "同步码已导入"); renderSettings();
+    } catch (error) {
+      if (committed) { showLedgerIssue("账本已保存，界面状态暂时无法更新，请重新载入核对。"); return; }
+      if (await rollback()) {
+        syncBlocked = "配对未完成，未上传本机账本，请检查同步码后重试。";
+        toast(error.message || "同步码无效");
+      }
+    } finally {
+      if (pairingEpoch === epoch) pairingEpoch = null;
+      if (epoch === syncEpoch) { renderLedgerNotice(); renderSyncBadge(); }
+    }
+  }
+
+  function resetLocalIdentity() { return withStorageLock(resetLocalIdentityLocked); }
+  function resetLocalIdentityLocked() {
+    if (!checkWriteBoundary()) return;
+    if (!confirm("重置后本机将生成全新空账本（云端旧账不受影响，但没有同步码就再也连不上）。\n确定重置？")) return;
+    if (!confirm("再次确认：当前账本将替换为空账本。请先导出备份并保留旧同步码，确定？")) return;
+    if (!ensureLocalSnapshot()) return;
+    const previousIdentity = identityRaw();
+    const previousBase = syncBase;
+    ++syncEpoch; pairingEpoch = null;
+    syncPending = false; clearTimeout(syncTimer);
+    try {
+      window.luhuoSync.resetIdentity();
+      captureStorageBaseline();
+      syncBlocked = ""; syncBase = null;
+      if (!setLedgerNow({ version: 1, orders: [] }, null,
+        { meta: { lastSyncedAt: null, lastSyncError: "", filter: "在途" } })) {
+        localStorage.setItem(IDENTITY_KEY, previousIdentity); syncBase = previousBase; captureStorageBaseline(); return;
+      }
+      currentFilter = "在途";
+      render(); renderSettings(); toast("已重置为新账本");
+    } catch {
+      try { localStorage.setItem(IDENTITY_KEY, previousIdentity); captureStorageBaseline(); } catch { /* Remain blocked. */ }
+      showLedgerIssue("重置未完成，原账本仍保留。请检查本机存储后重新载入。");
+    }
   }
 
   function exportJson() {
@@ -2827,15 +3358,15 @@
 
   function importJson(file) {
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
         const parsed = JSON.parse(reader.result);
+        const problem = ledgerProblem(parsed, true);
+        if (problem) { toast(problem); return; }
         const incoming = normalizeData(parsed);
         if (!confirm(`导入 ${incoming.orders.length} 单，覆盖当前账本（${data.orders.length} 单）？\n建议先导出备份。`)) return;
-        data = incoming;
-        // v38：导入也是整本覆盖 —— 代次 +1、手改锁与状态提示首判记号（含详情行）一起作废（报告 B9）。
-        invalidateForNewLedger();
-        saveData();
+        if (localIssue && !preserveConflict(incoming, "导入修正版本前的本机原数据")) return;
+        if (!await setLedger(incoming, new Date().toISOString(), { sync: true, recovery: true })) return;
         toast("导入完成");
       } catch {
         toast("文件格式不对，导入失败");
@@ -2845,6 +3376,48 @@
   }
 
   // ---- 视图切换 / toast ----
+  const modalOpeners = new Map();
+  const modalStack = [];
+
+  function topModal() {
+    const id = [...modalStack].reverse().find((name) => $(name).classList.contains("show"));
+    return id ? $(id) : $$(".modal.show").at(-1);
+  }
+
+  function refreshModalAccess() {
+    const top = topModal();
+    $$("main, header, .tabbar, #fab").forEach((node) => { node.inert = !!top; });
+    $$(".modal").forEach((node) => {
+      node.inert = !!top && node !== top;
+      node.setAttribute("aria-hidden", node.classList.contains("show") ? "false" : "true");
+    });
+  }
+
+  function openModal(selector) {
+    const modal = $(selector);
+    modalOpeners.set(selector, document.activeElement);
+    const index = modalStack.indexOf(selector); if (index >= 0) modalStack.splice(index, 1);
+    modalStack.push(selector); modal.classList.add("show"); refreshModalAccess();
+    renderLedgerNotice();
+    const first = [...modal.querySelectorAll("input, select, textarea, button")].find((node) => !node.disabled && node.getClientRects().length);
+    if (first) first.focus({ preventScroll: true });
+  }
+
+  function closeModal(selector) {
+    $(selector).classList.remove("show");
+    const index = modalStack.indexOf(selector); if (index >= 0) modalStack.splice(index, 1);
+    refreshModalAccess();
+    const opener = modalOpeners.get(selector); modalOpeners.delete(selector);
+    if (opener && opener.isConnected && opener.tabIndex >= 0 && !opener.closest("[inert]") && opener.getClientRects().length) opener.focus({ preventScroll: true });
+    else if (!topModal()) $("#fab").focus({ preventScroll: true });
+  }
+
+  function dismissModal(modal) {
+    const close = { formModal: closeForm, payModal: closePayForm, batchModal: closeBatchModal,
+      baodanModal: closeBaodan, settingsModal: closeSettings };
+    if (modal && close[modal.id]) close[modal.id]();
+  }
+
   function switchView(view) {
     $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + view));
     $$(".tabbar button").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
@@ -2862,9 +3435,9 @@
 
   function openSettings() {
     renderSettings();
-    $("#settingsModal").classList.add("show");
+    openModal("#settingsModal");
   }
-  function closeSettings() { $("#settingsModal").classList.remove("show"); }
+  function closeSettings() { closeModal("#settingsModal"); }
 
   // ---- 表单下拉 ----
   function fillSelect(sel, options, def) {
@@ -2880,6 +3453,52 @@
 
   // ---- 事件绑定 ----
   function bind() {
+    const modalTitles = { formModal: "formTitle", payModal: "payTitle", batchModal: "batchTitle", baodanModal: "baodanTitle", settingsModal: "settingsTitle" };
+    $$(".modal").forEach((modal) => {
+      modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", modalTitles[modal.id]); modal.tabIndex = -1;
+      const title = modal.querySelector("h2"); if (title && !title.id) title.id = modalTitles[modal.id];
+      if (modal.id !== "settingsModal") {
+        const errorLine = document.createElement("p"); errorLine.className = "save-error";
+        errorLine.hidden = true; errorLine.setAttribute("role", "status");
+        title.insertAdjacentElement("afterend", errorLine);
+      }
+    });
+    refreshModalAccess();
+    $("#reloadLedgerBtn").addEventListener("click", () => {
+      if (topModal() && !confirm("重新载入会关闭当前草稿，请先复制需要保留的内容。继续？")) return;
+      window.location.reload();
+    });
+    $("#retrySyncBtn").addEventListener("click", () => syncBlocked.includes("配对") ? applySyncCodeFromForm() : pullFromCloud());
+    $("#noticeExportBtn").addEventListener("click", () => localIssue ? exportRecovery() : exportJson());
+    $("#exportRecoveryBtn").addEventListener("click", exportRecovery);
+    $("#restoreSnapshotBtn").addEventListener("click", async () => {
+      let snapshot;
+      try { snapshot = JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || "null"); } catch { return; }
+      if (!snapshot || snapshot.owner !== identityOwner() || ledgerProblem(snapshot.data)) return;
+      if (!confirm("采用最近一次完整保存的账本？当前不同的原始数据会保留为核对副本。")) return;
+      if (!preserveConflict(snapshot.data, "采用最近完整快照前的不同数据")) return;
+      if (await setLedger(normalizeData(snapshot.data), snapshot.updatedAt, { recovery: true })) {
+        syncBlocked = "已恢复完整快照，请核对后重试同步。"; renderSettings(); renderLedgerNotice(); toast("已采用完整快照，原始差异副本仍保留");
+      }
+    });
+    window.addEventListener("storage", (event) => {
+      if (event.storageArea !== localStorage || (event.key !== null && ![DATA_KEY, SNAPSHOT_KEY, IDENTITY_KEY].includes(event.key))) return;
+      if (!storageBaseline || (identityRaw() === storageBaseline.identity && localStorage.getItem(DATA_KEY) === storageBaseline.data && localStorage.getItem(SNAPSHOT_KEY) === storageBaseline.snapshot)) return;
+      ++syncEpoch; pairingEpoch = null; invalidateForNewLedger();
+      showLedgerIssue("其他页面已更换或更新账本。本页已停止写入，请先保留草稿，再重新载入。");
+    });
+    document.addEventListener("keydown", (event) => {
+      const modal = topModal(); if (!modal) return;
+      if (event.key === "Escape") { event.preventDefault(); dismissModal(modal); return; }
+      if (event.key !== "Tab") return;
+      const nodes = [...modal.querySelectorAll("button, input, select, textarea, a[href], [tabindex]")]
+        .filter((node) => !node.disabled && node.tabIndex >= 0 && node.getClientRects().length);
+      const first = nodes[0], last = nodes.at(-1);
+      if (!first) { event.preventDefault(); modal.focus(); return; }
+      if (event.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+    });
     $$(".tabbar button").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
     $("#settingsBtn").addEventListener("click", openSettings);
     $("#fab").addEventListener("click", () => openForm(null));
@@ -2889,7 +3508,7 @@
       if (!btn) return;
       currentFilter = btn.dataset.filter;
       meta.filter = currentFilter;
-      persist();
+      persistMeta();
       renderList();
     });
 
@@ -2972,6 +3591,7 @@
     $("#baodanClose").addEventListener("click", closeBaodan);
     $("#baodanCopy").addEventListener("click", copyBaodan);
     $("#baodanAll").addEventListener("click", () => {
+      markBaodanChanged();
       const all = baodanCandidates.length > 0 && baodanSel.size === baodanCandidates.length;
       baodanSel = all ? new Set() : new Set(baodanCandidates.map((o) => o.id));
       renderBaodan();
@@ -2979,6 +3599,7 @@
     $("#baodanList").addEventListener("change", (ev) => {
       const cb = ev.target.closest("input[data-bd]");
       if (!cb) return;
+      markBaodanChanged();
       if (cb.checked) baodanSel.add(cb.dataset.bd); else baodanSel.delete(cb.dataset.bd);
       renderBaodan();        // 勾选一变：件数/种数/报单文本一起重算
     });
@@ -2987,7 +3608,8 @@
     //   change = 用户真的改完了（blur / 回车）：写账本（若值变了）→ 重算 → **重新复制剪贴板** → toast，
     //            这一套在 commitBaodanTracking 里。为什么必须是 change 而不是 input：打字途中的半截单号
     //            会一次次写进账本、还每次重算文本；而复制挂在 change 上，剪贴板才不会停在打开面板那一刻的旧文本
-    $("#baodanTracking").addEventListener("input", () => renderBaodan());
+    $("#baodanTracking").addEventListener("input", () => { markBaodanChanged(); renderBaodan(); });
+    $("#baodanText").addEventListener("input", markBaodanChanged);
     $("#baodanTracking").addEventListener("change", () => commitBaodanTracking());
     $("#batchCancel").addEventListener("click", closeBatchModal);
     $("#batchSubmit").addEventListener("click", submitBatch);
@@ -3006,7 +3628,7 @@
     });
 
     $$(".modal").forEach((m) => m.addEventListener("click", (ev) => {
-      if (ev.target === m) m.classList.remove("show");
+      if (ev.target === m) dismissModal(m);
     }));
 
     // 报表
@@ -3028,64 +3650,13 @@
       const ok = await writeClipboard(box.value, box);
       toast(ok ? "同步码已复制" : "复制失败，请手动全选复制");
     });
-    $("#applySyncBtn").addEventListener("click", async () => {
-      const code = $("#applySyncInput").value.trim();
-      if (!code) { toast("先粘贴另一台设备的同步码"); return; }
-      if (!confirm("导入同步码后，本机将与对方共用同一本账。\n首次同步以最新的一份数据为准，继续？")) return;
-      try {
-        syncEpoch += 1;                       // 作废旧身份在途的同步
-        invalidateForNewLedger();             // v38：换身份＝账本代次也换代（旧编辑会话/报单会话一并失效）
-        syncPending = false; clearTimeout(syncTimer);
-        const epoch = syncEpoch;              // v38：这一趟配对自己的代次（下面拉取期间可能又被换过）
-        const localOnly = data.orders.slice(); // 本机订单先留底，导入后按 id 并回，防覆盖丢失
-        window.luhuoSync.applySyncCode(code);
-        meta.updatedAt = null;
-        meta.lastSyncedAt = null;
-        meta.lastSyncError = "";
-        persist();
-        // v27：这条路的合并语义由下面那段 localOnly 负责（而且上面已经问过用户了），
-        // 所以这次拉取不弹「并入还是放弃」（suppressPullMerge，见它的声明）
-        suppressPullMerge = true;
-        try { await pullFromCloud(); } finally { suppressPullMerge = false; }
-        // v38（报告 B1）：拉取期间身份又被换代（用户又按了一次配对、或重置了身份）⇒ 这次配对的
-        // 收尾（把本机留底的旧单并回、保存、报「已配对」）已经没有意义，原样丢掉——
-        // 原来这里是无条件继续，等于把旧身份的单并进新账本。
-        if (epoch !== syncEpoch) return;
-        syncEpoch += 1;
-        // 合并：本机有、云端没有的订单不丢
-        const ids = new Set(data.orders.map((o) => o.id));
-        let recovered = 0;
-        localOnly.forEach((o) => {
-          if (!ids.has(o.id)) { data.orders.push(o); recovered += 1; }
-        });
-        render();
-        renderSettings();
-        if (recovered > 0) { saveData(); toast(`已配对，并找回本机 ${recovered} 单`); }
-        else { scheduleSync(); toast("同步码已导入"); }
-      } catch (error) {
-        toast(error.message || "同步码无效");
-      }
-    });
+    $("#applySyncBtn").addEventListener("click", applySyncCodeFromForm);
     $("#exportBtn").addEventListener("click", exportJson);
     $("#importFile").addEventListener("change", (ev) => {
       if (ev.target.files[0]) importJson(ev.target.files[0]);
       ev.target.value = "";
     });
-    $("#resetIdentityBtn").addEventListener("click", async () => {
-      if (!confirm("重置后本机将生成全新空账本（云端旧账不受影响，但没有同步码就再也连不上）。\n确定重置？")) return;
-      if (!confirm("再次确认：旧账本数据将无法从本机再访问，确定？")) return;
-      syncEpoch += 1;
-      invalidateForNewLedger();   // v38：重置＝换代（代次 +1、手改锁与状态提示首判记号一并作废）
-      syncPending = false; clearTimeout(syncTimer);
-      window.luhuoSync.resetIdentity();
-      data = { version: 1, orders: [] };
-      meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
-      currentFilter = "在途";
-      persist();
-      render();
-      renderSettings();
-      toast("已重置为新账本");
-    });
+    $("#resetIdentityBtn").addEventListener("click", resetLocalIdentity);
     $("#closeSettings").addEventListener("click", closeSettings);
 
     document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushPendingSync(); });
