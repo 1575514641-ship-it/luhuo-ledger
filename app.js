@@ -85,7 +85,9 @@
   // v26：这一次打开 #payModal 是「回款」（在途单 → 写金额+日期并置已回款）还是「改回款」
   // （已回款的单 → 只改 income/incomeDate）。由 openPayForm 按记录当前 status 决定，closePayForm 复位。
   let payEditMode = false;
+  let payBaseline = null;    // 04 期：打开回款弹窗时的控件基线（判"有没有改过"）
   let batchItems = [];        // 批量结算弹窗的勾选状态：{ id, name, cost, checked }
+  let batchBaseline = null;   // 04 期：打开批量结算弹窗时的控件基线（含勾选态）
   // v28 报单（寄出后给收货商报「型号 颜色 数量」）：范围在打开面板那一刻定死，
   // 勾选与手改文案都只活在内存里——不落库、不进同步包、关掉即丢（见 openBaodan 上方说明）
   let baodanScope = null;     // { type:"batch"|"filter", batchId, title }
@@ -428,20 +430,100 @@
       .map((input) => [input.name || input.id, input.value, input.checked, input.disabled]));
   }
 
-  function withFormIntent(root, session, currentSession, action) {
+  // ---- 03 期：提交那一刻的"表单读数快照" ----
+  // 每个格子存成 { value, disabled } 两字段 —— 与 `validAmountInputs` 需要的形状一致，
+  // 所以拿到写锁后如果发现表单已被重新打开，可以直接把它**当成 `f` 用**，不必改任何读取点。
+  // v38 会话快照（内存、不落库）：它记的是"打开表单那一刻的表单是什么样"——
+  // 04 期的离开保护用它判"有没有真的改动"（改过才提醒，没改过不问）。
+  let formBaseline = null;
+
+  let formOpenSerial = 0;   // 每次 openForm 自增：用来判"这张表单还是不是提交时那一张"
+  function formIntentSnapshot(f) {
+    const snap = {};
+    ["goods", "cost", "fee", "date", "qty", "channel", "status", "note", "tracking"].forEach((k) => {
+      snap[k] = { value: f && f[k] ? String(f[k].value ?? "") : "", disabled: !!(f && f[k] && f[k].disabled) };
+    });
+    snap.serial = formOpenSerial;
+    // 表单模式与在编辑哪一条也是**提交那一刻**的事实：收入单与货单落库形态不同，
+    // 排到锁之后才读 live 值的话，中途被重新打开的表单会把这一笔的落库形态换掉。
+    snap.formKind = formKind;
+    snap.editingId = editingId;
+    snap.prefillPlatform = prefillPlatform;
+    // 04 期：新单的**候选 orderId** 也在这里定下来——草稿创建时分配、正式提交沿用它，
+    // 这样同一份草稿被提交两次能被本机证据识别出来（见 draftGateForSubmit）。
+    snap.orderId = (editingId || !draftState) ? uid() : String(draftState.orderId || uid());
+    // 04 二轮审查第 2/5 项：把「提交那一刻这份新单是否认领了草稿、认领的是哪一份」也抓进快照。
+    // 草稿守门全部按这份快照判——等待写锁期间表单被重开（reopened）也不会误用新表单的草稿态，
+    // 更不会漏掉旧提交本该做的草稿分类。
+    const claimedDraft = !editingId && draftState && draftState.mode === "own" && draftState.claimed;
+    snap.draftClaimed = !!claimedDraft;
+    if (claimedDraft) {
+      snap.draftOwner = String(draftState.owner || "");
+      snap.draftId = String(draftState.draftId);
+      snap.draftRevision = Number(draftState.revision) || 0;
+    }
+    return snap;
+  }
+
+  // 「原生那几条」的 JS 版（非负、最多两位小数）。为什么必须补：`#formSaveNext` 是 type="button"，
+  // 点它**不走** form 的原生校验（required/min/step 全不生效），于是"保存"与"保存并继续"两条路的
+  // 校验强度就不一样了。02 期的寄出面板与批量结算都补过同样的 JS 校验，这里补齐让两条路同强度。
+  // 禁用的格子跳过——收入模式下邮费/数量是隐藏且禁用的，取库里的定值（与 validAmountInputs 同一条规矩）。
+  function amountTextProblem(f, pairs) {
+    for (const [key, label] of pairs) {
+      const ctl = f && f[key];
+      if (!ctl || ctl.disabled) continue;
+      const raw = String(ctl.value ?? "").trim();
+      if (raw === "") continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return `${label}填写有误，请修改后再保存`;
+      if (n < 0) return `${label}不能是负数`;
+      if (Math.abs(n * 100 - Math.round(n * 100)) > 1e-9) return `${label}最多两位小数`;
+    }
+    return "";
+  }
+
+  function withFormIntent(root, session, currentSession, action, serial, serialNow, precheck) {
     const state = controlState(root);
-    return withLedgerWrite(() => {
-      if (session !== currentSession() || state !== controlState(root)) {
-        toast("等待期间输入已变化，本次没有保存，请重新确认"); return false;
-      }
-      return action();
+    // 04 审查第 5 项：原来这里套的是 withLedgerWrite（它自己先跑一遍 checkWriteBoundary），
+    // 于是内层那份草稿 precheck **永远到不了** —— 外层旧基线一拒就直接返回了。
+    // 现在只取一次锁，把草稿归属分类交给 withLedgerWriteNow 在**通用旧基线之外、之前**执行。
+    return withStorageLock(() => {
+      // 03 期：表单在等待写锁期间被**重新打开**过（serial 变了）时不按"输入已变化"拒绝——
+      // 用户点保存那一刻的值已经抓成了快照（见 formIntentSnapshot），要写的正是那一份；不这么做的话
+      // 下面那条判据会把"已经点过保存的那一单"整笔丢掉（C20 实测：提交后立刻再点一次「记一单」
+      // 就会丢第一单；同一时序在纯 v39 上同样复现，属既有缺陷，不是 03 期引入的）。
+      // 不传 serial 的两条路（回款 / 批量结算）行为与从前**一字不差**。
+      const reopened = serial !== undefined && typeof serialNow === "function" && serialNow() !== serial;
+      // 04 二轮审查第 5 项收尾：reopened 的那次提交**也照跑**草稿分类——判据全部来自提交那一刻的
+      // 快照（draftClaimed/draftId/draftRevision/orderId），不会碰新表单的草稿态。漏跑它就等于
+      // "重开表单可以把已提交的草稿再记一笔"，且只会听到通用基线提示、没有草稿分类。
+      const gate = precheck;
+      return withLedgerWriteNow(() => {
+        if (session !== currentSession()) {
+          toast("等待期间输入已变化，本次没有保存，请重新确认"); return false;
+        }
+        if (!reopened && state !== controlState(root)) {
+          toast("等待期间输入已变化，本次没有保存，请重新确认"); return false;
+        }
+        return action();
+      }, gate);
     });
   }
 
-  function withLedgerWrite(action) { return withStorageLock(() => withLedgerWriteNow(action)); }
+  function withLedgerWrite(action, precheck) { return withStorageLock(() => withLedgerWriteNow(action, precheck)); }
 
-  function withLedgerWriteNow(action) {
+  function withLedgerWriteNow(action, precheck) {
     if (pairingEpoch !== null) { toast("正在配对，请稍候再保存"); return false; }
+    // 04 期：草稿归属/重复提交的守门。它是**唯一**在"通用旧基线拒绝"之前跑的自定义检查——
+    // 因为"这份草稿其实已经提交过"与"账本被别处改过"要分别给出不同的提示、不同的后续动作。
+    if (typeof precheck === "function") {
+      const verdict = precheck();
+      if (verdict && verdict.block) {
+        toast(verdict.message || "这一份草稿不能继续提交，请到账本里核对");
+        return false;
+      }
+    }
     if (!checkWriteBoundary()) return false;
     const problem = ledgerProblem(data);
     if (problem) { toast(problem); renderLedgerNotice(); return false; }
@@ -924,6 +1006,10 @@
     ledgerViewIndex = null;
     renderDash();
     renderList();
+    // 01 期：查账面板开着时跟着重算（从结果里点了「编辑 / 回款」保存成功 → saveData → render，
+    // 结果按最新数据重算：已不匹配的单如实移出，查询条件与面板内的位置都保持不变）。
+    // 面板没开时它第一行就返回，对既有渲染路径零影响。
+    renderLookup();
     renderReport();
     renderSyncBadge();
     renderLedgerNotice();
@@ -1236,9 +1322,18 @@
 
   // soloBatch：这一单的批次只剩它自己（页面上不显示「一起寄出」表头），卡片里补一句归属，
   // 免得「退出本批」这个按钮看起来没有来由
-  function orderCardHtml(o, extraClass, soloBatch) {
+  // opts（01 期新增，可选）：
+  //   · opts.lookup=true —— 这张卡片画在**查账面板**里。查账是只读查找视图、范围只是"命中集合"，
+  //     所以**不渲染**「改本批邮费 / 退出本批」这两个批次写入口（规格：查账模式不提供范围含糊的
+  //     批量操作，要整批操作就退出查账回账本页走明确完整范围）。其余动作（回款/改回款、再来一单、
+  //     编辑、删除）都是**单笔**语义、范围无歧义，照常保留。
+  //   · opts.hit=false —— 这一张是「查看整批」展开后补出来的**未命中**成员，标一句免得看错。
+  // 不传 opts 时行为与以前一字不差（账本页、既有测试全走这条）。
+  function orderCardHtml(o, extraClass, soloBatch, opts) {
     const settled = isSettled(o);
     const profit = displayedAmount(orderProfit(o));
+    const inLookup = !!(opts && opts.lookup);
+    const missFlag = inLookup && opts.hit === false ? `<div class="lk-flag">未命中本次查询（属于这一批）</div>` : "";
     // 已回款但金额未填，不在卡片上把未知回款显示成确定亏损。
     // 只改显示；旧自留、统计公式和账本字段保持原样。
     const pendingIncome = o.status === "已回款" && !hasIncome(o);
@@ -1247,8 +1342,11 @@
     // （batchProfitInfo 的三条禁入都过了）。单成员批次没有表头也没有「分项」，散单不涉及，
     // 一律保持原样（利润只是展示）。mates 按**数据全量**取——被筛选只显示部分成员时，
     // 分摊仍按整批算（页面显示几个不影响钱）。
+    // 查账模式下不做行内利润编辑：那是**整批**口径的分摊写入（改一项会连带重算同一批其他项），
+    // 属于"整批操作"，规格要求这类入口只在明确完整范围里给。渲染成死按钮比不给更糟（点了没反应），
+    // 所以这里只按只读文本显示利润，退出查账回账本页就能改。
     let profitEditable = false;
-    if (showProfit && o.batchId && !soloBatch) {
+    if (showProfit && o.batchId && !soloBatch && !inLookup) {
       const mates = batchMembers(o.batchId);
       if (mates.length > 1) {
         const pg = batchGroups().get(o.batchId);
@@ -1270,7 +1368,7 @@
     else if (o.status === "已回款") actions.push(`<button class="act primary" data-act="pay" data-id="${escapeHtml(o.id)}">改回款</button>`);
     actions.push(`<button class="act" data-act="dup" data-id="${escapeHtml(o.id)}">再来一单</button>`);
     actions.push(`<button class="act" data-act="edit" data-id="${escapeHtml(o.id)}">编辑</button>`);
-    if (o.batchId) {
+    if (o.batchId && !inLookup) {
       // v24：批次的金额入口**常驻在卡片上**（与批次表头那个 .bh-act 走同一个动作）。
       // v23 只有表头一条路，于是两种情形下用户根本点不到：①单成员批次不渲染表头；
       // ②筛选把那一批藏起来时表头也不在页面上。卡片上的入口按 o.batchId 渲染，
@@ -1279,6 +1377,12 @@
       actions.push(`<button class="act" data-act="batchfee" data-batch="${escapeHtml(o.batchId)}">改本批邮费</button>`);
       actions.push(`<button class="act" data-act="unbatch" data-id="${escapeHtml(o.id)}">退出本批</button>`);
     }
+    // 02 期：补寄出信息。散单与批内单都能点，范围分别落在「这一单」与「这一整批」上——
+    // 面板会把成员完整列出来（整批几单写得明明白白），所以它**不是**"范围含糊的批量操作"：
+    // 规格点名要挡的是"范围跟着当前筛选/勾选走"的那种。因此**查账模式也给**这个入口
+    //（03 的接缝场景正是"搜索之后打开寄出面板"）；而「批量结算 / 报单 / 改本批邮费 / 退出本批」
+    // 在查账里仍然一个都不给（见上面的 inLookup 分支与 lookup 模块的说明）。
+    actions.push(`<button class="act" data-act="ship" data-id="${escapeHtml(o.id)}">补寄出信息</button>`);
     actions.push(`<button class="act danger" data-act="del" data-id="${escapeHtml(o.id)}">删除</button>`);
     // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
     // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
@@ -1299,6 +1403,7 @@
           <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
         </div>
       </div>
+      ${missFlag}
       <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
       <div class="order-money">
         <span>垫付 <b>${money(o.cost)}</b></span>
@@ -1308,6 +1413,536 @@
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
       <div class="order-actions">${actions.join("")}</div>
     </div>`;
+  }
+
+  // ================= 01 期：查账（搜索 + 年月日定位） =================
+  // 这一整块是**只读查找视图**，与账本页的筛选/写入范围彻底分开，三条边界写在最前面：
+  //   ① 条件（关键词/状态/日期）只活在本次会话内存里——不落库、不进同步包、**不写 meta.filter**
+  //      （账本页的筛选 chip 走的是 persistMeta，查账这一套刻意不走）。退出查账后账本页的筛选、
+  //      批次展开记忆与滚动位置一个字节都不变，因为整块代码从来没碰过它们。
+  //   ② 渲染走自己的 #lookupList，**不碰 filteredOrders()**——那个函数的含义仍然是「账本页当前
+  //      筛选」，报单面板（openBaodan type:"filter"）与批次局部重绘都靠它。搜索命中集合**绝不能**
+  //      被当成写入范围，所以这里既不提供批量结算、也不提供报单（要整批操作就退出查账）。
+  //   ③ 一次业务写都没有：不调 saveData/persist/scheduleSync，不开任何写入弹窗之外的写路径。
+  //      （用户仍可从结果里点「编辑 / 回款」——那是用户显式发起的单笔业务写，走的是原有守门。）
+  const lookup = {
+    open: false,
+    q: "",                  // 关键词原文（分词与大小写在判据里做，展示仍用原文）
+    status: "全部",          // 全部 / 在途 / 已回款
+    dateMode: "all",        // all | y | ym | ymd | bad（bad＝日期待核对：date 解析不出真日历日）
+    y: 0, m: 0, d: 0,
+    panel: false,           // 日期导航面板是否展开
+    level: "year",          // 面板当前层：year | month | day
+    expanded: new Set(),    // 已「查看整批」的批次 id（只活在本面板/本次会话，与 expandedBatches 分开）
+    composing: false,       // 中文组词中：组词期间不重绘（免得打断输入法候选）
+    // 05 期：面板的两个页签（查账 / 核对清单），以及"从核对项精确跳到某一单/某一整批"的焦点
+    tab: "search",
+    focusId: "",
+    focusBatchId: "",      // 05 二轮审查：批次类核对项用它把**整批成员**精确带到眼前，不是"清空条件看全部"
+  };
+  const LOOKUP_STATUSES = ["全部", "在途", "已回款"];
+
+  // 关键词分词：按空白切、去掉空段、统一小写。多个词要求**每一段都命中**（AND），可落在不同字段上。
+  function lookupTokens() {
+    return String(lookup.q || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  }
+
+  // 命中判据：商品名 / 快递单号 / 备注 / 渠道 四个字段的**包含**匹配（忽略大小写与首尾空白）。
+  // 单号过 cleanTracking：账本里存的本来就是规范值，这里再过一道只为对齐"界面上显示的那个值"。
+  // 暂不做金额、拼音、AI 猜测（规格）。页面里这些值一律经 escapeHtml 作文本显示。
+  function lookupHit(order) {
+    const tokens = lookupTokens();
+    if (tokens.length === 0) return true;
+    const fields = [order.name, cleanTracking(order.tracking), order.note, order.channel]
+      .map((v) => String(v === null || v === undefined ? "" : v).toLowerCase());
+    return tokens.every((t) => fields.some((f) => f.includes(t)));
+  }
+
+  // 日期范围判据。分类全部由现有 order.date 现算派生，**不创建年份/月度业务字段**。
+  // 解析用项目现成的 parseDate（它已经带真日历回读校验：2026-02-30 这种进位日返回 null），
+  // 所以跨年、跨月、闰日都由同一套口径兜住，不会另算一套。
+  // 日期无效/缺失的旧单**不替换成今天、也不丢掉**——它们单独进「日期待核对」那一档。
+  function lookupDateHit(order) {
+    if (lookup.dateMode === "all") return true;
+    const dt = parseDate(order.date);
+    if (lookup.dateMode === "bad") return !dt;
+    if (!dt) return false;
+    if (lookup.dateMode === "y") return dt.getFullYear() === lookup.y;
+    if (lookup.dateMode === "ym") return dt.getFullYear() === lookup.y && dt.getMonth() + 1 === lookup.m;
+    if (lookup.dateMode === "ymd") {
+      return dt.getFullYear() === lookup.y && dt.getMonth() + 1 === lookup.m && dt.getDate() === lookup.d;
+    }
+    return true;
+  }
+
+  // 关键词＋日期先筛（**不含状态**）——状态 chip 的计数用这一份基底：
+  // 它回答的正是「点这个状态会看到几单」。
+  function lookupBase() {
+    return data.orders.filter((o) => lookupDateHit(o) && lookupHit(o));
+  }
+
+  // 关键词＋状态（**不含日期**）——年/月/日三层格子里的计数用这一份基底。
+  // 为什么日期层不能复用 lookupBase：那个已经被"当前日期范围"筛过一次，于是选中 2026-01 之后，
+  // 月份层会显示「2 月 0 单」（真实 2 单）、「看整年」也只剩 1 单——「有记录的日期作标记」当场失效。
+  // 用这一份基底时，格子里的数字仍等于"点下去会看到几单"（日期是唯一再叠上去的条件）。
+  function lookupDateBase() {
+    return data.orders.filter((o) => (lookup.status === "全部" || o.status === lookup.status) && lookupHit(o));
+  }
+
+  // 最终命中集合：基底再叠状态。三个条件取交集（规格）。
+  function lookupMatch() {
+    // 05 期：从核对清单「去查看这一单」进来时，按 **order id** 精确锁定这一单
+    if (lookup.focusId) return data.orders.filter((o) => String(o.id) === String(lookup.focusId));
+    // 05 二轮审查第 1 项：批次类核对项按 **batchId** 精确锁定——结果就是这一批的**全部成员**，
+    // 不是"清空条件后的整本账"（大账本里目标批次可能离当前视窗十万八千里）。
+    if (lookup.focusBatchId) return data.orders.filter((o) => String(o.batchId || "") === String(lookup.focusBatchId));
+    const base = lookupBase();
+    if (lookup.status === "全部") return base;
+    return base.filter((o) => o.status === lookup.status);
+  }
+
+  function lookupDateLabel() {
+    if (lookup.dateMode === "y") return `${lookup.y} 年`;
+    if (lookup.dateMode === "ym") return `${lookup.y}-${pad2(lookup.m)}`;
+    if (lookup.dateMode === "ymd") return `${lookup.y}-${pad2(lookup.m)}-${pad2(lookup.d)}`;
+    if (lookup.dateMode === "bad") return "日期待核对";
+    return "全部日期";
+  }
+
+  // 现算年月日三层的计数：年份 → 月份 → 日期 → 单数，另有「日期待核对」计数。
+  // 年份/月份/日期的存在性完全由现有 order.date 派生（规格：不建年度/月度字段）。
+  function lookupDateCounts() {
+    const years = new Map();
+    let bad = 0;
+    lookupDateBase().forEach((o) => {
+      const dt = parseDate(o.date);
+      if (!dt) { bad++; return; }
+      const y = dt.getFullYear(), mo = dt.getMonth() + 1, day = dt.getDate();
+      if (!years.has(y)) years.set(y, { total: 0, months: new Map() });
+      const yRec = years.get(y);
+      yRec.total += 1;
+      if (!yRec.months.has(mo)) yRec.months.set(mo, { total: 0, days: new Map() });
+      const mRec = yRec.months.get(mo);
+      mRec.total += 1;
+      mRec.days.set(day, (mRec.days.get(day) || 0) + 1);
+    });
+    return { years, bad };
+  }
+
+  // 纯状态设置（不渲染）：渲染由调用方显式做，免得下钻时连渲染两遍。
+  function lookupSetDate(mode, y, m, d) {
+    lookup.dateMode = mode;
+    lookup.y = mode === "all" || mode === "bad" ? 0 : y || 0;
+    lookup.m = mode === "ym" || mode === "ymd" ? m || 0 : 0;
+    lookup.d = mode === "ymd" ? d || 0 : 0;
+  }
+
+  // 日期导航面板：年 → 月 → 日三层，每层都能「直接看整层」，**不需要按几十次「上一月」**
+  // （旧年份直接点在列表里选；只列有记录的年份，另加今年兜底）。
+  function renderLookupDates() {
+    const box = $("#lookupDates");
+    if (!box) return;
+    if (!lookup.panel) { box.hidden = true; box.innerHTML = ""; return; }
+    box.hidden = false;
+    const { years, bad } = lookupDateCounts();
+    const sel = (on) => (on ? " on" : "");
+    const cell = (label, n, on, attr) => `<button type="button" class="lk-dcell${sel(on)}${n > 0 ? "" : " zero"}" ${attr}>`
+      + `<span>${escapeHtml(label)}</span><span class="lk-n">${n} 单</span></button>`;
+    const parts = [];
+
+    // 每一层都先给这两个「跳出去」的口子：回全部日期 / 看日期待核对那一档
+    const head = (label) => `<div class="lk-dnav">
+      <span class="lk-dlabel">${escapeHtml(label)}</span>
+      <button type="button" data-lkall="1">全部日期</button>
+      <button type="button" data-lkbad="1">日期待核对${bad > 0 ? `（${bad}）` : ""}</button>
+    </div>`;
+
+    if (lookup.level === "year") {
+      const list = [...years.keys()].sort((a, b) => b - a);
+      // 今年即使一条都没有也给一个格子：用户可能正是要确认「今年还没记」
+      if (!list.includes(new Date().getFullYear())) list.push(new Date().getFullYear());
+      list.sort((a, b) => b - a);
+      parts.push(head("选择年份"));
+      parts.push(`<div class="lk-dgrid">${list.map((y) => cell(`${y} 年`, years.has(y) ? years.get(y).total : 0,
+        lookup.dateMode === "y" && lookup.y === y, `data-lky="${y}"`)).join("")}</div>`);
+      parts.push(`<p class="lk-dnote">数字＝当前关键词/状态下该年的单数；点年份＝看整年，再往下还能选月、选日。</p>`);
+    } else if (lookup.level === "month") {
+      const rec = years.get(lookup.y);
+      parts.push(head(`${lookup.y} 年`));
+      const cells = [];
+      for (let mo = 1; mo <= 12; mo++) {
+        const n = rec && rec.months.has(mo) ? rec.months.get(mo).total : 0;
+        cells.push(cell(`${mo} 月`, n, lookup.dateMode === "ym" && lookup.y === lookup.y && lookup.m === mo, `data-lkm="${mo}"`));
+      }
+      parts.push(`<div class="lk-dgrid">${cells.join("")}</div>`);
+      parts.push(`<div class="lk-dnav"><button type="button" data-lkyear="1">看整年（${rec ? rec.total : 0} 单）</button>`
+        + `<button type="button" data-lkback="year">‹ 换年份</button></div>`);
+    } else {
+      const rec = years.get(lookup.y);
+      const mRec = rec && rec.months.get(lookup.m);
+      // 这个月的天数按**真日历**算（new Date(y, m, 0) 给出上个月最后一天）——闰年 2 月自然是 29 天。
+      // 2 月 30 日这类不存在的日子根本不会出现在格子里（真出现也只能进「日期待核对」）。
+      const days = new Date(lookup.y, lookup.m, 0).getDate();
+      parts.push(head(`${lookup.y}-${pad2(lookup.m)}`));
+      const cells = [];
+      for (let dd = 1; dd <= days; dd++) {
+        const n = mRec && mRec.days.has(dd) ? mRec.days.get(dd) : 0;
+        cells.push(cell(`${dd} 日`, n, lookup.dateMode === "ymd" && lookup.y === lookup.y && lookup.m === lookup.m && lookup.d === dd, `data-lkd="${dd}"`));
+      }
+      parts.push(`<div class="lk-dgrid">${cells.join("")}</div>`);
+      parts.push(`<div class="lk-dnav"><button type="button" data-lkmonth="1">看整月（${mRec ? mRec.total : 0} 单）</button>`
+        + `<button type="button" data-lkback="month">‹ 换月份</button></div>`);
+    }
+    box.innerHTML = parts.join("");
+  }
+
+  // 查账结果里的批次表头：**块内保持与账本页同一个批次口径**（表头那些钱是整批的），
+  // 但把「命中几单 / 整批几单」写在明面上，免得整批金额被误读成"命中这几单的合计"（规格要求）。
+  function lookupBatchHeadHtml(g, hitIds, allMembers) {
+    const hitCount = hitIds.size;
+    const total = allMembers.length;
+    const bits = [`垫付 ${money(g.costCents / 100)}`];
+    if (g.feeCents > 0) bits.push(`邮费 ${money(g.feeCents / 100)}`);
+    if (g.incomeCents > 0) bits.push(`回款 ${money(g.incomeCents / 100)}`);
+    const expanded = lookup.expanded.has(g.id);
+    return `<div class="batch-head lk-bh">
+      <div class="bh-meta-row">
+        <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
+        <span class="lk-hit">命中 ${hitCount} 单／整批 ${total} 单</span>
+      </div>
+      <div class="bh-meta">整批：${bits.join(" · ")}<span class="lk-whole">（整批口径，不是命中这几单的合计）</span></div>
+      <div class="bh-meta-row">
+        <button type="button" class="bh-act" data-lkwhole="${escapeHtml(g.id)}">${expanded
+          ? `只看命中（${hitCount} 单）`
+          : `查看完整批次（${total} 单）`}</button>
+      </div>
+    </div>`;
+  }
+
+  // 结果列表：同批在结果里**只出现一个批次块**（按 batchId 归组，成员跨购入日也只出一块、不复制表头、不造新 ID）。
+  // 命中成员**直接可见、不折叠**（规格：匹配成员在查账模式下直接可见，不藏在默认折叠里）；
+  // 「查看完整批次」再把未命中的成员补在下面，用一行分隔说明，随时可切回"只看命中"。
+  function renderLookupList() {
+    const listBox = $("#lookupList");
+    if (!listBox) return;
+    const sheet = listBox.closest(".sheet");
+    const keepScroll = sheet ? sheet.scrollTop : 0;      // 重绘后把弹窗内的滚动位置还回去
+    const matched = lookupMatch();
+    const groups = batchGroups();
+    const matchedIds = new Set(matched.map((o) => o.id));
+    // 「全部条件都空着」时才叫全部；否则如实说这是"命中"（核对项焦点下也不是"全部"）
+    const isAll = !lookup.focusId && !lookup.focusBatchId
+      && lookupTokens().length === 0 && lookup.status === "全部" && lookup.dateMode === "all";
+
+    const back = $("#lkFocusBack");
+    // 05 期：只有"从核对项跳过来"时才出现返回入口（单笔与整批两种焦点都给）
+    if (back) back.hidden = !lookup.focusId && !lookup.focusBatchId;
+    $("#lookupScope").textContent = lookup.focusId ? "从核对清单定位到这一单"
+      : lookup.focusBatchId ? "从核对清单定位到这一批（含全部成员）"
+      : `${lookup.status} · ${lookupDateLabel()}`;
+    $("#lookupDateBtn").textContent = lookupDateLabel() + (lookup.panel ? " ▴" : " ▾");
+    $("#lookupMeta").innerHTML = matched.length === 0
+      ? `没有找到符合的单子`
+      : (isAll
+        ? `本账本共 <b>${matched.length}</b> 单`
+        : `命中 <b>${matched.length}</b> 单 · 本账本共 ${data.orders.length} 单`);
+
+    if (matched.length === 0) {
+      const hint = lookupTokens().length > 0
+        ? `关键词「${escapeHtml(String(lookup.q).trim().slice(0, 40))}」没搜到；可以试试清空关键词或换日期范围`
+        : "换个状态或日期范围看看";
+      listBox.innerHTML = `<div class="empty">没有找到符合的单子<br><small>${hint}</small></div>`;
+      if (sheet) sheet.scrollTop = keepScroll;
+      return;
+    }
+
+    // 块的分组与排序照账本页同一套（块按下单日期倒序定位，同日保持账本数组里的先后，不制造互相矛盾的比较）。
+    const blocks = [];
+    const blockOf = new Map();
+    matched.forEach((o) => {
+      if (!o.batchId) { blocks.push({ id: "", date: o.date, orders: [o] }); return; }
+      let b = blockOf.get(o.batchId);
+      if (!b) { b = { id: o.batchId, date: o.date, orders: [] }; blockOf.set(o.batchId, b); blocks.push(b); }
+      b.orders.push(o);
+      if (o.date > b.date) b.date = o.date;
+    });
+    blocks.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
+    lookup.expanded.forEach((id) => { if (!groups.has(id)) lookup.expanded.delete(id); });
+
+    const parts = [];
+    blocks.forEach((b) => {
+      if (!b.id) {
+        b.orders.forEach((o) => parts.push(orderCardHtml(o, "", false, { lookup: true, hit: true })));
+        return;
+      }
+      const g = groups.get(b.id);
+      const allMembers = data.orders.filter((o) => o.batchId === b.id);
+      // 只剩一单的批次不撑表头（与账本页同一条规矩）：这一版没有"整批 vs 命中"可讲
+      if (!g || allMembers.length <= 1) {
+        const solo = !!g && allMembers.length === 1;
+        b.orders.forEach((o) => parts.push(orderCardHtml(o, solo ? "in-batch" : "", solo, { lookup: true, hit: true })));
+        return;
+      }
+      const hitIds = new Set(b.orders.map((o) => o.id));
+      parts.push(`<div class="batch-block lk-block">`);
+      parts.push(lookupBatchHeadHtml(g, hitIds, allMembers));
+      b.orders.forEach((o) => parts.push(orderCardHtml(o, "in-batch", false, { lookup: true, hit: true })));
+      if (lookup.expanded.has(b.id)) {
+        const rest = allMembers.filter((o) => !matchedIds.has(o.id));
+        if (rest.length > 0) {
+          parts.push(`<div class="lk-rest">以下 ${rest.length} 单属于这一批但没命中本次查询</div>`);
+          rest.forEach((o) => parts.push(orderCardHtml(o, "in-batch lk-miss", false, { lookup: true, hit: false })));
+        }
+      }
+      parts.push(`</div>`);
+    });
+    listBox.innerHTML = parts.join("");
+    if (sheet) sheet.scrollTop = keepScroll;
+  }
+
+  // 状态 chip：计数只回答「点下去会看到几单」（= 关键词＋日期筛完之后该状态的单数）。
+  function renderLookupStatus() {
+    const box = $("#lookupStatus");
+    if (!box) return;
+    const base = lookupBase();
+    const counts = { "全部": base.length, "在途": 0, "已回款": 0 };
+    base.forEach((o) => { if (counts[o.status] !== undefined) counts[o.status] += 1; });
+    box.innerHTML = LOOKUP_STATUSES.map((s) =>
+      `<button type="button" class="chip${lookup.status === s ? " on" : ""}" data-lkstatus="${s}">${s}${counts[s] > 0 ? ` <b>${counts[s]}</b>` : ""}</button>`).join("");
+  }
+
+  // render() 里统一调它；面板没开时直接返回（对既有渲染路径零影响）。
+  // 判据用 lookup.open 而**不是** `.show`：openLookup 里必须先 openModal 再渲染，但两者之间
+  // 有一瞬是"已打开、类还没加上"；而"面板开着但被表单盖住/inert"时 `.show` 仍在，两种情形都要渲染。
+  function renderLookup() {
+    const modal = $("#lookupModal");
+    if (!lookup.open || !modal) return;
+    // 05 期：核对页签走自己的只读派生渲染，不碰查账那一套条件与结果
+    if (lookup.tab === "check") { renderChecklist(); return; }
+    renderLookupStatus();
+    renderLookupDates();
+    renderLookupList();
+  }
+
+  // 进入查账：每次都从「全部状态、全部日期、无关键词」开始（规格的默认态），不继承上次的条件。
+  function openLookup() {
+    lookup.open = true;
+    lookup.q = "";
+    lookup.status = "全部";
+    lookup.dateMode = "all";
+    lookup.y = 0; lookup.m = 0; lookup.d = 0;
+    lookup.panel = false;
+    lookup.level = "year";
+    lookup.expanded.clear();
+    lookup.tab = "search";                 // 05 期：每次进入都从查账页签开始
+    lookup.focusId = "";
+    lookup.focusBatchId = "";
+    $("#lookupInput").value = "";
+    $("#lookupDates").hidden = true;
+    // 顺序要紧：先 openModal（把 .show 加上、并把焦点放到关键词框），再渲染——
+    // 反过来的话 renderLookup 的判据还没成立，第一次进入会是一片空白。
+    openModal("#lookupModal");
+    renderLookup();
+  }
+
+  // 退出查账：只关自己这一层。**刻意什么都不还原**——因为从来没动过账本页的筛选/展开/位置，
+  // 「还原」这件事是由"不碰"保证的，而不是由一串回写保证的（回写才是会把状态弄丢的那条路）。
+  function closeLookup() {
+    lookup.open = false;
+    lookup.panel = false;
+    lookup.expanded.clear();
+    $("#lookupDates").hidden = true;
+    closeModal("#lookupModal");
+  }
+
+  // ================= 02 期：寄出信息统一补录 =================
+  // 目标：买到先记名称与价格 → 按单寄或合寄 → **寄出后一次补单号和邮费** → 到账再补回款。
+  // 这一块只做"寄出"这一步，四条边界写在前面：
+  //   ① **范围永远是确定的**：入口挂在卡片上，点批内单＝这一整批（全部成员），点散单＝这一单。
+  //      面板里没有"选哪几单"这回事 ⇒ 结构上就不可能部分选批或跨批拆并（不是靠校验挡住的）。
+  //   ② **一次保存＝一个候选账本、一次业务提交**：单号与邮费在任何写入之前一起算完，
+  //      然后只调一次 saveData()。绝不串接两个各自落盘的旧回调（那会出现"写了一半"）。
+  //   ③ **回款那一套一个字不碰**：income / incomeDate / status / batchIncome / batchIncomeShare
+  //      全不在本面板的写入集合里，寄出保存不可能改变回款金额、状态或到账日期。
+  //   ④ **不新增账本字段**：`order.date` 是购入日、`batchDate` 是批次寄出日；散单**没有**单独
+  //      的寄出日期字段，本面板就**不记**散单寄出日——既不新增 schema，也绝不拿下单日顶替
+  //      （这条受限能力记在 docs/ux-phases/02/BLOCKED.md，不当成缺陷偷偷绕过）。
+  let shipTarget = null;      // { kind: "batch"|"loose", batchId?, id? }
+  let shipSession = null;     // { generation, ids, snaps, trackingClear }：打开那一刻的形状
+  let shipBaseHint = "";      // 单号那一格的"现状说明"（与"已点清空"那句互斥显示）
+
+  // 一次打开的目标成员（**全部**，不是子集）：这批就是这批、这单就是这单。
+  function shipMembers() {
+    if (!shipTarget) return [];
+    if (shipTarget.kind === "loose") {
+      const o = data.orders.find((x) => x.id === shipTarget.id);
+      return o && !o.batchId ? [o] : [];
+    }
+    return data.orders.filter((o) => o.batchId === shipTarget.batchId);
+  }
+
+  // 整批邮费按**现有分摊权重与尾差算法**落到成员（与批量结算、恢复默认分摊同源：垫付占比 + 逐分尾差）。
+  // 只算，不写——写发生在 submitShip 的唯一一次提交里。
+  function shipFeePlan(members, feeGiven, feeCents) {
+    if (!feeGiven) return null;
+    const weights = members.map((o) => Math.max(0, toCents(o.cost)));
+    const shares = splitByWeight(feeCents, weights);
+    if (!validShares(shares, feeCents)) return null;
+    return shares;
+  }
+
+  // 已有的单号现状：**混合就是混合**，既不取第一条覆盖、也不自动统一（规格明文禁止）。
+  function shipTrackingState(members) {
+    const values = [...new Set(members.map((o) => cleanTracking(o.tracking)).filter(Boolean))];
+    if (values.length === 0) return { kind: "empty", values };
+    if (values.length === 1) return { kind: "same", values };
+    return { kind: "mixed", values };
+  }
+
+  function openShipForm(target) {
+    const members = (() => {
+      if (target.kind === "loose") {
+        const o = data.orders.find((x) => x.id === target.id);
+        return o && !o.batchId ? [o] : [];
+      }
+      return data.orders.filter((o) => o.batchId === target.batchId);
+    })();
+    if (members.length === 0) { toast("这一单已经不在账本里了，请重新打开"); return; }
+    shipTarget = target.kind === "batch" ? { kind: "batch", batchId: target.batchId } : { kind: "loose", id: target.id };
+    // 会话快照：打开这一刻的成员集合与逐单形状。提交时对表，对不上整笔拒绝（旧面板不许改新账）。
+    shipSession = {
+      generation: ledgerGeneration,
+      ids: members.map((o) => o.id).sort(),
+      snaps: new Map(members.map((o) => [o.id, orderSnap(o)])),
+      // 单号那一格"算不算给了意图"只看**当前值**与"是否点了清空"这两件事，**不看是否打过字**：
+      //   · 填了非空值            ⇒ 写成这个值
+      //   · 点了「清空」小按钮     ⇒ 明确要清空（写成空串）
+      //   · 其余（含"打过字又全删掉"）⇒ 留空＝不改
+      // 早先只用旗标 trackingTouched（只置不复位）是有缺陷的：输入→删空→保存会把空串写进整批每一单，
+      // 而面板文案还写着"留空＝不动"——独立复核抓到这条，已改。
+      trackingClear: false,
+    };
+
+    const isBatch = shipTarget.kind === "batch";
+    const totalCost = members.reduce((a, o) => a + numberValue(o.cost), 0);
+    $("#shipScopeLabel").textContent = isBatch ? `整批 ${members.length} 单` : "单寄一单";
+    $("#shipScopeNote").textContent = isBatch
+      ? `范围＝这一整批（${members.length} 单，垫付合计 ${money(totalCost)}）。一起寄的一批只有一笔邮费，`
+        + `填在下面会按各单垫付占比摊到成员上；单号会写到这一批每一单上。`
+      : `范围＝这一单。散单没有单独的寄出日期字段，这一趟只记单号与邮费（不新增字段、也不拿下单日顶替寄出日）。`;
+    $("#shipMembers").innerHTML = members.map((o) => `<div class="batch-item"><span class="bi-name">`
+      + `${escapeHtml(o.name || "未命名")}</span><span class="bi-cost">${money(o.cost)}</span></div>`).join("");
+    // 2026-09-27 补强 D：成员名单收进可折叠块——摘要恒写范围与单数（折叠不改变范围）；
+    // 短名单默认展开（看得见全体成员），长名单默认收起（输入框不用滚半屏才够到）。
+    const fold = $("#shipMembersBox");
+    if (fold) {
+      const label = $("#shipMembersLabel");
+      if (label) {
+        label.textContent = isBatch
+          ? `成员明细 · 整批 ${members.length} 单 · 垫付合计 ${money(totalCost)}（范围＝这一整批，不含批外单）`
+          : `成员明细 · 单寄这一单 · 垫付 ${money(totalCost)}`;
+      }
+      fold.open = members.length <= 8;
+    }
+
+    const st = shipTrackingState(members);
+    shipBaseHint = st.kind === "empty"
+      ? "现在还没有单号；留空＝不动、填了才记。"
+      : st.kind === "same"
+        ? `现在记着 ${st.values[0]}；留空＝不动（不会重复写）。`
+        : `现有单号「不一致」（${st.values.join(" / ")}）。留空＝逐条保持原样；要统一才在这里填，填了就写到这一批每一单上。`;
+    updateShipTrackingHint();
+    const curFee = isBatch
+      ? (batchGroups().get(shipTarget.batchId) || { feeCents: 0 }).feeCents / 100
+      : numberValue(members[0].fee);
+    $("#shipFeeHint").textContent = isBatch
+      ? `这一批现在记着整批邮费 ${money(curFee)}；填 0＝明确改成 0。`
+      : `现在记着邮费 ${money(curFee)}；填 0＝明确改成 0。`;
+
+    $("#shipTracking").value = "";
+    $("#shipFee").value = "";
+    openModal("#shipModal");
+  }
+
+  function closeShipForm() {
+    closeModal("#shipModal");
+    shipTarget = null;
+    shipSession = null;
+    shipBaseHint = "";
+  }
+
+  // 单号那一格的说明：平时说"现在记着什么"；用户点了「清空」就换成"保存会清掉什么"。
+  // 两句话互斥显示，免得用户看到"留空＝不动"却其实已经表达了清空意图。
+  function updateShipTrackingHint() {
+    const el = $("#shipTrackingHint");
+    if (!el) return;
+    if (shipSession && shipSession.trackingClear) {
+      el.textContent = shipTarget && shipTarget.kind === "batch"
+        ? "已点「清空」：保存会把这一批每一单的单号一起清掉。"
+        : "已点「清空」：保存会清掉这一单的单号。";
+      return;
+    }
+    el.textContent = shipBaseHint;
+  }
+
+  // 唯一的一次提交：所有校验与整笔写入计划都在任何改动之前算完，只调一次 saveData()。
+  function submitShip() {
+    if (!shipTarget) return;
+    const members = shipMembers();
+    if (members.length === 0) { toast("这一单已经不在账本里了，这次没有保存"); return; }
+    const isBatch = shipTarget.kind === "batch";
+    // —— 单号：**留空＝不改**（不管用户是不是打过字又全删掉）；填了非空值＝写成它；
+    //    点了「清空」＝明确清空（写成空串）。判据只看这两件事，见 shipSession.trackingClear 的说明。——
+    const tracking = cleanTracking($("#shipTracking").value);
+    const trackingGiven = tracking !== "" || !!(shipSession && shipSession.trackingClear);
+    // —— 邮费：留空＝不改；填数字＝改成这个数（0 也是明确意图）——
+    const feeRaw = String($("#shipFee").value || "").trim();
+    const feeGiven = feeRaw !== "";
+    if (feeGiven && !validAmountInputs([$("#shipFee")])) return;
+    const fee = feeGiven ? numberValue(feeRaw) : 0;
+    if (feeGiven && fee < 0) { toast("邮费不能是负数"); return; }
+    if (!trackingGiven && !feeGiven) { toast("单号与邮费都没改，这次没有保存"); return; }
+    const feeCents = feeGiven ? toCents(fee) : 0;
+    const plan = isBatch ? shipFeePlan(members, feeGiven, feeCents) : null;
+    if (isBatch && feeGiven && !plan) { toast("分摊校验未通过，账本没有改动"); return; }
+
+    return withLedgerWrite(() => {
+      // 写守门内重新核一遍范围与会话：成员集合变了、或任何一单被别的入口改过、或整包换过账本，
+      // 这一笔就整笔拒绝（过期面板不许改旧成员集合、更不许部分写账）。
+      const now = shipMembers();
+      const nowIds = now.map((o) => o.id).sort();
+      if (!shipSession || shipSession.generation !== ledgerGeneration
+        || JSON.stringify(nowIds) !== JSON.stringify(shipSession.ids)) {
+        toast("这一批的成员已变化，这次没有保存，请重新打开核对");
+        return false;
+      }
+      const moved = now.filter((o) => shipSession.snaps.get(o.id) !== orderSnap(o));
+      if (moved.length > 0) {
+        toast("这一单的内容已变化，这次没有保存，请重新打开核对");
+        return false;
+      }
+      // 到这里才开始改：单号（若用户给了）与邮费（若用户给了）在**同一次**改动里一起落。
+      if (trackingGiven) now.forEach((o) => { o.tracking = tracking; });
+      if (feeGiven) {
+        if (isBatch) {
+          // 与批量结算那条既有路径**逐字同款**的写法（成员 fee = 新份额、份额字段同写、整批口径 = 新总额）。
+          // 只写 fee / batchFeeShare / batchFee 三项；income、incomeDate、status、batchIncome、
+          // batchIncomeShare、batchDate、batchCount 一个字都不碰（寄出保存不可能改回款，也不动归期）。
+          const feeById = new Map(now.map((o, i) => [o.id, plan[i]]));
+          now.forEach((o) => { o.fee = feeById.get(o.id) / 100; o.batchFeeShare = feeById.get(o.id); });
+          now.forEach((o) => { o.batchFee = fee; });
+        } else {
+          now[0].fee = fee;
+        }
+      }
+      if (!saveData()) return false;
+      const bits = [];
+      if (trackingGiven) bits.push(tracking ? `单号 ${tracking}` : "单号已清空");
+      if (feeGiven) bits.push(isBatch ? `整批邮费 ${money(fee)}` : `邮费 ${money(fee)}`);
+      toast(`已保存寄出信息：${bits.join(" · ")}${isBatch ? `（${now.length} 单）` : ""}`);
+      closeShipForm();
+      return true;
+    });
   }
 
   // ---- 报表 ----
@@ -1709,7 +2344,9 @@
     formKind = kind === "income" ? "income" : "order";
     const f = $("#orderForm");
     const income = formKind === "income";
-    if (!channelTouched) f.channel.value = income ? INCOME_CHANNEL : "收货商";
+    // 03 期：连续录入中的下一单，渠道默认是**清空**（或用户勾了保留才沿用的那个），
+    // 不能再被打回「收货商」——那正是规格要防的"把上一单的渠道悄悄带过来"的另一面。
+    if (!channelTouched) f.channel.value = income ? INCOME_CHANNEL : (chainSession.active ? chainSession.channel : "收货商");
     if (income) {
       if (!String(f.goods.value || "").trim()) { f.goods.value = INCOME_NAME; nameAuto = true; }
     } else if (nameAuto && String(f.goods.value || "").trim() === INCOME_NAME) {
@@ -1717,12 +2354,814 @@
       nameAuto = false;
     }
     applyKindUi();
+    applyChainUi();   // 切到收入模式时「保存并继续」「保留本次渠道」必须跟着消失
+  }
+
+  // ================= 05 期：待补信息与核对清单 =================
+  // 用**轻量派生清单**指出值得人工核对的账目，并把用户带到已有的查找/补录入口（01 的查账、02 的补寄出）。
+  // 只读：不写账、不生成待办字段、不发提醒、不创造状态/截止日/逾期结论、不改任何订单状态。
+  // 严格区分"空"与"0"（规格点名的红线）：
+  //   · income 缺失/空串  ⇒ 待补回款；**income: 0 是合法金额，绝不算缺回款**
+  //   · fee: 0 可以代表包邮 ⇒ **不能当漏邮费**，本清单根本不派生"缺邮费"
+  //   · tracking 为空 ⇒ 不能证明未发货 ⇒ 只作**可选、低优先级**的查找入口，不列高危
+  //   · 归期一律用项目现成的 parseDate（真日历回读校验）判；无效日期**不补成今天**，也不推断逾期
+  // 批次只沿用现有批次组与金额校验口径（batchDrift），把**实际差异**展示出来供人查，不自动重摊、不改金额。
+  function checklistItems() {
+    const items = [];
+    const locate = (o) => `${escapeHtml(String(o.date || ""))} · ${escapeHtml(o.name || "未命名")}`
+      + (cleanTracking(o.tracking) ? ` · 单号 ${escapeHtml(cleanTracking(o.tracking))}` : "");
+    // ① 在途＝尚未结清（状态事实，不是错误；**不自行更改状态**）
+    data.orders.filter((o) => o.status === "在途").forEach((o) => {
+      items.push({
+        kind: "pending", level: "info", id: o.id, sortDate: String(o.date || ""),
+        title: "还挂在在途（垫付未回笼）", who: locate(o),
+        money: `垫付 ${money(o.cost)}${numberValue(o.fee) > 0 ? ` · 邮费 ${money(o.fee)}` : ""}`,
+      });
+    });
+    // ② 已回款但没记回款金额：判据是项目唯一那一支 hasIncome（空串/缺失才算；0 不算）
+    data.orders.filter((o) => o.status === "已回款" && !hasIncome(o)).forEach((o) => {
+      items.push({
+        kind: "income-missing", level: "todo", id: o.id, sortDate: String(o.date || ""),
+        title: "已回款，但没记回款金额", who: locate(o),
+        money: `垫付 ${money(o.cost)} · 邮费 ${money(o.fee)}`,
+      });
+    });
+    // ③ 有回款金额、却没有有效的到账日期（按 parseDate 的真日历校验判；不补成今天）
+    data.orders.filter((o) => hasIncome(o) && !parseDate(o.incomeDate)).forEach((o) => {
+      items.push({
+        kind: "income-date", level: "todo", id: o.id, sortDate: String(o.date || ""),
+        title: "回款金额有，但到账日期缺失或不是有效日期", who: locate(o),
+        money: `回款 ${money(o.income)} · 记的到账日期「${escapeHtml(String(o.incomeDate ?? "（空）"))}」`,
+      });
+    });
+    // ④ 批次差异：**只沿用现有口径**（batchDrift 与表头同源），把差异原样列出来
+    batchGroups().forEach((g, id) => {
+      const members = batchMembers(id);
+      if (members.length === 0) return;
+      const batchCount = members.reduce((a, o) => Math.max(a, Math.round(numberValue(o.batchCount))), 0);
+      batchDrift(g, members, batchCount).forEach((n, i) => {
+        items.push({
+          kind: n.warn ? "batch-drift" : "batch-note", level: n.warn ? "warn" : "info",
+          batchId: id, sortDate: String(g.date || ""), seq: i,
+          title: n.warn ? "一起寄出的这一批：整批口径与成员明细对不上" : "一起寄出的这一批：有成员不在其中了",
+          who: `批次 ${escapeHtml(String(g.date || ""))} · 当前 ${members.length} 单`,
+          money: n.text,
+        });
+      });
+    });
+    // ⑤ 还没记快递单号：**可选、低优先级**（空单号证明不了没发货，所以不列高危、也不改状态）
+    data.orders.filter((o) => !cleanTracking(o.tracking) && o.status === "在途").forEach((o) => {
+      items.push({
+        kind: "no-tracking", level: "low", id: o.id, sortDate: String(o.date || ""),
+        title: "还没记快递单号（可选，不代表没发货）", who: locate(o), money: "",
+      });
+    });
+    // 去重：同一问题按「订单/批次 + 问题类型」只出现一次（seq 让同一批的不同提示各自成条，不互相吞掉）
+    const seen = new Set();
+    return items.filter((it) => {
+      const key = `${it.kind}|${it.id || it.batchId || ""}|${it.seq || 0}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  const CHECK_GROUPS = [
+    { level: "warn", label: "整批口径待对账" },
+    { level: "todo", label: "待补 / 待核对" },
+    { level: "info", label: "在途未结清（只是状态）" },
+    { level: "low", label: "可选" },
+  ];
+  // 要动手的项 = warn + todo（页签上那个数字只数它们；没有问题时不显示数字、也不常驻告警）
+  const checkActionable = (items) => items.filter((it) => it.level === "warn" || it.level === "todo").length;
+
+  function renderChecklist() {
+    const box = $("#checkList");
+    if (!box) return;
+    const all = checklistItems();
+    const actionable = checkActionable(all);
+    const badge = $("#lkCheckCount");
+    if (badge) { badge.hidden = actionable === 0; badge.textContent = actionable > 0 ? String(actionable) : ""; }
+    const meta = $("#lkCheckMeta");
+    if (meta) {
+      meta.innerHTML = all.length === 0
+        ? `这份账本没有需要核对的项。`
+        : `派生自查现有字段，「只读」：不写账、不改状态、不推断逾期。共 <b>${all.length}</b> 项`
+          + (actionable > 0 ? `，其中 <b>${actionable}</b> 项值得动手核对。` : `，没有需要动手的项。`);
+    }
+    if (all.length === 0) {
+      box.innerHTML = `<div class="chk-empty">没有需要核对的项 ✓</div>`;
+      return;
+    }
+    const parts = [];
+    CHECK_GROUPS.forEach((grp) => {
+      const list = all.filter((it) => it.level === grp.level)
+        .sort((a, b) => (a.sortDate === b.sortDate ? 0 : a.sortDate < b.sortDate ? 1 : -1));
+      if (list.length === 0) return;
+      parts.push(`<div class="chk-group"><div class="chk-head ${grp.level}">${grp.label}`
+        + `<span class="chk-n">${list.length} 项</span></div>`);
+      list.forEach((it) => {
+        parts.push(`<div class="chk-item" data-chk-kind="${escapeHtml(it.kind)}">`
+          + `<div class="ci-title">${escapeHtml(it.title)}</div>`
+          + `<div class="ci-who">${it.who}</div>`
+          + (it.money ? `<div class="ci-money">${escapeHtml(it.money)}</div>` : "")
+          + `<div class="ci-act"><button type="button" data-chk-go="${escapeHtml(it.id || "")}"`
+          + ` data-chk-batch="${escapeHtml(it.batchId || "")}">去查看这一单</button></div></div>`);
+      });
+      parts.push(`</div>`);
+    });
+    box.innerHTML = parts.join("");
+  }
+
+  // 从核对项跳到 01 的查账视图并**精确定位**（单笔按 order id、批次按 batchId 锁定成员集合，不靠名字/单号猜）。
+  // 写操作仍然要重新核对当前订单 ID 与整个批次（02 自己的守门），这里只是"带路"。
+  function checklistGoTo(id, batchId) {
+    setLookupTab("search");
+    if (id) {
+      lookup.focusId = id;
+      lookup.focusBatchId = "";
+      lookup.q = "";
+      lookup.status = "全部";
+      lookupSetDate("all");
+      lookup.panel = false;
+      renderLookup();
+      return;
+    }
+    if (batchId) {
+      // 批次类的项没有单笔 id：把**整批成员**精确带到眼前（05 二轮审查第 1 项）——
+      // 结果集合就是这一批的全部成员、置顶可见，返回核对清单的入口照常出现。
+      lookup.focusId = "";
+      lookup.focusBatchId = batchId;
+      lookup.q = "";
+      lookup.status = "全部";
+      lookupSetDate("all");
+      lookup.panel = false;
+      renderLookup();
+    }
+  }
+
+  function setLookupTab(tab) {
+    lookup.tab = tab === "check" ? "check" : "search";
+    const isCheck = lookup.tab === "check";
+    const sp = $("#lkSearchPane"), cp = $("#lkCheckPane");
+    if (sp) sp.hidden = isCheck;
+    if (cp) cp.hidden = !isCheck;
+    $$("#lkTabs .seg").forEach((b) => b.classList.toggle("on", b.dataset.lktab === lookup.tab));
+    if (isCheck) { $("#lookupScope").textContent = "核对清单"; }
+    renderLookup();
+  }
+
+
+  // ================= 04 期：新单草稿与误关闭保护 =================
+  // 目标：手机录单被打断/误关之后还能找回**新单的输入**；同时编辑/回款/批次只在"确有改动将丢失"时提醒。
+  // 边界（逐条对着 04 期提示词与 02-难点设计）：
+  //   ① **只服务新单**（含「再来一单」，它本质是新建）。编辑、回款、批次**不做跨刷新恢复**，
+  //      只加"未保存就离开"的提醒。
+  //   ② 草稿是**本机**的一份输入，**不属于账本、不上传、不进同步包**；键里只放版本号与
+  //      **编码后的非秘密 userId**，值里只放新单那几个字段 + 候选 orderId。绝不放同步码/密钥。
+  //   ③ 每个 owner 一个槽，彼此隔离：owner 判不出来（身份为空/损坏）就**完全不读写草稿**。
+  //   ④ 恢复必须**用户显式选**（继续 / 丢弃）；绝不自动回填后直接写账。
+  //   ⑤ 只有草稿**确实写成功**才显示"已暂存"；草稿槽出错**绝不拦正式保存**。
+  //   ⑥ 正式提交时在一个**写守门内、拿到排他锁后、动 data 之前**重核 owner/草稿ID/版本/候选 orderId，
+  //      并核 DATA/SNAPSHOT 镜像：候选 ID 已存在 ⇒ 判为"已提交/待清理"，不保存、不排同步；
+  //      对不上或结果不明 ⇒ 保留输入、标"待核对"、拒绝这份草稿继续提交。
+  //   ⑦ 清理只在槽仍是本次 draftId+revision 时做（草稿 set/remove 与正式写共用同一把 Web Lock）。
+  //   ⑧ 无 Web Locks 时**不承诺跨页持续草稿**：绝不静默覆盖已存在的槽；确认不了的旧草稿只标"待核对"。
+  const DRAFT_KEY_PREFIX = "luhuo-new-order-draft-v1";
+  const DRAFT_FIELDS = ["goods", "cost", "fee", "date", "qty", "channel", "status", "note", "tracking"];
+  // 内存态：{ owner, draftId, revision, orderId, savedAt, status, savedFields, pendingCheck, conflict }
+  let draftState = null;
+  let draftTimer = null;
+
+  function draftKeyFor(owner) {
+    return owner ? `${DRAFT_KEY_PREFIX}:${encodeURIComponent(owner)}` : "";
+  }
+  const draftOwner = () => identityOwner();     // 身份包解析不出 userId 时是空串 ⇒ 整个草稿功能停用
+
+  // 读当前 owner 的槽。**任何**异常/结构不符/owner 不符都当作"没有草稿"（宁可不恢复，也不串身份）。
+  function draftRead(owner) {
+    const key = draftKeyFor(owner);
+    if (!key) return null;
+    try {
+      const raw = JSON.parse(localStorage.getItem(key) || "null");
+      if (!raw || typeof raw !== "object" || raw.v !== 1) return null;
+      if (String(raw.owner || "") !== owner) return null;
+      if (!raw.draftId || !Number.isFinite(Number(raw.revision)) || !raw.fields) return null;
+      return raw;
+    } catch { return null; }
+  }
+
+  // 槽的三种状态：none（没有）/ ok（可解析且 owner 对得上）/ corrupt（**存在但读不出来**）。
+  // corrupt 必须与 none 分开：规格要求"绝不静默覆盖已存在槽"，把损坏的槽当空槽就会静默盖掉它。
+  function draftSlotState(owner) {
+    const key = draftKeyFor(owner);
+    if (!key) return { kind: "none" };
+    let raw = null;
+    try { raw = localStorage.getItem(key); } catch { return { kind: "none" }; }
+    if (raw === null) return { kind: "none" };
+    const rec = draftRead(owner);
+    return rec ? { kind: "ok", rec } : { kind: "corrupt" };
+  }
+
+  // 候选 orderId 是否已经在**本机证据**里（内存账本 / 本机 DATA 实时镜像 / 最近完整快照）。
+  // 三处都看：内存账本可能是从快照装载的、而 DATA 可能已被别页写过，只看一处会漏。
+  function draftOrderIdInLedger(orderId, owner) {
+    const wanted = String(orderId || "");
+    if (!wanted) return false;
+    if (data.orders.some((o) => String(o.id) === wanted)) return true;
+    if (draftOwnerOk() === false) return false;
+    try {
+      const live = JSON.parse(localStorage.getItem(DATA_KEY) || "null");
+      if (live && Array.isArray(live.orders) && live.orders.some((o) => String(o.id) === wanted)) return true;
+    } catch { /* 读不出来就不据此判定 */ }
+    try {
+      const snap = JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || "null");
+      if (snap && snap.owner === (owner || draftOwner()) && snap.data && Array.isArray(snap.data.orders)
+        && snap.data.orders.some((o) => String(o.id) === wanted)) return true;
+    } catch { /* 同上 */ }
+    return false;
+  }
+
+  // 本机证据是否"结果不明"：DATA / SNAPSHOT 键**存在但解析不了**（被外部写坏）。
+  // 键不存在是正常态（新账本本来就没有 SNAPSHOT），不算不明；解析不了才算——
+  // 这时既不能证明候选 ID 没提交过、也不能证明提交过 ⇒ 守门按"结果不明"只拦这一份。
+  function ledgerEvidenceUncertain() {
+    for (const key of [DATA_KEY, SNAPSHOT_KEY]) {
+      let raw = null;
+      try { raw = localStorage.getItem(key); } catch { return true; }
+      if (raw === null) continue;
+      try { JSON.parse(raw); } catch { return true; }
+    }
+    return false;
+  }
+
+  function draftFieldsFromForm(f) {
+    const out = {};
+    DRAFT_FIELDS.forEach((k) => { if (f && f[k]) out[k] = String(f[k].value ?? ""); });
+    return out;
+  }
+
+  // 当前表单的字段与"已落盘的那一份"是否逐格一致 —— 离开保护用它回答"最后这次输入到底落盘了没有"。
+  // 不用近似判断：差一次 400ms 防抖就要如实说"还没落盘"，不能拿"刚才写成功过"顶替。
+  function draftFieldsEqual(a, b) {
+    if (!a || !b) return false;
+    return DRAFT_FIELDS.every((k) => String(a[k] ?? "") === String(b[k] ?? ""));
+  }
+
+  // 身份在会话中途被换掉（导入同步码 / 重置身份 / 别页改了身份包）时，这份草稿**不再属于当前身份**：
+  // 立即丢掉内存态并停用一切草稿读写。这样"用 A 的内存草稿去写 B 的槽"这条串单路径就不存在了。
+  function draftOwnerOk() {
+    if (!draftState) return false;
+    const now = draftOwner();
+    if (!now || !draftState.owner || now !== draftState.owner) {
+      draftState = null;
+      draftRender();
+      return false;
+    }
+    return true;
+  }
+
+  function draftRender() {
+    const bar = $("#formDraftBar");
+    if (!bar) return;
+    if (editingId || !draftState) { bar.hidden = true; bar.innerHTML = ""; bar.className = "draft-bar"; return; }
+    const st = draftState;
+    const btn = (what, text, cls) => `<button type="button"${st.busy ? " disabled" : ""}${cls ? ` class="${cls}"` : ""} data-draft="${what}">${text}</button>`;
+    const acts = (list) => `<div class="dr-acts">${list.join("")}</div>`;
+    if (st.status === "offer") {
+      // 关键：这里**还没有认领**旧槽。用户不点任何按钮、直接开始填，也只会另记新的一单（新单号），
+      // 旧草稿原样留着 —— 不会被覆盖、也不会被消费（04 审查第 1 项）。
+      bar.className = "draft-bar";
+      bar.hidden = false;
+      bar.innerHTML = `这个账本上次没写完的一单还留着（${escapeHtml(st.savedAt || "")}）。<br>`
+        + `直接开始填也行——那样会另记新的一单，这份草稿仍然留着、不会被覆盖。`
+        + acts([btn("continue", "继续那一单"), btn("newone", "另记新的一单", "ghost"), btn("discard", "丢弃这份草稿", "ghost")]);
+      return;
+    }
+    if (st.status === "pending") {
+      bar.className = "draft-bar warn";
+      bar.hidden = false;
+      bar.innerHTML = `本机还留着一份「待核对」的草稿（它在另一处可能已经提交过，或读不出来）。`
+        + `已经保留它、不会覆盖；本页这一单不会被暂存。`
+        + acts([btn("newone", "继续记这一单（用新单号）"), btn("discard", "丢弃这份待核对的草稿", "ghost")]);
+      return;
+    }
+    if (st.status === "unprotected") {
+      bar.className = "draft-bar muted";
+      bar.hidden = false;
+      bar.innerHTML = `本机还留着一份没处理的草稿（请到账本里核对一下）。这一单不会被暂存——`
+        + `保存前别退出；想让它也受草稿保护，先处理掉那份旧草稿。`;
+      return;
+    }
+    if (st.status === "conflict") {
+      bar.className = "draft-bar warn";
+      bar.hidden = false;
+      bar.innerHTML = `另一页也在填这一单，草稿已经按它那边的版本走了。这里保留你正在输入的内容，`
+        + `但不会覆盖它——请确认好留哪一份再保存。`;
+      return;
+    }
+    if (st.status === "nolock") {
+      // 无 Web Locks 降级：槽里是先前那一版，之后的改动没有再写进去（也不该谎称"已暂存"）。
+      bar.className = "draft-bar muted";
+      bar.hidden = false;
+      bar.innerHTML = `本机浏览器不支持多页写入锁，草稿槽里保留的是先前那份（这里没有覆盖它）。`
+        + `这一单仍可正常保存，只是这次的改动不会再写进草稿。`;
+      return;
+    }
+    if (st.status === "dirty") {
+      bar.className = "draft-bar muted";
+      bar.hidden = false;
+      bar.innerHTML = `刚改的内容还没落到草稿里（马上会落，别在这时候退出）。`;
+      return;
+    }
+    if (st.status === "nosave") {
+      bar.className = "draft-bar muted";
+      bar.hidden = false;
+      bar.innerHTML = `未保存在草稿（本机存储暂时写不进去）——不影响你正常保存这一单。`;
+      return;
+    }
+    if (st.status === "saved") {
+      bar.className = "draft-bar muted";
+      bar.hidden = false;
+      bar.innerHTML = `已暂存为草稿，退出后可以找回。`;
+      return;
+    }
+    bar.hidden = true; bar.innerHTML = ""; bar.className = "draft-bar";
+  }
+
+  // 把当前表单写进槽。**必须在与正式写同一把锁里**，而且只在"这一份表单确实认领了槽"时才写：
+  //   · mode=blocked（有未处理/可疑的旧槽）⇒ 一律不写：既不覆盖旧槽，也不给这一单留下"已暂存"的错觉
+  //   · claimed=false（offer 还没点继续）  ⇒ 一律不写：未明确选择不得覆盖或消费旧草稿
+  // 锁内重读该 owner 的槽，只有两种情况允许写：槽不存在（首次）或槽仍是本次 draftId+revision。
+  function draftWriteNow() {
+    if (!draftState || editingId) return false;
+    if (!draftOwnerOk()) return false;
+    if (draftState.mode !== "own" || !draftState.claimed) return false;
+    // 最终写入口的拒写守卫（补强任务 A）：已判"待核对/冲突"的草稿写通道整体关闭。
+    // draftSchedule 只是不再排写，而**关窗补写**（formLeaveGuard，取消/Esc/点遮罩全部出口都走它）
+    // 会直呼本函数——不在这里拦，取消关闭仍会把旧槽推进一版（复核探针 04.pending-close 抓到的正是这条）。
+    if (draftState.pendingCheck || draftState.conflict) return false;
+    const owner = draftState.owner;
+    const state = draftSlotState(owner);
+    if (state.kind === "corrupt") {
+      draftState.conflict = true; draftState.status = "conflict"; draftRender();
+      return false;
+    }
+    const cur = state.kind === "ok" ? state.rec : null;
+    if (cur && (String(cur.draftId) !== String(draftState.draftId)
+      || Number(cur.revision) !== Number(draftState.revision))) {
+      draftState.conflict = true;
+      draftState.status = "conflict";
+      draftRender();
+      return false;
+    }
+    if (cur && String(cur.orderId || "") !== String(draftState.orderId)) {
+      // 04 二轮审查第 2 项：同 draftId+revision 但**候选单号被换掉** ⇒ 槽被别人动过、结果不明：
+      // 不写、标冲突，绝不把别人的候选号当成自己这份继续推进。
+      draftState.conflict = true;
+      draftState.status = "conflict";
+      draftRender();
+      return false;
+    }
+    if (!cur && Number(draftState.revision) >= 1) {
+      // 04 二轮审查第 2 项：认领后**写过**（revision ≥ 1）而槽现在没了（别页刚提交并清理、
+      // 或刚丢弃）⇒ 结果不明，**绝不当"首次创建"把草稿复活**。保留 DOM 输入、标待核对。
+      draftState.pendingCheck = true;
+      draftState.status = "pending";
+      draftRender();
+      return false;
+    }
+    if (cur && !(navigator.locks && navigator.locks.request)) {
+      // 无 Web Locks 的保守降级（补强任务 B，原设计契约：无锁时"绝不静默覆盖已存在槽"）：
+      // 读到的"仍是同一份"不构成 CAS——排锁等待的间隙里别页可能已消费/推进这份槽。
+      // 旧槽原样保留、如实说明状态；这一单仍可正常保存（新单号路径不受影响）。
+      // 无锁空槽的首次创建不在此列（原设计已豁免该并发窗口的原子性，见 04 期 BLOCKED）。
+      draftState.status = "nolock";
+      draftRender();
+      return false;
+    }
+    const revision = cur ? Number(cur.revision) + 1 : 1;
+    const record = {
+      v: 1, owner, draftId: draftState.draftId, revision,
+      updatedAt: new Date().toISOString(),
+      kind: formKind === "income" ? "income" : "order",
+      orderId: draftState.orderId,                       // 稳定候选 ID：正式提交沿用它
+      fields: draftFieldsFromForm($("#orderForm")),
+    };
+    try {
+      localStorage.setItem(draftKeyFor(owner), JSON.stringify(record));
+    } catch {
+      draftState.status = "nosave";                      // 写失败：如实说"未保存在草稿"，但绝不拦正式保存
+      draftRender();
+      return false;
+    }
+    draftState.revision = revision;
+    draftState.savedAt = record.updatedAt.replace("T", " ").slice(0, 16);
+    draftState.savedFields = record.fields;
+    if (!draftState.pendingCheck && !draftState.conflict) draftState.status = "saved";
+    draftRender();
+    return true;
+  }
+
+  function draftSchedule() {
+    if (!draftState || editingId) return;
+    // 未认领 / 受保护槽模式：不排写，也不谎报状态
+    if (draftState.mode !== "own" || !draftState.claimed) return;
+    // 已被守门判成"待核对"（候选号已入库/槽结果不明）或处在冲突态：这一单的草稿通道已经关了，
+    // 状态条也写着"不会被暂存"——绝不再排写（否则会把已判 duplicate 的槽悄悄推进一版）。
+    // 无锁降级（nolock）同理：再写也只会被 draftWriteNow 拒掉，别把状态条翻回"马上会落"的假话。
+    if (draftState.pendingCheck || draftState.conflict || draftState.status === "nolock") return;
+    clearTimeout(draftTimer);
+    // **立刻**把状态改成"还没落盘"：提示条与离开保护都据此说话。原来只在写成功后才改状态，
+    // 于是"改了但还没写"这段时间里界面还写着"已暂存、退出可找回"（04 审查第 2 项）。
+    if (!draftState.pendingCheck && !draftState.conflict && draftState.status !== "nosave") {
+      draftState.status = "dirty";
+      draftRender();
+    }
+    // 防抖：手机上每敲一下都落一次盘没必要；400ms 足够"被打断也能找回"
+    draftTimer = setTimeout(() => { withStorageLock(draftWriteNow); }, 400);
+  }
+
+  // 按**调用方给的目标快照**（owner/draftId/revision）删槽，且只在槽仍匹配时才删。
+  // 用显式快照而不是读 draftState：① 丢弃"待核对/损坏"的旧槽时，本页的 draftState 根本不属于它；
+  // ② 排队等锁期间别页可能推进版本，锁后必须按**发起时那一份**重核。
+  // allowCorrupt：只在调用方明确声明"整槽不可信、要整份丢掉"时才允许删读不出来的槽。
+  function draftClearSnapshot(target) {
+    if (!target || !target.owner) return false;
+    const key = draftKeyFor(target.owner);
+    if (!key) return false;
+    let raw = null;
+    try { raw = localStorage.getItem(key); } catch { return false; }
+    if (raw === null) return true;                        // 本来就没有：算成功
+    const rec = draftRead(target.owner);
+    if (rec) {
+      if (String(rec.draftId) !== String(target.draftId)) return false;
+      if (Number(rec.revision) !== Number(target.revision)) return false;
+    } else {
+      if (!target.allowCorrupt) return false;
+      // 04 二轮审查第 3 项：损坏槽只删**用户看到的那一份**——发起丢弃时钉下的原文在排队等锁期间
+      // 被换成别的字节（另一页写了另一份坏内容）就不删，让用户重新看一眼再决定。
+      if (typeof target.raw === "string" && raw !== target.raw) return false;
+    }
+    try { localStorage.removeItem(key); return true; } catch { return false; }
+  }
+
+  // 自己认领的那一份：按当前 draftId/revision 删
+  function draftClearNow() {
+    if (!draftState || draftState.mode !== "own" || !draftState.claimed) return false;
+    return draftClearSnapshot({ owner: draftState.owner, draftId: draftState.draftId, revision: draftState.revision });
+  }
+
+  // 打开新单表单时：看一眼当前 owner 的槽。
+  //   · 没有槽        ⇒ own + 已认领，正常暂存
+  //   · 有可续的槽    ⇒ **不认领**，给「继续 / 另记新的一单 / 丢弃」三个选择（offer）
+  //   · 已提交或读不出的槽 ⇒ blocked + 待核对，给「用新单号继续记 / 丢弃这份」
+  // options.forceNew：「保存并继续」这类"用户已经明确要下一单"的路径，不必被旧草稿挡住 ——
+  // 直接进"另记新的一单"（新单号、不写槽），旧草稿原样留着（04 审查第 3 项）。
+  function draftOpenForNewForm(options) {
+    clearTimeout(draftTimer);
+    const forceNew = !!(options && options.forceNew);
+    const owner = draftOwner();
+    draftState = {
+      owner, mode: "own", claimed: true,
+      draftId: uid(), revision: 0, orderId: uid(),
+      slotDraftId: "", slotRevision: 0, slotOrderId: "",
+      status: "", savedAt: "", savedFields: null, pendingCheck: false, conflict: false,
+    };
+    if (!owner) { draftRender(); return; }
+    const state = draftSlotState(owner);
+    if (state.kind === "none") { draftRender(); return; }
+    // 槽存在：先把它的身份记下来，但**本表单自己用全新的 draftId/orderId**。
+    // 这样"未选择就直接填"只会另记新的一单（新单号），绝不会复用旧候选号、更不会覆盖旧槽。
+    draftState.mode = "blocked";
+    draftState.claimed = false;
+    draftState.slotDraftId = state.kind === "ok" ? String(state.rec.draftId) : "";
+    draftState.slotRevision = state.kind === "ok" ? Number(state.rec.revision) : 0;
+    draftState.slotOrderId = state.kind === "ok" ? String(state.rec.orderId || "") : "";
+    draftState.savedAt = state.kind === "ok" ? String(state.rec.updatedAt || "").replace("T", " ").slice(0, 16) : "";
+    const already = state.kind === "ok" && draftOrderIdInLedger(state.rec.orderId, owner);
+    draftState.status = (already || state.kind === "corrupt") ? "pending" : "offer";
+    draftState.pendingCheck = draftState.status === "pending";
+    if (forceNew && draftState.status === "offer") draftState.status = "unprotected";
+    // （复核回退注记）pending 不在这里归整：残留槽的 pending 状态条带着「用新单号 / 丢弃」两个入口，
+    // 归整成 unprotected 会把入口一起丢掉（用户得关窗重开才能处理残留）。关窗问句的分流改在
+    // formLeaveGuard 里做：未认领的新单说"这一单没有被暂存"，不再误用"本页不再提交它"。
+    draftRender();
+  }
+
+  // 「另记新的一单」：旧槽原样留着（不写、不删），本表单用**全新的单号**走普通新单路径。
+  // 这一单不享受草稿保护 —— 本机每个身份只有一份草稿槽，那一份属于还没处理的旧草稿。
+  function draftEnterNewOrder() {
+    if (!draftState || draftState.busy) return false;    // 丢弃在途：互斥，先等它落地
+    draftState.mode = "blocked";
+    draftState.claimed = false;
+    draftState.draftId = uid();
+    draftState.orderId = uid();
+    draftState.savedFields = null;
+    draftState.status = "unprotected";
+    draftRender();
+    return true;
+  }
+
+  // 用户选「继续那一单」：认领 + 把字段回填到表单（**只回填，仍然要用户自己点保存**）。
+  function draftApplyToForm() {
+    const st = draftState;
+    if (!st || !st.owner || st.busy) return false;       // 丢弃在途：互斥，"继续"插不进来（04 二轮审查第 3 项）
+    // 认领前重核：槽还在吗？身份/版本还是打开时看到的那一份吗？不符就不认领、也不动它。
+    const state = draftSlotState(st.owner);
+    if (state.kind !== "ok") {
+      st.status = "pending"; st.pendingCheck = true; draftRender();
+      toast("那份草稿已经不在了或读不出来，这里没有动它");
+      return false;
+    }
+    if (String(state.rec.draftId) !== String(st.slotDraftId)
+      || Number(state.rec.revision) !== Number(st.slotRevision)) {
+      st.status = "conflict"; draftRender();
+      toast("那份草稿在别处已经变过，这里没有覆盖它");
+      return false;
+    }
+    const cur = state.rec;
+    const f = $("#orderForm");
+    const fields = cur.fields || {};
+    const kind = cur.kind === "income" ? "income" : "order";
+    if (kind === "income" && formKind !== "income") setFormKind("income");
+    if (kind === "order" && formKind !== "order") setFormKind("order");
+    nameAuto = false;
+    channelTouched = true;                       // 回填的渠道算"已经定过"，切类型不该被默认值顶掉
+    DRAFT_FIELDS.forEach((k) => { if (f[k] && fields[k] !== undefined) f[k].value = String(fields[k]); });
+    if (f.status && !STATUSES.includes(f.status.value)) fillSelect(f.status, STATUSES.map((s) => [s, statusLabel(s)]), "在途");
+    const chVal = String(f.channel.value || "");
+    const chOpts = CHANNELS.slice();
+    if (!chOpts.includes(chVal)) chOpts.push(chVal);
+    fillSelect(f.channel, chOpts.map((c) => [c, c === "" ? "未填写" : c]), chVal);
+    st.mode = "own";
+    st.claimed = true;
+    st.draftId = String(cur.draftId);
+    st.revision = Number(cur.revision);
+    st.orderId = String(cur.orderId || st.orderId);
+    st.savedFields = fields;
+    st.status = "saved";
+    st.pendingCheck = false;
+    draftRender();
+    updateFormMoreSummary();
+    applyKindUi();
+    return true;
+  }
+
+  // 用户选「丢弃草稿」：**等待真实结果**再说话（原来把 withStorageLock 的 Promise 当布尔，
+  // 失败也说已丢弃 —— 04 审查第 4 项）。锁后再核一遍要丢的还是不是当初那一份。
+  // 04 二轮审查第 3 项：排队等锁期间**互斥**（按钮禁用 + 操作序号），"继续那一单"插不进来，
+  // 丢弃完成后也不会把刚认领的旧草稿用同 draftId/orderId 复活；损坏槽按**发起时钉下的原文**删。
+  let draftOpSerial = 0;
+  async function draftDiscard() {
+    const st = draftState;
+    if (!st || !st.owner || st.busy) return false;
+    const op = ++draftOpSerial;
+    // 丢弃目标按**归属**路由（复核修正）：本页自己认领的那份（own+claimed，含被判待核对/冲突的）
+    // 按自己的 draftId/revision 删——槽已被别人换掉时自然删不动、如实说"没能删掉"；
+    // 只有没有认领的旧槽（offer/待核对残留）才走"槽快照 + 原文钉住"那条路。
+    const target = (st.mode === "own" && st.claimed)
+      ? { owner: st.owner, draftId: st.draftId, revision: st.revision }
+      : (() => {
+        const key = draftKeyFor(st.owner);
+        let raw;
+        try { raw = key ? localStorage.getItem(key) : undefined; } catch { raw = undefined; }
+        return { owner: st.owner, draftId: st.slotDraftId || "", revision: st.slotRevision || 0,
+          allowCorrupt: true, raw: typeof raw === "string" ? raw : undefined };
+      })();
+    st.busy = true;
+    draftRender();                                        // 丢弃在途：草稿条按钮全部禁用
+    let ok = false;
+    try {
+      ok = await withStorageLock(() => {
+        if (draftOwner() !== target.owner) return false;
+        return draftClearSnapshot(target);
+      });
+    } finally {
+      st.busy = false;
+      if (draftState === st) draftRender();
+    }
+    if (draftState !== st || op !== draftOpSerial) return !!ok;   // 期间被换过会话/又发起了别的操作：不纠正别人的状态
+    if (ok) {
+      st.slotDraftId = ""; st.slotRevision = 0; st.slotOrderId = "";
+      st.savedFields = null; st.pendingCheck = false; st.conflict = false;
+      if (st.mode === "blocked") { st.mode = "own"; st.claimed = true; st.draftId = uid(); st.orderId = uid(); st.revision = 0; }
+      st.status = "";
+      toast("已丢弃那份草稿");
+    } else {
+      st.status = st.status === "offer" ? "offer" : "pending";
+      toast("没能删掉那份草稿（另一页刚更新过，或本机存储写不进去）——这里没有动它");
+    }
+    draftRender();
+    return !!ok;
+  }
+
+  // ---- 离开保护：所有出口（取消 / Esc / 点遮罩）统一过它 ----
+  // 判据：**有改动**且**改动会丢**才提醒。而"会不会丢"只看一件事：**当前字段与已落盘的那份是否一致**。
+  // 原来只看 status === "saved"，于是"改成 100、400ms 内关窗"会听到"可以找回"，实际存储里还是 10
+  //（04 审查第 2 项）。现在关窗前先补写一次，再按补写结果决定措辞。
+  // 04 二轮审查第 1 项：补写**必须过与正式写同一把锁**——同步直写绕开互斥，两页同锁读写交错时
+  // "读旧 revision → 写同号 revision"不是 CAS，最后一次输入会被对方持锁写入后静默顶掉。
+  // 所以守门是 async：等同一把锁补写完，再按真实结果问话。
+  let leaveGuardBusy = false;   // 已有一次守门在等锁：挡住连点取消/Esc 的重复进入
+  async function formLeaveGuard() {
+    if (!$("#formModal").classList.contains("show")) return true;
+    if (leaveGuardBusy) return false;                           // 在等的那次守门马上会问，这次不重复
+    const f = $("#orderForm");
+    const changed = formBaseline === null || controlState(f) !== formBaseline;
+    if (!changed) return true;                                  // 没改动：不问
+    const durable = () => !!(draftState && draftState.mode === "own" && draftState.claimed
+      && draftState.status === "saved"
+      && draftFieldsEqual(draftFieldsFromForm(f), draftState.savedFields));
+    if (!durable() && draftState && draftState.mode === "own" && draftState.claimed) {
+      leaveGuardBusy = true;
+      try {
+        clearTimeout(draftTimer);
+        await withStorageLock(draftWriteNow);                   // 与正式写/草稿写同一把排他锁
+      } finally { leaveGuardBusy = false; }
+      // 等锁期间保存成功可能已经把表单关了（closeForm(true) 清掉 draftState）：无事可问，直接放行
+      if (!$("#formModal").classList.contains("show")) return true;
+      // 等锁期间若又打了字，durable() 会如实说"没落盘"，不拿补写成功顶替最后那次输入。
+    }
+    if (durable()) {
+      return confirm("这一单还没保存，但输入已经暂存在草稿里（退出后可以找回）。\n确定离开？");
+    }
+    if (draftState && draftState.status === "pending"
+      && draftState.mode === "own" && draftState.claimed) {
+      // 只有"本页自己认领的那份被判待核对"才说"本页不再提交它"（守门确实会拦它）；
+      // blocked/未认领的新单其实能用新单号正常保存，说那句话是骗人——按"未被暂存"如实说。
+      return confirm("这份草稿待核对（可能在另一处已经提交过），本页不再提交它。\n"
+        + "离开会丢掉你现在的输入，确定离开？");
+    }
+    if (draftState && draftState.status === "nolock") {
+      // 无锁降级：槽里只有先前那一版，之后的改动没写进去。两头都不冒充——不说"可以找回"，
+      // 也不说"全都会丢"；如实说清哪部分在、哪部分丢。
+      return confirm("草稿里只留有先前暂存的那一版（本机浏览器不支持多页写入锁，之后的改动没有再写进去）。\n"
+        + "离开的话最后这些改动会丢，确定离开？");
+    }
+    if ((draftState && draftState.status === "pending")
+      || (draftState && draftState.status === "unprotected")) {
+      return confirm("这一单没有被暂存（本机还留着一份没处理的草稿）。\n离开会丢掉你现在的输入，确定离开？");
+    }
+    // 编辑 / 回款 / 批次：只提示"当前改动会丢"，**不承诺刷新后能恢复**
+    return confirm("你有还没保存的改动，离开就丢了。\n确定离开？");
+  }
+
+  // 草稿守门的"待核对"只落在**仍是这一份**的 live 状态上；reopened（live 已属于新表单）时
+  // 只拦这次提交，不去改新表单的状态条。
+  function draftMarkPendingSnap(snap, owner) {
+    if (draftState && draftState.owner === owner
+      && String(draftState.draftId) === String(snap.draftId)
+      && Number(draftState.revision) === Number(snap.draftRevision)) {
+      draftState.pendingCheck = true; draftState.status = "pending"; draftRender();
+    }
+  }
+
+  // 正式提交前的**草稿归属分类**。由 withFormIntent 在**同一把锁内、通用旧基线拒绝之前**调用
+  //（04 审查第 5 项：原来它被嵌在通用写守门之后，外层基线一拒就根本跑不到）。
+  // 04 二轮审查第 2/5 项：判据全部用**提交那一刻的快照**（snap），不读 live draftState 的归属——
+  // 等待写锁期间表单可能被重新打开，live 态已经属于新表单；reopened 的提交同样要过这道分类。
+  // 返回 "ok" | "duplicate" | "blocked"。
+  function draftGateForSubmit(snap) {
+    if (!snap || snap.editingId || !snap.draftClaimed) return "ok";
+    const owner = String(snap.draftOwner || "");
+    if (!owner || owner !== draftOwner()) return "ok";           // 身份判不出来/中途换过：草稿机制整体不参与
+    // ① 候选 ID 已经在本机证据里（内存账本 / DATA 实时镜像 / 最近完整快照，三处都看）⇒ 已经提交过
+    if (draftOrderIdInLedger(snap.orderId, owner)) {
+      draftMarkPendingSnap(snap, owner);
+      return "duplicate";
+    }
+    // ①b 证据**读不出来**≠没有证据（复核指出的规格残留）：DATA/SNAPSHOT 存在但解析不了
+    //    ⇒ 本机证据"结果不明"，按规格只拦这一份、标待核对（键不存在是正常态，不在此列）。
+    if (ledgerEvidenceUncertain()) {
+      draftMarkPendingSnap(snap, owner);
+      return "blocked";
+    }
+    const cur = draftRead(owner);
+    if (Number(snap.draftRevision) >= 1) {
+      // ② 认领后**写过**的草稿：槽必须仍然是同一份（同 draftId + revision + orderId）。
+      //    槽没了/读不出/版本或候选号被换掉 ⇒ 无法证明这份草稿没在别处被提交或处理过
+      //    ⇒ 只拦这一份、标待核对（不拦与草稿无关的合法新单）。
+      if (!cur || String(cur.draftId) !== String(snap.draftId)
+        || Number(cur.revision) !== Number(snap.draftRevision)
+        || String(cur.orderId || "") !== String(snap.orderId)) {
+        draftMarkPendingSnap(snap, owner);
+        return "blocked";
+      }
+    }
+    // ③ 还没写过（revision 0）的全新草稿：候选号是本机新号；就算槽已被别的草稿占了也与这份提交无关
+    //   （清理只删匹配版本，不会误删别人的）。重复 ID 由通用守门再兜一道。
+    return "ok";
+  }
+
+  // ================= 03 期：连续录入与历史商品名建议 =================
+  // 目标：手机上连着记两单时少重复点，且**绝不把上一笔的价格或快递信息带进新单**。四条边界：
+  //   ① 「保存并继续」只给**新建货单**（编辑既有单、收入单都不渲染这个入口），普通「保存」一个字不改。
+  //   ② 只有**一次本地保存确认成功**才进入下一单；失败时整张表单（含所有值与选择）原样保留。
+  //   ③ 下一单的默认值严格按规格重置：名称/垫付/邮费/单号/备注清空，数量 1、日期今天、状态在途，
+  //      **不带**旧订单 ID/批次/回款金额/回款日期；渠道默认清空（只有显式勾了「保留本次渠道」才沿用）。
+  //   ④ 历史商品名建议是**临时派生**（每次打开表单现算）：不建模板库、不加账本字段、不合并同名单、
+  //      不重做「再来一单」；点选**只改名称这一格**，金额/渠道/数量/日期等一个都不碰。
+  // 会话状态只活在内存里：普通保存 / 关窗 / 取消都结束本次连续录入，重新打开表单不记住任何选择。
+  let chainSession = { active: false, channel: "" };
+
+  // 近期商品名：按「下单日期新→旧、同日按 createdAt 新→旧」取前 N 个**去重**的非空名称。
+  // 排序与账本页同一套日期口径（不自造第二套）；同日同毫秒时用 name 兜底，保证顺序稳定可复现。
+  function recentNames(limit = 8) {
+    const seen = new Set();
+    const out = [];
+    const sorted = data.orders.slice().sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+      const ca = String(a.createdAt || ""), cb = String(b.createdAt || "");
+      if (ca !== cb) return ca < cb ? 1 : -1;
+      return String(a.name || "") < String(b.name || "") ? -1 : 1;
+    });
+    for (const o of sorted) {
+      const name = String(o.name || "").trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push(name);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  function renderRecentNames() {
+    const box = $("#formRecent");
+    if (!box) return;
+    const names = editingId ? [] : recentNames();
+    if (names.length === 0) { box.hidden = true; box.innerHTML = ""; return; }
+    box.hidden = false;
+    box.innerHTML = `<span class="rn-label">近期：</span>`
+      + names.map((n) => `<button type="button" class="rn" data-rn="${escapeHtml(n)}" title="${escapeHtml(n)}">${escapeHtml(n)}</button>`).join("");
+  }
+
+  // 「保存并继续」与「保留本次渠道」的显隐：都只服务**新建货单**。
+  function applyChainUi() {
+    const isNewOrder = !editingId && formKind === "order";
+    $("#formSaveNext").hidden = !isNewOrder;
+    $("#formKeepChannelWrap").hidden = !isNewOrder;
+    renderRecentNames();
+  }
+
+  // 一次成功保存之后把表单换成"下一单"的空白态。**刻意不关弹窗**（这正是"继续"的含义），
+  // 也刻意不整表重渲染——只把该清的清掉、该还原的还原，用户视线与键盘都不用挪。
+  function startNextOrder() {
+    const f = $("#orderForm");
+    chainSession.active = true;      // 本次连续录入开始了（结束于点保存/关窗/取消）
+    // 04 期：下一单＝一份**全新草稿**（新的候选 ID）——上一单的那份已经在保存成功时被消费掉了。
+    // 若上一份因为清理失败还留在槽里，这里会照实把它作为待处理的那份呈现出来，
+    // 而不是静默覆盖它。
+    const keep = !$("#formKeepChannel").hidden && $("#formKeepChannel").checked && channelTouched;
+    // 勾了"保留本次渠道"且这一单确实手选过渠道 ⇒ 记住它；勾着但没碰过渠道 ⇒ 沿用上次记住的那个
+    if ($("#formKeepChannel").checked) {
+      if (keep) chainSession.channel = String(f.channel.value || "").trim();
+    } else {
+      chainSession.channel = "";
+    }
+    editingId = null;
+    formSession = null;                 // 新建从一开始就没有编辑会话；这里显式保证
+    formKind = "order";
+    nameAuto = false;
+    channelTouched = false;
+    prefillPlatform = "";
+    f.goods.value = "";
+    f.cost.value = "";                  // 全新一单：金额从空开始（**绝不复用上一笔的价**）
+    f.fee.value = "";
+    f.tracking.value = "";              // 单号必然不同，空着比填错强
+    f.note.value = "";
+    f.qty.value = 1;
+    f.date.value = todayStr();
+    fillSelect(f.status, STATUSES.map((s) => [s, statusLabel(s)]), "在途");
+    // 渠道：默认清空（"未填写"）；只有沿用态才带上次那个值。空值也照既有做法补进选项表，
+    // 否则控件会因为没有匹配项而回空、摘要骗人（v33 渠道下拉踩过同一个坑）。
+    const chOpts = CHANNELS.slice();
+    const chVal = chainSession.channel;
+    if (!chOpts.includes(chVal)) chOpts.push(chVal);
+    fillSelect(f.channel, chOpts.map((c) => [c, c === "" ? "未填写" : c]), chVal);
+    $("#formBatchHint").hidden = true;
+    $("#formBatchHint").textContent = "";
+    $("#formIncomeHint").hidden = true;
+    $("#formIncomeHint").textContent = "";
+    $("#formMore").open = false;
+    $("#formTitle").textContent = "记一单";
+    $("#formKind").hidden = false;
+    applyKindUi();
+    applyChainUi();
+    draftOpenForNewForm({ forceNew: true });   // 04 期：下一单用**全新单号**；若还有未处理的旧槽，进"另记新的一单"（不覆盖旧槽）
+    formBaseline = controlState(f); // 新一单的没改动基线也跟着重置
+    setTimeout(() => f.goods.focus({ preventScroll: true }), 60);
   }
 
   // order：编辑既有单（editingId = 其 id）；prefill：「再来一单」预填（editingId 保持 null，保存即新建）
   function openForm(order, prefill) {
     const src = order || prefill || null;
+    formOpenSerial += 1;   // 03 期：这是新的一张表单，在飞的那次提交据此判定自己该不该关表单
     editingId = order ? order.id : null;
+    // 03 期：**每次打开表单都结束上一次的连续录入**（新建、编辑、再来一单都一样）——
+    // 「保留本次渠道」只活在"连着记"的这一串里，重开一次就不该记得它。
+    chainSession = { active: false, channel: "" };
+    $("#formKeepChannel").checked = false;
     // v38（报告 B2）：**编辑会话**（内存）——记下这次编辑依赖的账本代次 + 原单快照，写回前对表。
     // 整包换过账本（导入/云端拉取/重置/换身份，代次变）或原单被别的入口改过/删掉（快照变），
     // 这一次保存就**整笔拒绝**并保留草稿，绝不自动挑一边的值（旧表单值 vs 新账本值）。
@@ -1806,28 +3245,102 @@
     // v25：编辑表单**不加**类型切换（一律按货单形态回显，用户在该形态下自由改）
     $("#formKind").hidden = !!order;
     applyKindUi();
+    applyChainUi();      // 03 期：「保存并继续」/「保留本次渠道」只对新建货单出现；近期名称建议同此
+    // 04 期：编辑既有单不进草稿（也不承诺跨刷新恢复）；新建（含「再来一单」）看一眼当前身份的草稿槽
+    if (order) { draftState = null; draftRender(); }   // 编辑既有单：完全不用草稿
+    else draftOpenForNewForm();                       // 新建/再来一单：建一份新草稿，或请用户处理旧的那份
     openModal("#formModal");
+    // 基线必须在表单**建好之后**取：之后只有真改动才会与它不同（离开保护与草稿判据共用）
+    formBaseline = controlState(f);
     setTimeout(() => f.goods.focus(), 120);
   }
 
-  function closeForm() {
+  // force=true 只给"确实保存成功"那几条路用（避免保存成功后再弹一次"要丢改动吗"）——
+  // 这与 02-难点设计里"真正保存成功用显式 bypass"是同一条要求。
+  // 守门是 async（关窗补写要等与正式写同一把锁）：closeForm 等它落地再关；同步布尔路径保持原样。
+  function closeForm(force) {
+    if (force === true) { closeFormNow(); return true; }
+    const verdict = formLeaveGuard();
+    if (verdict && typeof verdict.then === "function") {
+      return verdict.then((ok) => { if (ok) closeFormNow(); return ok; });
+    }
+    if (!verdict) return false;
+    closeFormNow();
+    return true;
+  }
+  function closeFormNow() {
     closeModal("#formModal");
     editingId = null;
     formSession = null;   // v38：编辑会话随弹窗关闭一起作废（下次「编辑」会重新记一份）
+    formBaseline = null;
+    // 03 期：关窗（取消/遮罩/Esc/保存成功）＝结束本次连续录入，不记住"保留本次渠道"
+    chainSession = { active: false, channel: "" };
+    // 04 期：草稿**不在这里删**——它正是"被误关之后还能找回"的东西。只有保存成功那条路才消费它。
+    // 内存态留着（下次 openForm 会重新读槽），但把那句"已暂存"的提示收起来。
+    clearTimeout(draftTimer);
+    draftState = null;
+    draftRender();
+    return true;
   }
 
-  function submitForm(ev) { ev.preventDefault(); return withFormIntent(ev.target, formSession, () => formSession, () => submitFormImpl(ev)); }
-  function submitFormImpl(ev) {
+  function submitForm(ev) {
     ev.preventDefault();
-    const f = ev.target;
+    const snap = formIntentSnapshot(ev.target);
+    const gate = draftPrecheck(snap);
+    return withFormIntent(ev.target, formSession, () => formSession,
+      () => submitFormImpl(ev, false, snap), snap.serial, () => formOpenSerial, gate);
+  }
+  // 04 期：「保存并继续」除了草稿归属检查，还要在成功之后换成下一单的空白态。
+  function submitFormNext(ev) {
+    ev.preventDefault();
+    const form = $("#orderForm");
+    const snap = formIntentSnapshot(form);
+    const gate = draftPrecheck(snap);
+    // 合成一个与 form submit 同形的事件对象，让 submitFormImpl 不需要为这条入口分叉
+    return withFormIntent(form, formSession, () => formSession,
+      () => submitFormImpl({ preventDefault() { }, target: form }, true, snap), snap.serial, () => formOpenSerial, gate);
+  }
+  // 04 期：交给写守门的草稿归属检查。**在拿到排他锁之后、通用旧基线拒绝与任何改动之前**调用；
+  // 判定"这份草稿是不是已经提交过"只用账本与服务端无关的本机证据（DATA / 最近完整快照里的候选 orderId）。
+  function draftPrecheck(snap) {
+    if (!snap || snap.editingId) return null;
+    return () => {
+      const verdict = draftGateForSubmit(snap);
+      if (verdict === "duplicate") {
+        return { block: true, message: "这一单看起来已经记过了（草稿的候选单号已在账本里），这次没有重复保存" };
+      }
+      if (verdict === "blocked") {
+        return { block: true, message: "这份草稿在别处已经变过或已不在原状，本页不再提交它；请关掉后到账本里核对" };
+      }
+      return null;
+    };
+  }
+
+  function submitFormImpl(ev, chain, snap) {
+    ev.preventDefault();
+    let f = ev.target;
+    // 03 期：拿到写锁时如果**表单已经被重新打开过**（serial 变了），说明排队期间用户又开了新表单；
+    // 这次要写的是他点保存那一刻看到的那张表单 ⇒ 换成提交时抓下的快照读数，并把"关表单/进入下一单"
+    // 这两件事都跳过（现在开着的这张表单不属于这次提交，不该替用户关掉或清空）。
+    const reopened = !!(snap && snap.serial !== formOpenSerial);
+    if (reopened) f = snap;
     // v25：保存后表单已经关了（连点保存的第二次、或事件晚到的那一下）一律丢弃，
     // 保证「一次保存 → 恰好一条」。真实用户连点第二下时按钮已随弹窗隐藏，这里兜住程序化连点。
     if (!$("#formModal").classList.contains("show")) return;
-    const isIncome = formKind === "income" && !editingId;   // 编辑一律走货单路径
+    // 模式/编辑目标：被重新打开过时用提交那一刻的快照，否则读 live（与从前一字不差）
+    const kindAtSubmit = reopened ? snap.formKind : formKind;
+    const editingAtSubmit = reopened ? snap.editingId : editingId;
+    const prefillAtSubmit = reopened ? snap.prefillPlatform : prefillPlatform;
+    const isIncome = kindAtSubmit === "income" && !editingAtSubmit;   // 编辑一律走货单路径
     const name = String(f.goods.value || "").trim();
     const date = f.date.value || todayStr();
     if (!name) { toast(isIncome ? "先填名称" : "先填商品名称"); return; }
     if (!validAmountInputs([f.cost, f.fee])) return;
+
+    // 03 期：把原生校验那几条在 JS 里补上（`#formSaveNext` 绕过了 required/min/step），
+    // 让「保存」与「保存并继续」逐条同强度。负金额／三位小数从这里起就进不来。
+    const rawProblem = amountTextProblem(f, [["cost", "垫付金额"], ["fee", "邮费"]]);
+    if (rawProblem) { toast(rawProblem); return; }
 
     // —— v25 收入单：只填一个金额，没有垫付/邮费/数量，落库全部用**现有字段** ——
     if (isIncome) {
@@ -1836,7 +3349,7 @@
       const amount = numberValue(raw);
       if (amount < 0) { toast("金额不能是负数"); return; }
       const order = {
-        id: uid(),
+        id: (snap && snap.orderId) ? snap.orderId : uid(),   // 04 期：新单沿用草稿的候选 ID
         date,                                        // 用户只填一个日期：它既是发生日也是到账日
         name,
         platform: prefillPlatform,
@@ -1858,11 +3371,18 @@
       };
       data.orders.push(order);
       if (!saveData()) return;
-      closeForm();
+      clearTimeout(draftTimer);
+      // 保存成功才消费草稿（清不掉也不拦）。按**提交那一刻的快照**清：reopened 的提交也清得对那一份；
+      // draftClearSnapshot 锁内会再核 draftId+revision，别页推进过就不删（残留 → 下次按"待核对"处理）。
+      if (snap.draftClaimed) withStorageLock(() => draftClearSnapshot({ owner: String(snap.draftOwner || ""), draftId: String(snap.draftId), revision: Number(snap.draftRevision) || 0 }));
+      if (reopened) { toast("已记账"); return; }   // 现在开着的是另一张表单，别替用户关掉
+      closeForm(true);
       toast("已记账");
       switchView("list");
       return;
     }
+    // 03 期：只有「新建货单」这条路可能要求连续录入（收入单/编辑都不给那个入口，这里再兜一道）
+    const wantChain = !!chain && !editingAtSubmit && !isIncome;
 
     const cost = numberValue(f.cost.value);
     if (cost < 0) { toast("垫付金额不能是负数"); return; }
@@ -1871,8 +3391,8 @@
     //      ——那等于拿一份旧表单的草稿凭空造一条新记录；
     //   ② 账本整包被换过（代次变）或原单已被改过（快照对不上）：拒绝落库、草稿留在表单里供核对。
     // 对表放在「0 元购确认框」之前：失效的编辑连确认都不该弹（点完再报「没保存」是骗点击）。
-    const existing = editingId ? data.orders.find((o) => o.id === editingId) : null;
-    if (editingId && !existing) {
+    const existing = editingAtSubmit ? data.orders.find((o) => o.id === editingAtSubmit) : null;
+    if (editingAtSubmit && !existing) {
       toast("这一单已不在账本里，这次编辑没保存，请关掉重新核对");
       return;
     }
@@ -1898,10 +3418,10 @@
         + "那笔回款照旧按回款日期计入收入统计。")) return;
     }
     const order = {
-      id: existing ? existing.id : uid(),
+      id: existing ? existing.id : (snap && snap.orderId ? snap.orderId : uid()),   // 04 期：新单沿用草稿的候选 ID
       date,
       name,
-      platform: existing ? existing.platform : prefillPlatform,
+      platform: existing ? existing.platform : prefillAtSubmit,
       qty: Math.max(1, Math.round(numberValue(f.qty.value)) || 1),
       cost,
       pay: existing ? existing.pay : "",
@@ -1930,7 +3450,19 @@
     if (existing) Object.assign(existing, order, { id: existing.id });
     else data.orders.push(order);
     if (!saveData()) return;
-    closeForm();
+    clearTimeout(draftTimer);
+    // 同上：按提交那一刻的快照清理，reopened 也清得对（见 income 分支的注释）。
+    if (snap.draftClaimed) withStorageLock(() => draftClearSnapshot({ owner: String(snap.draftOwner || ""), draftId: String(snap.draftId), revision: Number(snap.draftRevision) || 0 }));
+    if (reopened) { toast(existing ? "已更新" : "已记账"); return; }   // 同上：这次提交不属于当前这张表单
+    if (wantChain) {
+      // 保存**已经确认成功**才进入下一单：到这里的 saveData() 返回真，账本已落库、已排同步。
+      // 失败（persist 返回 false）在上面那行就 return 了，整张表单原样留着，什么都不清。
+      switchView("list");
+      startNextOrder();
+      toast("已记账，接着记下一单");
+      return;
+    }
+    closeForm(true);
     toast(existing ? "已更新" : "已记账");
     switchView("list");
   }
@@ -1969,14 +3501,27 @@
     $("#payTitle").textContent = `${payEditMode ? "改回款" : "回款"} · ${o.name}`;
     updatePayPreview();
     openModal("#payModal");
+    payBaseline = controlState(f);      // 04 期：预填之后取基线，"没动过"才不会被问
     setTimeout(() => f.income.focus(), 120);
   }
 
-  function closePayForm() {
+  // 04 期（独立复核 P0-2）：回款弹窗也要"确有未保存改动才提醒"。基线在 openPayForm 预填之后取，
+  // 所以"打开看一眼就关"不会被问，只提示**当前**改动会丢——**不承诺**刷新后能恢复（规格明文）。
+  function payLeaveGuard() {
+    const modal = $("#payModal");
+    if (!modal.classList.contains("show")) return true;
+    if (payBaseline === null || controlState($("#payForm")) === payBaseline) return true;
+    return confirm("回款这里有还没保存的改动，离开就丢了。\n确定离开？");
+  }
+
+  function closePayForm(force) {
+    if (force !== true && !payLeaveGuard()) return false;
     closeModal("#payModal");
     payTargetId = null;
     payEditMode = false;
     paySession = null;   // v38：会话随弹窗关闭一起作废（下次打开重新记一份）
+    payBaseline = null;
+    return true;
   }
 
   function updatePayPreview() {
@@ -2016,7 +3561,7 @@
     o.incomeDate = f.incomeDate.value || todayStr();
     if (!wasEdit) o.status = "已回款";
     if (!saveData()) return;
-    closePayForm();
+    closePayForm(true);      // 04 期：保存成功用显式 bypass，别再问一次
     toast(wasEdit ? `已改回款 ${money(income)}，利润 ${money(orderProfit(o))}` : `已回款 ${money(income)}，利润 ${money(orderProfit(o))}`);
   }
 
@@ -2402,9 +3947,11 @@
     }
     if (pool.length === 0) { toast("没有在途单可结算"); return; }
     const groups = batchGroups();
-    // 同批次的单排在一起、批次日期新的在前（先摊了邮费的那批最好找），没成批的殿后
+    // 同批次的单排在一起、批次日期新的在前（先摊了邮费的那批最好找），没成批的殿后。
+    // 比较器必须自洽：日期相等返回 0（原来 a.date<b.date?1:-1 在相等时两个方向都给 -1，
+    // 是自相矛盾的比较器 ⇒ 同日两单的先后成了实现定义，还会跟账本页「先记的在上」对不上）。
     const rank = new Map();
-    pool.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((o) => {
+    pool.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).forEach((o) => {
       if (!o.batchId || rank.has(o.batchId)) return;
       const g = groups.get(o.batchId);
       rank.set(o.batchId, g ? g.date : "");
@@ -2412,11 +3959,11 @@
     pool.sort((a, b) => {
       const ra = a.batchId ? rank.get(a.batchId) : undefined;
       const rb = b.batchId ? rank.get(b.batchId) : undefined;
-      if (ra === undefined && rb === undefined) return a.date < b.date ? 1 : -1;
+      if (ra === undefined && rb === undefined) return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
       if (ra === undefined) return 1;
       if (rb === undefined) return -1;
       if (ra !== rb) return ra < rb ? 1 : -1;
-      return a.date < b.date ? 1 : -1;
+      return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
     });
     batchItems = pool.map((o) => ({
       id: o.id, name: o.name, cost: o.cost, batchId: o.batchId,
@@ -2436,6 +3983,7 @@
     $("#batchDate").value = todayStr();
     renderBatchList();
     openModal("#batchModal");
+    batchBaseline = controlState($("#batchModal"));   // 04 期：渲染之后取基线
   }
 
   // 所勾选的单恰好是某个已存在批次的整批原班人马吗？→ 提交时复用该批次号（v19 的既有规则），
@@ -2462,7 +4010,21 @@
   function updateBatchNote() {
     const box = $("#batchNote");
     if (!box) return;
-    const prev = selectedBatchInfo().prev;
+    const sel = selectedBatchInfo();
+    const prev = sel.prev;
+    // 2026-09-27 补强 D：日期说明与「这一批记着多少钱」分开判——既有批次**不管有没有记过钱**
+    // 都要说清「批次日期保持原值、这格是本次到账日期」，否则勾选刚成批（还没钱）时误导照旧。
+    const hint = $("#batchDateHint");
+    if (hint) {
+      if (prev) {
+        hint.hidden = false;
+        hint.innerHTML = `这一批的批次日期是 <b>${escapeHtml(prev.date || "（空）")}</b>，保持不变。`
+          + `上面这格是<b>本次到账日期</b>：填正数回款就按它记；只改邮费不动任何日期。`;
+      } else {
+        hint.hidden = false;
+        hint.innerHTML = `新建／重组批次：这格既是<b>批次日期</b>，也是<b>本次到账日期</b>（填正数回款时按它记）。`;
+      }
+    }
     const show = !!(prev && (prev.feeCents > 0 || prev.incomeCents > 0));
     if (!show) { box.hidden = true; box.innerHTML = ""; return; }
     const bits = [];
@@ -2474,10 +4036,22 @@
       + `两个框<b>留空＝不动</b>；填 0＝<b>删掉这一批的这笔钱</b>。</div>`;
   }
 
-  function closeBatchModal() {
+  // 04 期（独立复核 P0-2）：批量结算也要"确有未保存改动才提醒"。基线在弹窗渲染之后取
+  //（勾选是控件状态，controlState 会带上 checked），所以"点开看一眼就关"不会被问。
+  function batchLeaveGuard() {
+    const modal = $("#batchModal");
+    if (!modal.classList.contains("show")) return true;
+    if (batchBaseline === null || controlState(modal) === batchBaseline) return true;
+    return confirm("批量结算这里还没保存的改动，离开就丢了。\n确定离开？");
+  }
+
+  function closeBatchModal(force) {
+    if (force !== true && !batchLeaveGuard()) return false;
     closeModal("#batchModal");
     batchItems = [];
     batchSession = null;   // v38：会话随弹窗关闭一起作废
+    batchBaseline = null;
+    return true;
   }
 
   function renderBatchList() {
@@ -2569,7 +4143,7 @@
     for (const [selector, label] of [
       ["#batchFee", "本批邮费"],
       ["#batchIncome", "对方总回款"],
-      ["#batchDate", "回款日期"],
+      ["#batchDate", "本次到账日期"],
     ]) {
       const input = $(selector);
       if (!input.checkValidity()) {
@@ -2696,7 +4270,7 @@
     });
 
     if (!saveData()) return;
-    closeBatchModal();
+    closeBatchModal(true);   // 04 期：保存成功用显式 bypass
     const amounts = [];
     if (feeGiven) amounts.push(`邮费 ${money(feeCents / 100)}`);
     if (incomeGiven) amounts.push(`回款 ${money(incomeCents / 100)}`);
@@ -3414,7 +4988,7 @@
 
   function dismissModal(modal) {
     const close = { formModal: closeForm, payModal: closePayForm, batchModal: closeBatchModal,
-      baodanModal: closeBaodan, settingsModal: closeSettings };
+      baodanModal: closeBaodan, lookupModal: closeLookup, shipModal: closeShipForm, settingsModal: closeSettings };
     if (modal && close[modal.id]) close[modal.id]();
   }
 
@@ -3452,8 +5026,36 @@
   }
 
   // ---- 事件绑定 ----
+  // 卡片/表头上那些 data-act 按钮的**唯一**处理支——账本页 (#orderList) 与查账面板 (#lookupList)
+  // 共用它，免得两条路各写一套、日子久了行为分叉。
+  // v32：折叠开关（触发区只有表头第一行那个 button，它里面没有嵌套按钮）。注意判断顺序：落在别的
+  // 按钮上时 closest 先命中的是那个按钮，下面这些分支各走各的，折叠只在真的点到 .bh-top 时发生——
+  // 所以点「改本批邮费」不会顺手收起这一批。
+  function handleCardAction(btn) {
+    if (btn.dataset.act === "btoggle") { toggleBatchBlock(btn); return; }
+    const { act, id } = btn.dataset;
+    if (act === "pay") openPayForm(id);
+    else if (act === "dup") duplicateOrder(id);
+    else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
+    else if (act === "unbatch") leaveBatch(id);
+    // 02 期：补寄出信息（散单＝这一单；批内单＝这一整批，范围由 openShipForm 定死）
+    else if (act === "ship") {
+      const o = data.orders.find((x) => x.id === id);
+      if (!o) return;
+      openShipForm(o.batchId ? { kind: "batch", batchId: o.batchId } : { kind: "loose", id: o.id });
+    }
+    // 批次表头上的「改本批邮费」：直接开批量结算并预选这一批的全部成员（含已回款的）
+    else if (act === "batchfee") openBatchModal(btn.dataset.batch || "");
+    // v28：批次表头上的「报单」——范围就是这一批的全部成员（不看在不在途：报单发生在寄出后）
+    else if (act === "baodan") openBaodan({ type: "batch", batchId: btn.dataset.batch || "" });
+    // v35：分项利润行内编辑 + 恢复默认分摊（都只动这一批的回款分摊，整批总额不变）
+    else if (act === "pedit") startProfitEdit(btn);
+    else if (act === "breset") resetBatchShares(btn.dataset.batch || "");
+    else if (act === "del") deleteOrder(id);
+  }
+
   function bind() {
-    const modalTitles = { formModal: "formTitle", payModal: "payTitle", batchModal: "batchTitle", baodanModal: "baodanTitle", settingsModal: "settingsTitle" };
+    const modalTitles = { formModal: "formTitle", payModal: "payTitle", batchModal: "batchTitle", baodanModal: "baodanTitle", lookupModal: "lookupTitle", shipModal: "shipTitle", settingsModal: "settingsTitle" };
     $$(".modal").forEach((modal) => {
       modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true");
       modal.setAttribute("aria-labelledby", modalTitles[modal.id]); modal.tabIndex = -1;
@@ -3483,6 +5085,21 @@
       }
     });
     window.addEventListener("storage", (event) => {
+      // 04 期：草稿键单独处理——**别页推进了同一份草稿**时锁住本页的草稿写入、保留 DOM 输入、提示冲突；
+      // 不合并、不最后写入获胜。（草稿键与账本键互不影响：草稿事件不触发账本被更新那条暂停。）
+      if (event.storageArea === localStorage && event.key && event.key.indexOf(DRAFT_KEY_PREFIX + ":") === 0) {
+        const owner = draftOwner();
+        if (!owner || event.key !== draftKeyFor(owner) || !draftState || editingId) return;
+        const cur = draftRead(owner);
+        if (!cur) return;                       // 别页删掉了草稿：不自动处理，留给用户（不静默重建）
+        if (String(cur.draftId) !== String(draftState.draftId)
+          || Number(cur.revision) !== Number(draftState.revision)) {
+          draftState.conflict = true;
+          draftState.status = "conflict";
+          draftRender();
+        }
+        return;
+      }
       if (event.storageArea !== localStorage || (event.key !== null && ![DATA_KEY, SNAPSHOT_KEY, IDENTITY_KEY].includes(event.key))) return;
       if (!storageBaseline || (identityRaw() === storageBaseline.identity && localStorage.getItem(DATA_KEY) === storageBaseline.data && localStorage.getItem(SNAPSHOT_KEY) === storageBaseline.snapshot)) return;
       ++syncEpoch; pairingEpoch = null; invalidateForNewLedger();
@@ -3514,24 +5131,7 @@
 
     $("#orderList").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-act]");
-      if (!btn) return;
-      // v32：折叠开关（触发区只有表头第一行那个 button，它里面没有嵌套按钮）。
-      // 注意判断顺序：落在别的按钮上时 closest 先命中的是那个按钮，下面这些分支各走各的，
-      // 折叠只在真的点到 .bh-top 时发生——所以点「改本批邮费」不会顺手收起这一批。
-      if (btn.dataset.act === "btoggle") { toggleBatchBlock(btn); return; }
-      const { act, id } = btn.dataset;
-      if (act === "pay") openPayForm(id);
-      else if (act === "dup") duplicateOrder(id);
-      else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
-      else if (act === "unbatch") leaveBatch(id);
-      // 批次表头上的「改本批邮费」：直接开批量结算并预选这一批的全部成员（含已回款的）
-      else if (act === "batchfee") openBatchModal(btn.dataset.batch || "");
-      // v28：批次表头上的「报单」——范围就是这一批的全部成员（不看在不在途：报单发生在寄出后）
-      else if (act === "baodan") openBaodan({ type: "batch", batchId: btn.dataset.batch || "" });
-      // v35：分项利润行内编辑 + 恢复默认分摊（都只动这一批的回款分摊，整批总额不变）
-      else if (act === "pedit") startProfitEdit(btn);
-      else if (act === "breset") resetBatchShares(btn.dataset.batch || "");
-      else if (act === "del") deleteOrder(id);
+      if (btn) handleCardAction(btn);
     });
 
     // v35：行内利润输入框 —— change（blur/回车）＝提交；Enter 只负责触发 change（blur）；
@@ -3548,8 +5148,147 @@
       else if (ev.key === "Escape") { ev.preventDefault(); rerenderBatchBlock((data.orders.find((x) => x.id === inp.dataset.id) || {}).batchId || ""); }
     });
 
+    // ---- 01 期：查账面板（只读查找视图）的入口与交互 ----
+    $("#lookupBtn").addEventListener("click", openLookup);
+    $("#lookupClose").addEventListener("click", closeLookup);
+    // 关键词：**只重绘结果区，绝不重建输入框本身**——所以焦点、软键盘与输入法候选都不会被打断。
+    // 中文组词期间（isComposing / compositionstart→compositionend 之间）刻意**不重绘**，
+    // 组词一结束再算一次：打字打到一半结果列表乱跳，是最容易把候选框打飞的做法。
+    $("#lookupInput").addEventListener("compositionstart", () => { lookup.composing = true; });
+    $("#lookupInput").addEventListener("compositionend", (ev) => {
+      lookup.composing = false;
+      lookup.q = ev.target.value;
+      renderLookup();
+    });
+    $("#lookupInput").addEventListener("input", (ev) => {
+      lookup.q = ev.target.value;
+      if (lookup.composing || ev.isComposing) return;
+      renderLookup();
+    });
+    // <input type="search"> 上点原生小叉会走 search 事件（不冒泡，得挂在元素自己身上）
+    $("#lookupInput").addEventListener("search", (ev) => { lookup.q = ev.target.value; renderLookup(); });
+    $("#lookupClear").addEventListener("click", () => {
+      lookup.q = "";
+      $("#lookupInput").value = "";
+      // 清空后把焦点还给关键词框：接着就能打字，且不移动页面（focus 的默认滚动被 preventScroll 挡掉）
+      $("#lookupInput").focus({ preventScroll: true });
+      renderLookup();
+    });
+    $("#lookupStatus").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-lkstatus]");
+      if (!btn) return;
+      lookup.status = btn.dataset.lkstatus;   // 切状态**不重置**关键词与日期（三个条件取交集）
+      renderLookup();
+    });
+    $("#lookupDateBtn").addEventListener("click", () => {
+      lookup.panel = !lookup.panel;
+      // 展开时从与当前范围相符的那一层开始：某年 → 看月；某月/某日 → 看日；全部/待核对 → 看年
+      if (lookup.panel) {
+        lookup.level = lookup.dateMode === "y" ? "month"
+          : (lookup.dateMode === "ym" || lookup.dateMode === "ymd") ? "day" : "year";
+      }
+      renderLookup();
+    });
+    $("#lookupDates").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn) return;
+      const ds = btn.dataset;
+      const go = (level) => { if (level) lookup.level = level; renderLookup(); };
+      // 「全部日期」/「日期待核对」都把面板**带回年份层**：不复位 level 的话，面板会停在一个
+      // 已经无意义的层上（比如选过 2026-01 再点全部日期，月层还拿着 y=2026、标题却能显示成 0-00）。
+      if (ds.lkall) { lookupSetDate("all"); go("year"); return; }
+      if (ds.lkbad) { lookupSetDate("bad"); go("year"); return; }
+      if (ds.lkyear) { lookupSetDate("y", lookup.y); go("month"); return; }
+      if (ds.lkmonth) { lookupSetDate("ym", lookup.y, lookup.m); go("day"); return; }
+      if (ds.lkback) { go(ds.lkback); return; }
+      // 点年份＝看整年并下钻到月；点月份＝看整月并下钻到日；点某日＝只看那一天
+      if (ds.lky !== undefined) { lookupSetDate("y", Number(ds.lky)); go("month"); return; }
+      if (ds.lkm !== undefined) { lookupSetDate("ym", lookup.y, Number(ds.lkm)); go("day"); return; }
+      if (ds.lkd !== undefined) { lookupSetDate("ymd", lookup.y, lookup.m, Number(ds.lkd)); go(); return; }
+    });
+    // 结果区：卡片上的**单笔**动作走与账本页同一个 handleCardAction（范围无歧义）；
+    // 「查看完整批次 / 只看命中」是查账面板自己的开关（内存态，不落库）。
+    $("#lookupList").addEventListener("click", (ev) => {
+      const whole = ev.target.closest("button[data-lkwhole]");
+      if (whole) {
+        const id = whole.dataset.lkwhole;
+        if (lookup.expanded.has(id)) lookup.expanded.delete(id); else lookup.expanded.add(id);
+        renderLookupList();
+        return;
+      }
+      const btn = ev.target.closest("button[data-act]");
+      if (btn) handleCardAction(btn);
+    });
+
+    // ---- 02 期：寄出信息面板 ----
+    $("#shipCancel").addEventListener("click", closeShipForm);
+    $("#shipSubmit").addEventListener("click", submitShip);
+    // 单号那一格：写不写只看**当前值**（非空就写）或"是否点了清空"，所以这里输入只需要
+    // 把"清空意图"撤掉——用户改回手输，意图就由值本身表达了。
+    $("#shipTracking").addEventListener("input", () => { if (shipSession) shipSession.trackingClear = false; updateShipTrackingHint(); });
+    $("#shipTrackingClear").addEventListener("click", (ev) => {
+      ev.preventDefault();
+      $("#shipTracking").value = "";
+      if (shipSession) shipSession.trackingClear = true;     // 清空＝明确意图，不是"没改"
+      updateShipTrackingHint();
+      $("#shipTracking").focus({ preventScroll: true });
+    });
+    $("#shipFeeClear").addEventListener("click", (ev) => {
+      ev.preventDefault();
+      // 邮费那一格留空＝不改，所以「清空」不能也做成留空（那等于没按钮）。
+      // 照 #payForm 回款那一格的既有做法：清空＝**置 0**（置 0 本来就是明确意图，常见于包邮）。
+      $("#shipFee").value = "0";
+      $("#shipFee").focus({ preventScroll: true });
+    });
+
+    // ---- 04 期：新单草稿 ----
+    // 草稿条上的两个选择：继续那一单 / 丢弃草稿。**恢复只回填，仍然要用户自己点保存**。
+    $("#formDraftBar").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-draft]");
+      if (!btn) return;
+      ev.preventDefault();
+      const what = btn.dataset.draft;
+      if (what === "continue") draftApplyToForm();
+      else if (what === "newone") draftEnterNewOrder();
+      else if (what === "discard") await draftDiscard();     // 04 审查第 4 项：等真实结果再说话
+    });
+    // 任何一格的输入/选择变动都尝试暂存（防抖 400ms）。**只在新单这条路上生效**（draftSchedule 自己判），
+    // 编辑既有单完全不碰草稿。
+    $("#orderForm").addEventListener("input", () => { if (!editingId) draftSchedule(); });
+    $("#orderForm").addEventListener("change", () => { if (!editingId) draftSchedule(); });
+    // ---- 03 期：连续录入与历史商品名建议 ----
+    $("#formSaveNext").addEventListener("click", submitFormNext);
+    // 近期名称建议：**只改名称这一格**——不碰金额、渠道、数量、日期、备注，也不自动提交。
+    // 点完把光标留在这格后面，方便接着改（手机上不弹键盘，用户想改再点）。
+    $("#formRecent").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-rn]");
+      if (!btn) return;
+      ev.preventDefault();
+      const f = $("#orderForm");
+      f.goods.value = btn.dataset.rn;
+      nameAuto = false;      // 这是用户选的，不是我们替他补的默认值
+      f.goods.focus({ preventScroll: true });
+    });
+
+    // ---- 05 期：查账 / 核对 两个页签，以及清单里的「去查看这一单」 ----
+    $("#lkTabs").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-lktab]");
+      if (btn) setLookupTab(btn.dataset.lktab);
+    });
+    $("#lkFocusBack").addEventListener("click", () => {
+      lookup.focusId = "";
+      lookup.focusBatchId = "";
+      setLookupTab("check");                 // 回到核对清单（原路返回）
+    });
+    $("#checkList").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-chk-go], button[data-chk-batch]");
+      if (!btn) return;
+      // 只带路，不代写：真正的补录/编辑仍走 01/02 自己的入口与写守门
+      checklistGoTo(btn.dataset.chkGo || "", btn.dataset.chkBatch || "");
+    });
+
     $("#orderForm").addEventListener("submit", submitForm);
-    $("#formCancel").addEventListener("click", closeForm);
+    $("#formCancel").addEventListener("click", () => closeForm());   // 04 期：取消要过离开保护（有改动才问）
     // v25：记单表单顶部的类型切换（货单 / 收入）。切换只动显隐与默认值，不写任何数据。
     $("#formKind").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-kind]");
@@ -3565,7 +5304,7 @@
     $("#orderForm").status.addEventListener("change", updateFormMoreSummary);
 
     $("#payForm").addEventListener("submit", submitPay);
-    $("#payCancel").addEventListener("click", closePayForm);
+    $("#payCancel").addEventListener("click", () => closePayForm());
     $("#payForm").addEventListener("input", updatePayPreview);
     $("#payQuick").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-add]");
@@ -3611,7 +5350,7 @@
     $("#baodanTracking").addEventListener("input", () => { markBaodanChanged(); renderBaodan(); });
     $("#baodanText").addEventListener("input", markBaodanChanged);
     $("#baodanTracking").addEventListener("change", () => commitBaodanTracking());
-    $("#batchCancel").addEventListener("click", closeBatchModal);
+    $("#batchCancel").addEventListener("click", () => closeBatchModal());
     $("#batchSubmit").addEventListener("click", submitBatch);
     // v24：弹窗里那一行只是说明（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉），没有可点的选择
     $("#batchList").addEventListener("change", (ev) => {

@@ -336,6 +336,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   border: 1px solid var(--teal-line); background: var(--card); color: var(--accent);
   border-radius: 99px; padding: 7px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
   transition: all .15s;
+  /* 2026-09-27 补强 D：批次表头动作（改本批邮费/报单/恢复默认分摊）点击区 ≥44px */
+  min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
 }
 .bh-act:active { transform: scale(.96); background: var(--accent-soft); }
 .bh-note { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
@@ -369,6 +371,9 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   border: 1px solid var(--line); background: var(--card); color: var(--ink);
   border-radius: 9px; padding: 6px 12px; font-size: 13px; cursor: pointer;
   transition: all .15s;
+  /* 2026-09-27 补强 D：卡片动作（回款/补寄出/编辑…）是高频手机操作，点击区 ≥44px；
+     .order-actions 本就 flex-wrap，360px 下换行不断横向溢出 */
+  min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
 }
 .act:active { transform: scale(.96); }
 .act.primary { background: var(--accent-soft); border-color: rgba(20, 184, 166, .35); color: var(--accent); font-weight: 600; }
@@ -386,6 +391,7 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   box-shadow: 0 10px 24px -6px rgba(13, 148, 136, .55); cursor: pointer;
   display: flex; align-items: center; gap: 6px;
   transition: transform .15s;
+  min-height: 44px;   /* 2026-09-27 补强 D：主入口点击区 ≥44px */
 }
 #fab:active { transform: scale(.95); }
 .fab-plus { font-size: 17px; font-weight: 700; }
@@ -398,8 +404,10 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .tabbar button {
   border: 0; background: none; color: var(--muted); font-size: 12px;
-  display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; cursor: pointer;
   width: 68px;
+  /* 2026-09-27 补强 D：底部页签点击区 ≥44px */
+  min-height: 44px;
 }
 .tabbar button.on { color: var(--accent); font-weight: 600; }
 
@@ -469,10 +477,38 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .more summary { cursor: pointer; padding: 4px 0; }
 .more[open] summary { margin-bottom: 8px; }
 .sheet-actions { display: flex; gap: 10px; margin-top: 14px; }
+/* 2026-09-27 补强 D：吸底操作区（批量结算 / 补寄出面板）。
+   .sheet 本身就是滚动容器，sticky bottom:0 让「金额摘要 + 提交」在长名单滚动时始终可达；
+   元素仍占布局位（内容不被永久遮挡），负下边距把 .sheet 的底部内边距收进来、
+   滚动中也不会从它下面露出内容。 */
+.sheet-foot {
+  position: sticky; bottom: 0; z-index: 5;
+  background: var(--card);
+  margin: 14px -18px calc(-20px - env(safe-area-inset-bottom));
+  padding: 10px 18px calc(20px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+}
+.sheet-foot .sheet-actions { margin-top: 10px; }
+.sheet-foot .batch-summary { margin-bottom: 0; }
+/* 2026-09-27 补强 D：补寄出面板的成员折叠块——摘要行本身就是 ≥44px 的点击区，
+   展开与否不改变名单内容与范围（范围写在摘要与 #shipScopeNote 里） */
+.members-fold { margin: 2px 0 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+.members-fold > summary {
+  list-style: none; cursor: pointer; min-height: 44px;
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px; font-size: 12px; color: var(--muted);
+}
+.members-fold > summary::-webkit-details-marker { display: none; }
+.members-fold > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .15s; }
+.members-fold[open] > summary::after { transform: rotate(180deg); }
+.members-fold[open] > summary { border-bottom: 1px solid var(--line); }
+.members-fold .batch-list { margin-bottom: 0; border: 0; border-radius: 0 0 12px 12px; }
 .btn {
   border: 1px solid var(--line); background: var(--card); color: var(--ink);
   border-radius: 11px; padding: 12px 16px; font-size: 15px; cursor: pointer;
   flex: 1; text-align: center; transition: all .15s;
+  /* 2026-09-27 补强 D：高频主操作点击区域 ≥44 CSS px（含弹窗的保存/取消/结算/保存寄出信息） */
+  min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
 }
 .btn:active { transform: scale(.98); }
 .btn.primary {
@@ -511,6 +547,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   border: 1px solid var(--teal-line); background: var(--card); color: var(--accent);
   border-radius: 99px; padding: 6px 13px; font-size: 13px; font-weight: 600; cursor: pointer;
   transition: all .15s;
+  /* 2026-09-27 补强 D：查账/批量结算/报单三个高频入口点击区 ≥44px */
+  min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
 }
 .batch-btn:active { transform: scale(.96); background: var(--accent-soft); }
 .batch-sub { font-size: 12px; color: var(--muted); margin: -6px 0 12px; }
@@ -717,3 +755,148 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   .sheet { border-radius: 20px; }
   body { padding-bottom: 96px; }
 }
+
+/* ---- 01 期：查账面板（只读查找视图）----
+   它是 .modal 里的一张 sheet，所以页面级版面判据（body 扫描）本来就跳过它；
+   这里只用现有的色板变量排版，不引入新的视觉语言。
+   三条硬约束都落在样式里：① 关键词框在**重绘结果时不重建**（见 app.js 的 renderLookupList），
+   所以打字期间焦点与软键盘不会被收走；② 结果区只滚动自己（.lk-sheet 是纵向滚动容器），
+   不把整页顶上去；③ 触控目标（日期格子/状态 chip）最小 44px 高，单手可点。 */
+.lk-sheet { max-height: 92vh; display: flex; flex-direction: column; }
+.lk-search { position: relative; flex: 0 0 auto; margin-bottom: 10px; }
+.lk-search input {
+  width: 100%; height: 46px; min-height: 46px; margin: 0; padding: 0 62px 0 13px;
+  border: 1px solid var(--line); border-radius: 12px;
+  font-size: 16px; color: var(--ink); background: var(--card);
+  appearance: none; -webkit-appearance: none;
+}
+.lk-search input:focus { outline: none; border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(20, 184, 166, .16); }
+.lk-x {
+  position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
+  height: 30px; padding: 0 11px; border: 1px solid var(--line); border-radius: 99px;
+  background: var(--bg); color: var(--muted); font-size: 12px; font-family: inherit; cursor: pointer;
+}
+.lk-x:active { background: var(--accent-soft); color: var(--accent); }
+.lk-bar { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; flex: 0 0 auto; }
+.lk-bar .chips { flex: 1 1 auto; min-width: 0; }
+.lk-dates {
+  flex: 0 0 auto; margin: 2px 0 10px; padding: 10px 12px;
+  border: 1px solid var(--teal-line); border-radius: 14px;
+  background: linear-gradient(135deg, #eefaf7, #dff3ee);
+}
+.lk-dnav { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.lk-dlabel { font-size: 13px; font-weight: 700; color: var(--hero-ink); margin-right: auto; }
+.lk-dnav button {
+  height: 30px; padding: 0 11px; border: 1px solid var(--teal-line); border-radius: 99px;
+  background: var(--card); color: var(--accent); font-size: 12px; font-weight: 600;
+  font-family: inherit; cursor: pointer;
+}
+.lk-dnav button:active { background: var(--accent-soft); }
+.lk-dgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 7px; }
+.lk-dcell {
+  min-height: 44px; padding: 5px 6px; border: 1px solid var(--line); border-radius: 11px;
+  background: var(--card); color: var(--ink); font-family: inherit; font-size: 13px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  cursor: pointer; transition: all .15s;
+}
+.lk-dcell:active { background: var(--accent-soft); }
+.lk-dcell.on { background: #0e1f1c; border-color: #0e1f1c; color: #e6f2f0; }
+.lk-dcell .lk-n { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.lk-dcell.on .lk-n { color: var(--accent-2); }
+/* 没记录的日子仍是可点的合法日期（用户可能就是在找「那天是不是漏记了」），但视觉上弱化 */
+.lk-dcell.zero { color: var(--muted); }
+.lk-dcell.zero .lk-n { color: var(--line); }
+.lk-dnote { font-size: 11px; color: var(--muted); margin: 8px 0 0; }
+.lk-meta { font-size: 12px; color: var(--muted); margin: 0 0 8px; flex: 0 0 auto; }
+.lk-meta b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.lk-bh { border-radius: 14px 14px 10px 10px; }
+.lk-bh .lk-hit {
+  font-size: 12px; font-weight: 700; color: var(--hero-ink);
+  white-space: nowrap; margin-left: auto;
+}
+.lk-bh .lk-whole { color: var(--muted); font-weight: 400; }
+.lk-rest {
+  font-size: 12px; color: var(--muted); text-align: center;
+  border-top: 1px dashed var(--line); padding-top: 8px; margin: 3px 0 8px;
+}
+.lk-flag { font-size: 11px; color: var(--muted); margin: 3px 0 0; }
+.order-card.lk-miss { opacity: .62; }
+
+/* ---- 03 期：连续录入与历史商品名建议 ---- */
+/* 近期商品名建议：一排小药丸，横向可换行。它是**临时派生**的（每次打开表单现算），
+   不落库、不进同步包、不建模板库。长名字画省略号，免得把行撑出去。 */
+.recent-names { display: flex; flex-wrap: wrap; gap: 6px; margin: -6px 0 11px; }
+.recent-names .rn-label { font-size: 11px; color: var(--muted); align-self: center; }
+.recent-names .rn {
+  flex: 0 1 auto; max-width: 100%; min-width: 0;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  border-radius: 99px; padding: 5px 11px; font-size: 12px; font-family: inherit; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: all .15s;
+}
+.recent-names .rn:active, .recent-names .rn:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--teal-line); }
+/* 「保留本次渠道」：默认不勾。复选框要抹掉 .sheet input 的整行样式（否则会是 100% 宽、46px 高的大方块） */
+.keep-channel {
+  display: flex; align-items: center; gap: 7px; margin: 4px 0 0;
+  font-size: 12px; color: var(--muted); cursor: pointer;
+}
+#formKeepChannel {
+  width: 18px; height: 18px; min-height: 0; margin: 0; padding: 0;
+  flex: 0 0 auto; accent-color: var(--accent);
+  appearance: auto; -webkit-appearance: checkbox;
+}
+/* 「保存并继续」自己占一整行：`.btn` 是 flex:1，三个按钮挤一行在 360px 上会把文字压折。
+   只作用于记单表单，不动其它弹窗的 .sheet-actions。 */
+#orderForm .sheet-actions { flex-wrap: wrap; }
+#orderForm .sheet-actions #formSaveNext { flex: 1 1 100%; }
+
+/* ---- 04 期：新单草稿条（本机、按身份隔离、不上传）---- */
+.draft-bar {
+  margin: 0 0 12px; padding: 9px 12px;
+  border: 1px solid var(--teal-line); border-radius: 12px;
+  background: linear-gradient(135deg, #eefaf7, #dff3ee);
+  font-size: 12px; color: var(--hero-ink); line-height: 1.5;
+}
+.draft-bar.warn { border-color: var(--neg-soft); background: var(--neg-soft); color: var(--neg); }
+.draft-bar.muted { border-color: var(--line); background: var(--bg); color: var(--muted); }
+.draft-bar .dr-acts { display: flex; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
+.draft-bar .dr-acts button {
+  min-height: 44px; padding: 0 14px; border: 1px solid var(--teal-line); border-radius: 99px;
+  background: var(--card); color: var(--accent); font-size: 12px; font-weight: 600;
+  font-family: inherit; cursor: pointer;
+  /* 2026-09-27 补强 D：草稿条按钮（继续/另记新的一单/丢弃）点击区 ≥44px */
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.draft-bar .dr-acts button:active { background: var(--accent-soft); }
+.draft-bar .dr-acts button.ghost { border-color: var(--line); color: var(--muted); background: var(--bg); }
+
+/* ---- 05 期：核对清单（只读派生） ---- */
+.lk-tabs { margin: 0 0 12px; flex: 0 0 auto; }
+.lk-tabs .seg b { font-weight: 600; color: var(--accent); margin-left: 3px; }
+.lk-focusback { margin: 2px 0 8px; }
+.chk-group { margin-bottom: 12px; }
+.chk-head {
+  display: flex; align-items: baseline; gap: 7px; margin: 0 0 6px;
+  font-size: 12px; font-weight: 700; color: var(--hero-ink);
+}
+.chk-head .chk-n { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+.chk-head.warn { color: var(--neg); }
+.chk-head.todo { color: var(--accent); }
+.chk-head.low, .chk-head.info { color: var(--muted); font-weight: 600; }
+.chk-item {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+  padding: 9px 12px; margin-bottom: 7px;
+}
+.chk-item .ci-title { font-size: 13px; font-weight: 600; color: var(--ink); }
+.chk-item .ci-who { font-size: 12px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.chk-item .ci-money { font-size: 12px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.chk-item .ci-act { margin-top: 7px; }
+.chk-item .ci-act button {
+  min-height: 44px; padding: 0 14px; border: 1px solid var(--teal-line); border-radius: 99px;
+  background: var(--bg); color: var(--accent); font-size: 12px; font-weight: 600;
+  font-family: inherit; cursor: pointer;
+  /* 2026-09-27 补强 D：核对清单动作按钮点击区 ≥44px */
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.chk-item .ci-act button:active { background: var(--accent-soft); }
+.chk-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 22px 0; }

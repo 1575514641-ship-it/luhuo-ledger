@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=39">
+  <link rel="stylesheet" href="./styles.css?v=40">
 </head>
 <body>
   <header class="topbar">
@@ -85,6 +85,8 @@
         <div id="filterChips" class="chips"></div>
         <!-- v28：两个按钮包在一个盒子里，窄屏上整盒下移（不拆成两个按钮各占一行） -->
         <div class="list-acts">
+          <!-- 01 期：查账（搜索 + 年月日定位）。它是**只读查找视图**，与账本页筛选/写入范围无关 -->
+          <button id="lookupBtn" type="button" class="batch-btn">查账</button>
           <button id="batchBtn" type="button" class="batch-btn">批量结算</button>
           <button id="baodanBtn" type="button" class="batch-btn">报单</button>
         </div>
@@ -155,12 +157,20 @@
   <div id="formModal" class="modal">
     <form id="orderForm" class="sheet">
       <h2 id="formTitle">记一单</h2>
+      <!-- 04 期：新单草稿。它是**本机**的、按账本身份隔离的一份新单输入，不属账本、不上传。
+           打开表单时若当前身份已有草稿，这里让用户选「继续」或「丢弃」——**绝不自动回填后直接写账**。
+           平时这里只显示暂存状态（已暂存 / 未保存在草稿 / 待核对），不占地方。 -->
+      <div id="formDraftBar" class="draft-bar" hidden></div>
       <!-- v25：类型切换（只改表单形态，不落库、不是类型字段）。编辑既有记录时整条隐藏 -->
       <div id="formKind" class="segment">
         <button type="button" class="seg on" data-kind="order">货单</button>
         <button type="button" class="seg" data-kind="income">收入</button>
       </div>
       <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
+      <!-- 03 期：近期商品名建议。**临时从已有订单派生**（不建模板库、不加账本字段、不合并同名单）；
+           点一个只改「商品名称」这一格，不动你已经填好的金额/渠道等任何值。
+           编辑既有单时不渲染（那时名称本来就是原值），新建时按最近记录排前。 -->
+      <div id="formRecent" class="recent-names" hidden></div>
       <div class="row2" id="formCostRow">
         <!-- 收入模式下这一格就是「金额」（回款金额），label 文案由 applyKindUi 换 -->
         <label class="fld"><span id="formCostLabel">垫付金额</span><input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
@@ -193,9 +203,14 @@
         </div>
       </details>
       <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
+      <!-- 03 期：连续录入。「保存并继续」只在**新建货单**时渲染（编辑/收入单都不给，见 applyChainUi）；
+           「保留本次渠道」默认不勾，只有用户显式勾上、并在本次连续录入里手选过渠道，下一单才暂时沿用，
+           普通保存 / 关窗 / 取消都结束本次连续录入，重新打开表单不记住这个选择。 -->
+      <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">保留本次渠道（只影响这次连着记的下一单）</label>
       <div class="sheet-actions">
         <button type="button" id="formCancel" class="btn ghost">取消</button>
         <button type="submit" class="btn primary">保存</button>
+        <button type="button" id="formSaveNext" class="btn primary" hidden>保存并继续</button>
       </div>
     </form>
   </div>
@@ -229,7 +244,6 @@
       <h2>批量结算</h2>
       <p class="batch-sub">勾选本次一起寄出的在途单，邮费和回款按垫付占比分摊</p>
       <div id="batchList" class="batch-list"></div>
-      <div id="batchSummary" class="batch-summary"></div>
       <div class="row2">
         <label class="fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
         <label class="fld">对方总回款 <small>留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
@@ -237,10 +251,19 @@
       <!-- 这一批现在记着多少钱 + 这三条规矩（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉）。
            v24 起没有「覆盖 / 追加」的选择，由 app.js 决定显不显示这一行 -->
       <div id="batchNote" class="batch-note" hidden></div>
-      <label class="fld">回款日期<input id="batchDate" type="date"></label>
-      <div class="sheet-actions">
-        <button type="button" id="batchCancel" class="btn ghost">取消</button>
-        <button type="button" id="batchSubmit" class="btn primary">结算</button>
+      <!-- 2026-09-27 补强 D：这一格对**既有批次**只用作「本次到账日期」（批次日期保持原值），
+           对**新建批次**才同时用作批次日期——原来只写「回款日期」+ 无条件预填今天，
+           看起来像要改批次日期。写账规则一字未动，说明行 #batchDateHint 由 app.js 随勾选更新 -->
+      <label class="fld">本次到账日期<input id="batchDate" type="date"></label>
+      <p class="foot-note" id="batchDateHint" hidden></p>
+      <!-- 吸底操作区（2026-09-27 补强 D）：长名单滚动时金额摘要与「结算」始终可达，
+           不用滚回底部；吸底元素占布局位，不永久遮挡任何内容 -->
+      <div class="sheet-foot">
+        <div id="batchSummary" class="batch-summary"></div>
+        <div class="sheet-actions">
+          <button type="button" id="batchCancel" class="btn ghost">取消</button>
+          <button type="button" id="batchSubmit" class="btn primary">结算</button>
+        </div>
       </div>
     </div>
   </div>
@@ -270,6 +293,74 @@
       <div class="sheet-actions">
         <button type="button" id="baodanClose" class="btn ghost">关闭</button>
         <button type="button" id="baodanCopy" class="btn primary">复制报单</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 查账（01 期：搜索 + 年月日定位）
+       这是一个**只读查找视图**：条件只活在本次会话内存里（不落库、不进同步包、不写 meta.filter），
+       自己的结果列表在 #lookupList，**不碰账本页的 filteredOrders()**——那个函数仍然是「账本页当前
+       筛选」，报单面板与批次重绘都靠它。搜索命中集合绝不能被当成写入范围，所以这里也不放
+       「批量结算 / 报单」这类范围含糊的整批入口（要整批操作就退出查账回账本页）。 -->
+  <div id="lookupModal" class="modal">
+    <div class="sheet lk-sheet">
+      <h2 id="lookupTitle">查账 <small id="lookupScope">全部 · 全部日期</small></h2>
+      <!-- 05 期：核对清单（只读派生）。它复用这个只读面板：**不新增工具条按钮**（免得动既有版面断言），
+           两个页签在手机上一眼能认。核对页签上的数字只数**要动手的项**，没有问题时不显示数字。 -->
+      <div id="lkTabs" class="segment lk-tabs">
+        <button type="button" class="seg on" data-lktab="search">查账</button>
+        <button type="button" class="seg" data-lktab="check">核对 <b id="lkCheckCount" hidden></b></button>
+      </div>
+      <div id="lkSearchPane">
+      <div class="lk-search">
+        <input id="lookupInput" type="search" autocomplete="off" maxlength="60" placeholder="搜商品名 / 快递单号 / 备注 / 渠道">
+        <button type="button" id="lookupClear" class="lk-x">清空</button>
+      </div>
+      <div class="lk-bar">
+        <div id="lookupStatus" class="chips"></div>
+        <button type="button" id="lookupDateBtn" class="batch-btn">全部日期</button>
+      </div>
+      <!-- 年 → 月 → 日 三层导航（每层都能「看整层」）；默认收起，点「日期」才展开 -->
+      <div id="lookupDates" class="lk-dates" hidden></div>
+      <button type="button" id="lkFocusBack" class="batch-btn lk-focusback" hidden>← 返回核对清单</button>
+      <p id="lookupMeta" class="lk-meta"></p>
+      <div id="lookupList"></div>
+      </div>
+      <div id="lkCheckPane" hidden>
+        <p class="lk-meta" id="lkCheckMeta"></p>
+        <div id="checkList"></div>
+      </div>
+      <div class="sheet-actions">
+        <button type="button" id="lookupClose" class="btn primary">退出查账</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 寄出信息（02 期：单号与邮费**一次**补齐）
+       入口只在卡片/批次表头上，所以范围永远是**一个确定的东西**：一笔未成批散单，或一整个既有批次。
+       面板里没有"选哪几单"这回事——不允许部分选批、也不允许跨批拆并（口径见 app.js 的 openShipForm）。
+       一次点保存＝一个候选账本、一次业务提交：单号与邮费同生共死，不串接两个各自落盘的旧回调。 -->
+  <div id="shipModal" class="modal">
+    <div class="sheet">
+      <h2 id="shipTitle">补寄出信息 <small id="shipScopeLabel">-</small></h2>
+      <p class="batch-sub" id="shipScopeNote"></p>
+      <!-- 2026-09-27 补强 D：单号/邮费两个输入框挪到**成员名单之前**——大批次不必先滚过整份名单
+           才能录入；成员名单收进可折叠的 #shipMembersBox（摘要恒显示范围与单数，折叠不改范围），
+           app.js 的 openShipForm 会写 #shipMembersLabel 并按名单长度决定默认展开与否 -->
+      <label class="fld">快递单号<input id="shipTracking" maxlength="40" autocomplete="off" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipTrackingClear">清空</button></label>
+      <p class="foot-note" id="shipTrackingHint"></p>
+      <label class="fld">邮费<input id="shipFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipFeeClear">清空</button></label>
+      <p class="foot-note" id="shipFeeHint"></p>
+      <p class="foot-note">填数字＝改成这个数、留空＝不动、填 0＝明确改成 0（邮费＝0 常见于包邮，按「清空」小按钮也是置 0）。回款金额、状态与到账日期这一趟一个字都不碰。</p>
+      <details id="shipMembersBox" class="members-fold">
+        <summary><span id="shipMembersLabel">成员明细</span></summary>
+        <div id="shipMembers" class="batch-list"></div>
+      </details>
+      <div class="sheet-foot">
+        <div class="sheet-actions">
+          <button type="button" id="shipCancel" class="btn ghost">取消</button>
+          <button type="button" id="shipSubmit" class="btn primary">保存寄出信息</button>
+        </div>
       </div>
     </div>
   </div>
@@ -316,7 +407,7 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=39"></script>
-  <script src="./app.js?v=39"></script>
+  <script src="./sync.js?v=40"></script>
+  <script src="./app.js?v=40"></script>
 </body>
 </html>
