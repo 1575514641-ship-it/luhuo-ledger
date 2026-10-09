@@ -40,6 +40,12 @@
   "use strict";
 
   // ---- 常量 ----
+  // v41：账本版本 1 → 2（新增可空字段 shipDate）。读入 1 与 2 都接受；写出一律 2。
+  // 升版本号的用意是给**没刷新的旧页面（v40）装护栏**：v40 的 ledgerProblem 只认 version 1，
+  // 读到 2 会在 readCloudRecord 里返回 failed → 暂停上传——旧页面不会把丢了 shipDate 的账本覆盖回云端。
+  // 注意：本机完整快照外壳（SNAPSHOT_KEY 里的 { version: 1, owner, ... }）是另一套东西，**不要跟着改**。
+  const LEDGER_VERSION = 2;
+  const LEDGER_VERSIONS = [1, 2];
   const DATA_KEY = "luhuo-ledger-data-v1";
   const META_KEY = "luhuo-ledger-meta-v1";
   const SNAPSHOT_KEY = "luhuo-ledger-snapshot-v1";
@@ -53,7 +59,11 @@
   const STATUSES = ["在途", "已回款"];
   const LEGACY_STATUSES = ["自留"];              // 只读的遗留状态：认得、能显示，不能创建
   const SETTLED = ["已回款", "自留"];             // 「已结算」= 不在途：含旧自留（那笔钱已经落地）
-  const FILTERS = ["在途", "全部", "已回款"];     // 账本页筛选；「全部」也要能记住
+  // v41：账本页按阶段分四个页签（待寄 / 待回款 / 已回款 / 全部）；「全部」也要能记住。
+  // 「待寄 / 待回款」是 status=在途 的两个**派生**子集（见 orderStage），不是新状态。
+  const FILTERS = ["待寄", "待回款", "已回款", "全部"];
+  // 旧版记住的筛选值 → 新页签（只在读 meta.filter 时换一次，不写回账本）
+  const LEGACY_FILTER = { "在途": "待寄" };
   const CHANNELS = ["收货商", "闲鱼", "转转", "朋友", "自用", "开发票"];
   const STATUS_CLASS = { "在途": "st-out", "已回款": "st-done", "自留": "st-loss" };
   // v25：「收入」表单模式的默认值（只在新建表单、且用户没碰过那格时才补）
@@ -61,7 +71,7 @@
   const INCOME_CHANNEL = "开发票";
 
   // ---- 状态 ----
-  let data = { version: 1, orders: [] };
+  let data = { version: LEDGER_VERSION, orders: [] };
   let meta = { updatedAt: null, lastSyncedAt: null, lastSyncError: "", filter: "在途" };
   let storageBaseline = null;
   let localIssue = "";
@@ -99,7 +109,11 @@
   let baodanTrackingTouched = false;
   let baodanRevision = 0, baodanCopySeq = 0;
   let clipboardQueue = Promise.resolve();
-  let currentFilter = "在途";
+  let currentFilter = "待寄";
+  // v41：账本页勾选（只活在内存里，不落库、不进同步包）。键：o:<订单id> 或 b:<批次id>（整批）。
+  // 每次 renderList 都按「当前页签里还能勾的东西」收敛一次——保存成功后单子换了阶段，勾选自然消失。
+  const selection = new Set();
+  let legacyLoaded = false;
   // v32：「一起寄出」批次块折叠 —— 只记「被用户手动展开过的那些批次 id」。
   // 它是展开态的唯一真相（重渲染也照它还原），但**刻意只活在内存里**：不落库、不进同步包、
   // 不写 localStorage，刷新页面回到默认收起（用户确认过的默认态）。
@@ -323,7 +337,7 @@
     if (!source || typeof source !== "object" || Array.isArray(source) || !Array.isArray(source.orders)) {
       return "账本格式不正确：需要包含 orders 数组，原账本未改动。";
     }
-    if (source.version !== undefined && source.version !== 1) return "暂不支持这个账本版本，请保留原文件。";
+    if (source.version !== undefined && !LEDGER_VERSIONS.includes(source.version)) return "暂不支持这个账本版本，请保留原文件。";
     const ids = new Set();
     const sums = { cost: 0, fee: 0, income: 0 };
     for (const order of source.orders) {
@@ -615,7 +629,7 @@
   }
 
   function normalizeData(source) {
-    const out = { version: 1, orders: [] };
+    const out = { version: LEDGER_VERSION, orders: [] };
     const orders = source && Array.isArray(source.orders) ? source.orders : [];
     orders.forEach((o) => {
       if (!o || typeof o !== "object") return;
@@ -654,6 +668,10 @@
         // 一份带换行的脏账本（只能从导入 JSON / 云端旧数据进来）原先会「存 A\nB、显示 A B」——
         // 账本、卡片、报单文本三处对不上。现在账本里存的就是那一格会显示的那个规范值。
         tracking: cleanTracking(o.tracking),
+        // v41：寄出日期（可空）。只由「寄出」写入、「改回待寄」清空；不参与任何金额口径与报表归期。
+        // 它只回答一件事：没有单号、也没成批的单是不是**已经寄出了**（见 isShipped）。
+        // 与 tracking 同理必须留在白名单里，否则加载/拉取会静默丢掉它。非 YYYY-MM-DD 一律归空串。
+        shipDate: cleanShipDate(o.shipDate),
         createdAt: String(o.createdAt || new Date().toISOString()),
       });
     });
@@ -673,6 +691,8 @@
       } catch { meta.lastSyncError = "本机同步状态无法读取，账本数据仍保留"; }
       const source = snapshot && snapshot.version === 1 && snapshot.data ? snapshot.data : raw;
       if (source) { localIssue = ledgerProblem(source, true); data = normalizeData(source); }
+      // v41：本机这本账是不是旧版（version 1 / 无版本）存下的——决定要不要出一次「老单标记寄出」提示
+      legacyLoaded = !!(source && source.version !== LEDGER_VERSION && Array.isArray(source.orders) && source.orders.length > 0);
       if (snapshot) {
         if (snapshot.version !== 1 || !snapshot.data || snapshot.owner !== identityOwner()) {
           localIssue = "本机身份与完整快照不一致，已停止写入和同步。请先导出核对或重新配对。";
@@ -683,9 +703,13 @@
       }
       try {
         const base = JSON.parse(localStorage.getItem(SYNC_BASE_KEY) || "null");
-        syncBase = base && base.owner === identityOwner() && !ledgerProblem(base.data) ? base.data : null;
+        // v41：基线也过一遍 normalizeData。旧版存下的基线没有 shipDate 键，而本机/云端两份都经新版
+        // 规范化带上了它——orderSnap 逐键比对会让「基线 ≠ 本机」对每一单都成立，conflictingIds 的
+        // bothChanged 分支就会把升级后第一次正常拉取误判成整本冲突。三方同一口径才可比。
+        syncBase = base && base.owner === identityOwner() && !ledgerProblem(base.data) ? normalizeData(base.data) : null;
       } catch { syncBase = null; }
-      if (!FILTERS.includes(meta.filter)) meta.filter = "在途";
+      if (LEGACY_FILTER[meta.filter]) meta.filter = LEGACY_FILTER[meta.filter];
+      if (!FILTERS.includes(meta.filter)) meta.filter = "待寄";
       currentFilter = meta.filter;
       captureStorageBaseline();
       durableData = clone(data); durableMeta = clone(meta);
@@ -1089,21 +1113,140 @@
     // 日期倒序；同日返回 0，保留账本数组里的先后，不制造互相矛盾的比较结果。
     orders.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
     if (currentFilter === "全部") return orders;
-    return orders.filter((o) => o.status === currentFilter);
+    // v41：页签按阶段过滤（待寄 / 待回款 / 已回款）；旧「自留」只在「全部」里出现
+    return orders.filter((o) => orderStage(o) === currentFilter);
+  }
+
+  // v41：账本顶部摘要（垫付在外 + 待寄/待回款单数）。口径与统计页英雄卡同源（computeStats）。
+  function renderLedgerSum() {
+    const el = $("#lsOutstanding");
+    if (!el) return;
+    el.textContent = money(computeStats().outstanding);
+    let toShip = 0, toPay = 0;
+    data.orders.forEach((o) => { const st = orderStage(o); if (st === "待寄") toShip += 1; else if (st === "待回款") toPay += 1; });
+    $("#lsCounts").textContent = toShip + toPay > 0 ? `待寄 ${toShip} · 待回款 ${toPay}` : "";
+  }
+
+  // v41：当前页签里「能勾」的东西。待寄：每张待寄单；待回款：多成员批次按**整批**一个键（b:），
+  // 散单与单成员批次的单按单（o:）。其余页签不提供勾选。
+  function selectableKeys() {
+    const keys = new Set();
+    if (currentFilter !== "待寄" && currentFilter !== "待回款") return keys;
+    const groups = batchGroups();
+    data.orders.forEach((o) => {
+      if (orderStage(o) !== currentFilter) return;
+      const g = o.batchId ? groups.get(o.batchId) : null;
+      if (currentFilter === "待回款" && g && g.count > 1) keys.add("b:" + o.batchId);
+      else keys.add("o:" + o.id);
+    });
+    return keys;
+  }
+
+  function pruneSelection() {
+    const ok = selectableKeys();
+    [...selection].forEach((k) => { if (!ok.has(k)) selection.delete(k); });
+  }
+
+  // v41：勾选操作条。待回款允许的组合只有两种：恰好一整批，或若干散单（≥2 单会在结算时合成一批）。
+  function selectionPlan() {
+    const keys = [...selection];
+    const batches = keys.filter((k) => k.startsWith("b:")).map((k) => k.slice(2));
+    const loose = keys.filter((k) => k.startsWith("o:")).map((k) => k.slice(2));
+    if (currentFilter === "待寄") return { kind: loose.length ? "ship" : "none", ids: loose };
+    if (batches.length === 1 && loose.length === 0) return { kind: "pay-batch", batchId: batches[0] };
+    if (batches.length === 0 && loose.length === 1) return { kind: "pay-one", id: loose[0] };
+    if (batches.length === 0 && loose.length > 1) return { kind: "pay-merge", ids: loose };
+    if (keys.length === 0) return { kind: "none" };
+    return { kind: "bad", reason: "一次回款只能是一整批，或若干单独寄的单" };
+  }
+
+  function renderSelBar() {
+    const bar = $("#selBar");
+    if (!bar) return;
+    const show = selection.size > 0 && (currentFilter === "待寄" || currentFilter === "待回款");
+    bar.hidden = !show;
+    document.body.classList.toggle("has-sel", show);
+    if (!show) return;
+    let n = 0, costCents = 0;
+    selection.forEach((k) => {
+      const id = k.slice(2);
+      const list = k.startsWith("b:") ? data.orders.filter((o) => o.batchId === id) : data.orders.filter((o) => o.id === id);
+      list.forEach((o) => { n += 1; costCents += toCents(o.cost); });
+    });
+    const plan = selectionPlan();
+    $("#selCount").textContent = `已选 ${n} 单`;
+    $("#selSub").textContent = plan.kind === "bad" ? plan.reason : ` · 垫付 ${money(costCents / 100)}`;
+    const go = $("#selGo");
+    go.textContent = currentFilter === "待寄" ? "寄出" : "回款";
+    go.disabled = plan.kind === "bad" || plan.kind === "none";
+  }
+
+  function runSelection() {
+    const plan = selectionPlan();
+    if (plan.kind === "ship") openShipForm({ kind: "new", ids: plan.ids });
+    else if (plan.kind === "pay-one") openPayForm(plan.id);
+    else if (plan.kind === "pay-batch") openBatchModal(plan.batchId, { mode: "pay" });
+    else if (plan.kind === "pay-merge") openBatchModal("", { mode: "pay", ids: plan.ids });
+    else if (plan.kind === "bad") toast(plan.reason);
+  }
+
+  // v41：升级提示的候选＝升级前就记下、现在落在「待寄」的单（老数据没有寄出日期，没单号也没成批的
+  // 在途单一律落在待寄；其中其实已经寄出的，请用户勾选标记一次）。只看本机 meta，不进账本、不同步。
+  // 新设备配对到旧版写的云端账本、或导入旧版备份时，本机加载那一刻看不出「升级前」——
+  // 在换入旧版（version≠2）且有订单的账本时补记一次升级时刻，升级提示与「老单默认各自寄」才不会漏。
+  function markLegacyLedger(rawVersion, orders) {
+    if (meta.v41FirstSeen || rawVersion === LEDGER_VERSION || !orders || !orders.length) return;
+    meta.v41FirstSeen = new Date().toISOString();
+    persistMeta();
+    renderListHints();
+  }
+
+  function upgradeCandidates() {
+    if (!meta.v41FirstSeen || meta.v41HintDone) return [];
+    return data.orders.filter((o) => orderStage(o) === "待寄" && String(o.createdAt || "") < meta.v41FirstSeen);
+  }
+
+  function renderListHints() {
+    const ch = $("#checkHint");
+    if (ch) {
+      const n = checkActionable(checklistItems());
+      ch.hidden = n === 0;
+      ch.textContent = n > 0 ? `${n} 项需要核对 ›` : "";
+    }
+    const uh = $("#upgradeHint");
+    if (uh) {
+      const list = upgradeCandidates();
+      uh.hidden = list.length === 0;
+      if (list.length) {
+        $("#upgradeHintText").textContent = `升级后，有 ${list.length} 单还没标记寄出（老数据没有寄出记录）。`
+          + `其中已经寄出的，勾选后点「寄出」标记一下；没寄的不用管。`;
+      }
+    }
   }
 
   function renderList() {
     // v21 起没有「自留」筛选（那个状态不能再新建）；旧自留单在「全部」里看得到、可手动删除
-    const chips = ["在途", "全部", "已回款"];
-    $("#filterChips").innerHTML = chips.map((c) => {
-      const n = c === "全部" ? data.orders.length
-        : data.orders.filter((o) => o.status === c).length;
+    // v41：页签按阶段（待寄 / 待回款 / 已回款 / 全部）。数字只在 >0 时显示；「全部」不带数字（不是待办）。
+    renderLedgerSum();
+    const counts = { 待寄: 0, 待回款: 0, 已回款: 0 };
+    data.orders.forEach((o) => { const st = orderStage(o); if (st in counts) counts[st] += 1; });
+    $("#filterChips").innerHTML = FILTERS.map((c) => {
+      const n = c === "全部" ? 0 : counts[c];
       return `<button class="chip ${currentFilter === c ? "on" : ""}" data-filter="${c}">${c} ${n > 0 ? `<b>${n}</b>` : ""}</button>`;
     }).join("");
+    pruneSelection();
+    renderSelBar();
+    renderListHints();
 
     const orders = filteredOrders();
     if (orders.length === 0) {
-      $("#orderList").innerHTML = `<div class="empty">没有${currentFilter === "全部" ? "" : "「" + currentFilter + "」的"}单子<br><small>点右下角「记一单」开始</small></div>`;
+      const empty = {
+        待寄: "没有待寄的单<br><small>点右下角「记一单」开始</small>",
+        待回款: "没有等回款的单<br><small>寄出之后会出现在这里</small>",
+        已回款: "还没有已回款的单",
+        全部: "还没有单子<br><small>点右下角「记一单」开始</small>",
+      }[currentFilter] || "没有单子";
+      $("#orderList").innerHTML = `<div class="empty">${empty}</div>`;
       return;
     }
     // 同批的单子收成一块：成员各自的下单日期可能夹着别的单，但显示上必须挨在一起，
@@ -1268,7 +1411,13 @@
     // 箭头只有 ▾ 一个字符，收起态靠 CSS 转 -90° 变成 ▸ —— 这样切态只改类、不用重渲染。
     // title 给鼠标/读屏补一句「这一行是干什么的」（可见文本只有标题+单数+箭头，状态只有 aria-expanded）；
     // **刻意不用 aria-label**：那会把「一起寄出 · 日期 N 单」这段可见文本从无障碍名里整个顶掉。
-    return `<div class="batch-head">
+    // v41：待回款页签里整批一个勾选框（勾的是这一整批，不是某几个成员）；表头的「回款」在收起态也看得见
+    const payable = members.some((o) => o.status === "在途");
+    const selBox = currentFilter === "待回款" && payable
+      ? `<label class="sel-box bh-sel" title="勾选这一整批"><input type="checkbox" data-sel="b:${escapeHtml(g.id)}"${selection.has("b:" + g.id) ? " checked" : ""} aria-label="勾选这一整批"></label>`
+      : "";
+    return `<div class="batch-head${selBox ? " has-sel" : ""}">
+      ${selBox}
       <button type="button" class="bh-top" data-act="btoggle" data-batch="${escapeHtml(g.id)}" title="点一下展开/收起这一批的单子" aria-expanded="${expanded ? "true" : "false"}">
         <span class="bh-title">一起寄出 · ${escapeHtml(g.date)}</span>
         <span class="bh-right">
@@ -1281,8 +1430,10 @@
         <div class="bh-meta">整批：${bits.join(" · ")}</div>
         ${filterFlag}
         ${warnFlag}
-        <button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批邮费</button>
+        ${payable ? `<button type="button" class="bh-pay" data-act="bpay" data-batch="${escapeHtml(g.id)}">回款</button>` : ""}
         <button type="button" class="bh-act" data-act="baodan" data-batch="${escapeHtml(g.id)}">报单</button>
+        <button type="button" class="bh-act" data-act="bship" data-batch="${escapeHtml(g.id)}">改单号/邮费</button>
+        ${payable ? "" : `<button type="button" class="bh-act" data-act="batchfee" data-batch="${escapeHtml(g.id)}">改本批回款</button>`}
         ${resetBtn}
       </div>
       ${shownCount < g.count ? `<div class="bh-note">本页只显示其中 ${shownCount} 单，另有 ${g.count - shownCount} 单被筛选隐藏</div>` : ""}
@@ -1318,6 +1469,27 @@
   // 只在脏数据上出现，但「账本里那一格永远是一个规范值」这句话就不成立了。
   function cleanTracking(v) {
     return String(v === null || v === undefined ? "" : v).replace(/\s+/g, " ").trim().slice(0, 40);
+  }
+
+  // v41：寄出日期的规范化——只认真实日历日的 YYYY-MM-DD，其余（空、乱码、2026-02-30）一律空串。
+  // 空串＝没标记过寄出（老数据全是空串，阶段由单号/批次推得，见 isShipped）。
+  function cleanShipDate(v) {
+    const t = String(v === null || v === undefined ? "" : v).trim();
+    // parseDate 自带回读校验（2026-02-30 → null），这里只再卡掉它允许的带时刻写法
+    return /^\d{4}-\d{2}-\d{2}$/.test(t) && parseDate(t) ? t : "";
+  }
+
+  // v41：阶段（只派生、不落库）。status 仍只有 在途/已回款（+遗留自留），统计口径一字不动；
+  // 「在途」在账本页再细分成「待寄 / 待回款」两个页签，判据只有这一处：
+  //   有寄出日期 ∨ 有单号 ∨ 已在某个批次里  ⇒ 已寄出。
+  // 老数据没有 shipDate：有单号或已成批的在途单自动算已寄（落到「待回款」），其余落「待寄」。
+  function isShipped(o) {
+    return !!(o && (o.shipDate || cleanTracking(o.tracking) || o.batchId));
+  }
+  function orderStage(o) {
+    if (o.status === "已回款") return "已回款";
+    if (o.status === "在途") return isShipped(o) ? "待回款" : "待寄";
+    return "遗留";   // 旧「自留」：只在「全部」里出现
   }
 
   // soloBatch：这一单的批次只剩它自己（页面上不显示「一起寄出」表头），卡片里补一句归属，
@@ -1364,32 +1536,49 @@
     // **会从外部数据进来**（「导入 JSON 备份」与云端拉取都直接落进 orders），一份 id 里带 `">` 的
     // 备份文件就能在渲染卡片时把脚本注进页面（外部验收实测：`data-id="qX"><img src=x onerror=…>`
     // 真的执行了）。同类写法在本文件里早就有先例（批次表头与报单清单都转义过），这里补齐。
-    if (!settled) actions.push(`<button class="act primary" data-act="pay" data-id="${escapeHtml(o.id)}">回款</button>`);
-    else if (o.status === "已回款") actions.push(`<button class="act primary" data-act="pay" data-id="${escapeHtml(o.id)}">改回款</button>`);
-    actions.push(`<button class="act" data-act="dup" data-id="${escapeHtml(o.id)}">再来一单</button>`);
-    actions.push(`<button class="act" data-act="edit" data-id="${escapeHtml(o.id)}">编辑</button>`);
-    if (o.batchId && !inLookup) {
-      // v24：批次的金额入口**常驻在卡片上**（与批次表头那个 .bh-act 走同一个动作）。
-      // v23 只有表头一条路，于是两种情形下用户根本点不到：①单成员批次不渲染表头；
-      // ②筛选把那一批藏起来时表头也不在页面上。卡片上的入口按 o.batchId 渲染，
-      // 与「这一批是不是被筛选藏了」「这一批还剩几个人」都无关。
-      // 已回款的成员同样有——openBatchModal 会把该批**全部成员**并进弹窗（不管在不在途）。
-      actions.push(`<button class="act" data-act="batchfee" data-batch="${escapeHtml(o.batchId)}">改本批邮费</button>`);
-      actions.push(`<button class="act" data-act="unbatch" data-id="${escapeHtml(o.id)}">退出本批</button>`);
+    // v41：卡片只露**一个**与阶段对应的主按钮（待寄 → 寄出；待回款的散单 → 回款），其余动作收进「更多」。
+    // 所有既有 data-act 按钮**原样保留**（只是住进 .order-more 里），行为一字未改。
+    const eid = escapeHtml(o.id);
+    const stage = orderStage(o);
+    const looseShipped = stage === "待回款" && !(o.batchId && !soloBatch);
+    let primary = "";
+    if (stage === "待寄") primary = `<button class="act primary" data-act="shipnew" data-id="${eid}">寄出</button>`;
+    let payBtn = "";
+    if (!settled) payBtn = `<button class="act${looseShipped ? " primary" : ""}" data-act="pay" data-id="${eid}">回款</button>`;
+    else if (o.status === "已回款") payBtn = `<button class="act" data-act="pay" data-id="${eid}">改回款</button>`;
+    if (looseShipped) { primary = payBtn; payBtn = ""; }
+    if (payBtn) actions.push(payBtn);
+    actions.push(`<button class="act" data-act="dup" data-id="${eid}">再来一单</button>`);
+    actions.push(`<button class="act" data-act="edit" data-id="${eid}">编辑</button>`);
+    // 02 期：寄出信息（散单＝这一单；批内单＝这一整批，范围由 openShipForm 定死）。
+    // 查账模式也给（范围是确定的一单/一整批，不是"跟着筛选走"的含糊范围）。
+    actions.push(`<button class="act" data-act="ship" data-id="${eid}">改单号/邮费</button>`);
+    if (!inLookup && o.status === "在途" && isShipped(o) && !o.batchId) {
+      // v41：已寄出的散单——补报一次单、或寄错了改回待寄
+      actions.push(`<button class="act" data-act="bd1" data-id="${eid}">报单</button>`);
+      actions.push(`<button class="act" data-act="unship" data-id="${eid}">改回待寄</button>`);
     }
-    // 02 期：补寄出信息。散单与批内单都能点，范围分别落在「这一单」与「这一整批」上——
-    // 面板会把成员完整列出来（整批几单写得明明白白），所以它**不是**"范围含糊的批量操作"：
-    // 规格点名要挡的是"范围跟着当前筛选/勾选走"的那种。因此**查账模式也给**这个入口
-    //（03 的接缝场景正是"搜索之后打开寄出面板"）；而「批量结算 / 报单 / 改本批邮费 / 退出本批」
-    // 在查账里仍然一个都不给（见上面的 inLookup 分支与 lookup 模块的说明）。
-    actions.push(`<button class="act" data-act="ship" data-id="${escapeHtml(o.id)}">补寄出信息</button>`);
-    actions.push(`<button class="act danger" data-act="del" data-id="${escapeHtml(o.id)}">删除</button>`);
+    if (o.batchId && !inLookup) {
+      // v24：批次的金额入口**常驻在卡片上**（与批次表头走同一个动作）：单成员批次没有表头、
+      // 筛选把表头藏起来时，卡片上的入口仍在。openBatchModal 会把该批**全部成员**并进弹窗。
+      actions.push(`<button class="act" data-act="batchfee" data-batch="${escapeHtml(o.batchId)}">改本批邮费</button>`);
+      actions.push(`<button class="act" data-act="unbatch" data-id="${eid}">退出本批</button>`);
+    }
+    actions.push(`<button class="act danger" data-act="del" data-id="${eid}">删除</button>`);
+    // v41：勾选框只在账本页「待寄 / 待回款」页签、且这张卡是一个独立勾选单元时出现（批内成员跟着表头整批勾）
+    const selKey = "o:" + o.id;
+    const selOn = !inLookup && (currentFilter === "待寄" || currentFilter === "待回款")
+      && stage === currentFilter && !(currentFilter === "待回款" && o.batchId && !soloBatch);
+    const selBox = selOn
+      ? `<label class="sel-box" title="勾选"><input type="checkbox" data-sel="${escapeHtml(selKey)}"${selection.has(selKey) ? " checked" : ""} aria-label="勾选这一单"></label>`
+      : "";
     // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
     // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
     // v33：利润从金额格里挪到卡片右上的 .order-side（状态下面），金额格只留垫付/回款/邮费三格。
     // 那一次判据（showProfit / profit 的计算）一个字没动，只搬展示位置；
     // 判据本身后来为「待记回款」改过一次，见本函数上方的 pendingIncome。
-    return `<div class="order-card ${extraClass || ""}">
+    return `<div class="order-card ${extraClass || ""}${selBox ? " has-sel" : ""}">
+      ${selBox}
       <div class="order-top">
         <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
         <div class="order-side">
@@ -1400,18 +1589,19 @@
               ? `<button type="button" class="profit-edit" data-act="pedit" data-id="${escapeHtml(o.id)}" title="点一下改这一项的利润（整批总利润不变）"><b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></button>`
               : `<b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>`}
           </div>` : ""}
-          <span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(statusLabel(o.status))}</span>
+          <span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>
         </div>
       </div>
       ${missFlag}
-      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}</div>
+      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}</div>
       <div class="order-money">
         <span>垫付 <b>${money(o.cost)}</b></span>
         <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
-        <span>邮费 <b>${money(o.fee)}</b></span>
+        ${stage === "待寄" && !(toCents(o.fee) > 0) ? "" : `<span>邮费 <b>${money(o.fee)}</b></span>`}
       </div>
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
-      <div class="order-actions">${actions.join("")}</div>
+      <div class="order-actions">${primary}<button class="act more-toggle" data-act="more" aria-expanded="false">更多</button></div>
+      <div class="order-more" hidden>${actions.join("")}</div>
     </div>`;
   }
 
@@ -1440,7 +1630,8 @@
     focusId: "",
     focusBatchId: "",      // 05 二轮审查：批次类核对项用它把**整批成员**精确带到眼前，不是"清空条件看全部"
   };
-  const LOOKUP_STATUSES = ["全部", "在途", "已回款"];
+  // v41：查账的状态 chip 与账本页同一套阶段叫法（待寄 / 待回款 / 已回款），旧「自留」只在「全部」里
+  const LOOKUP_STATUSES = ["全部", "待寄", "待回款", "已回款"];
 
   // 关键词分词：按空白切、去掉空段、统一小写。多个词要求**每一段都命中**（AND），可落在不同字段上。
   function lookupTokens() {
@@ -1486,7 +1677,7 @@
   // 月份层会显示「2 月 0 单」（真实 2 单）、「看整年」也只剩 1 单——「有记录的日期作标记」当场失效。
   // 用这一份基底时，格子里的数字仍等于"点下去会看到几单"（日期是唯一再叠上去的条件）。
   function lookupDateBase() {
-    return data.orders.filter((o) => (lookup.status === "全部" || o.status === lookup.status) && lookupHit(o));
+    return data.orders.filter((o) => (lookup.status === "全部" || orderStage(o) === lookup.status) && lookupHit(o));
   }
 
   // 最终命中集合：基底再叠状态。三个条件取交集（规格）。
@@ -1498,7 +1689,7 @@
     if (lookup.focusBatchId) return data.orders.filter((o) => String(o.batchId || "") === String(lookup.focusBatchId));
     const base = lookupBase();
     if (lookup.status === "全部") return base;
-    return base.filter((o) => o.status === lookup.status);
+    return base.filter((o) => orderStage(o) === lookup.status);
   }
 
   function lookupDateLabel() {
@@ -1705,8 +1896,8 @@
     const box = $("#lookupStatus");
     if (!box) return;
     const base = lookupBase();
-    const counts = { "全部": base.length, "在途": 0, "已回款": 0 };
-    base.forEach((o) => { if (counts[o.status] !== undefined) counts[o.status] += 1; });
+    const counts = { "全部": base.length, "待寄": 0, "待回款": 0, "已回款": 0 };
+    base.forEach((o) => { const st = orderStage(o); if (counts[st] !== undefined) counts[st] += 1; });
     box.innerHTML = LOOKUP_STATUSES.map((s) =>
       `<button type="button" class="chip${lookup.status === s ? " on" : ""}" data-lkstatus="${s}">${s}${counts[s] > 0 ? ` <b>${counts[s]}</b>` : ""}</button>`).join("");
   }
@@ -1774,6 +1965,11 @@
   // 一次打开的目标成员（**全部**，不是子集）：这批就是这批、这单就是这单。
   function shipMembers() {
     if (!shipTarget) return [];
+    // v41：「寄出」新模式——范围是打开那一刻勾的这几单（按 data.orders 的顺序，分摊尾差与批量结算同源）
+    if (shipTarget.kind === "new") {
+      const want = new Set(shipTarget.ids);
+      return data.orders.filter((o) => want.has(o.id));
+    }
     if (shipTarget.kind === "loose") {
       const o = data.orders.find((x) => x.id === shipTarget.id);
       return o && !o.batchId ? [o] : [];
@@ -1799,7 +1995,37 @@
     return { kind: "mixed", values };
   }
 
+  // v41：「寄出」（新模式）——把**待寄**的一单或几单标记为已寄出，同一次提交写齐：
+  //   寄出日期（shipDate）＋ 单号（填了才写）＋ 邮费（留空＝不改各单已有邮费；新记的单本来就是 0）。
+  //   几单「一起寄」＝当场建成一批：批次字段的写法与批量结算「两框留空 / 只填邮费」那条既有路径逐字段同款
+  //   （batchId / batchDate=寄出日期 / batchCount / batchFee=填的整批邮费或各单现有邮费之和 /
+  //    batchIncome=各单现有回款之和 / 填了邮费才写 fee 与 batchFeeShare）；回款、状态一个字都不碰。
+  //   「各自寄 / 只标记已寄」＝不成批，只写寄出日期（单号邮费之后在每单的「改单号/邮费」里补）。
+  let shipTogether = true;
+  function applyShipTogetherUi() {
+    const isNew = !!(shipTarget && shipTarget.kind === "new");
+    const n = isNew ? shipTarget.ids.length : 0;
+    const separate = isNew && n > 1 && !shipTogether;
+    $$("#shipTogetherRow .seg").forEach((b) => b.classList.toggle("on", (b.dataset.together === "1") === shipTogether));
+    $("#shipModal").classList.toggle("ship-separate", separate);
+    if (isNew) {
+      $("#shipSubmit").textContent = separate ? `标记 ${n} 单已寄出` : "保存并复制报单";
+      $("#shipScopeNote").textContent = n === 1 ? ""
+        : separate ? "各自寄：只把这几单标记为已寄出（不成批）；单号和邮费之后在每单的「改单号/邮费」里补。"
+          : "一起寄：这几单记成一批，单号写到每一单上；邮费填整批合计，按各单垫付占比分摊。";
+      $("#shipFeeHint").textContent = n > 1 && !separate
+        ? "整批合计；留空＝不改各单已有邮费，填 0＝明确 0。"
+        : "留空＝不改（新记的单本来就是 0），填 0＝明确 0。";
+    }
+  }
+
   function openShipForm(target) {
+    if (target.kind === "new") return openShipNew(target);
+    $("#shipModal").classList.remove("ship-new", "ship-separate");
+    $("#shipTogetherRow").hidden = true;
+    $("#shipDateRow").hidden = true;
+    $("#shipTitleText").textContent = "寄出信息";
+    $("#shipSubmit").textContent = "保存寄出信息";
     const members = (() => {
       if (target.kind === "loose") {
         const o = data.orders.find((x) => x.id === target.id);
@@ -1829,7 +2055,7 @@
     $("#shipScopeNote").textContent = isBatch
       ? `范围＝这一整批（${members.length} 单，垫付合计 ${money(totalCost)}）。一起寄的一批只有一笔邮费，`
         + `填在下面会按各单垫付占比摊到成员上；单号会写到这一批每一单上。`
-      : `范围＝这一单。散单没有单独的寄出日期字段，这一趟只记单号与邮费（不新增字段、也不拿下单日顶替寄出日）。`;
+      : `范围＝这一单。这一趟只改单号与邮费（寄出日期、回款与状态不动）。`;
     $("#shipMembers").innerHTML = members.map((o) => `<div class="batch-item"><span class="bi-name">`
       + `${escapeHtml(o.name || "未命名")}</span><span class="bi-cost">${money(o.cost)}</span></div>`).join("");
     // 2026-09-27 补强 D：成员名单收进可折叠块——摘要恒写范围与单数（折叠不改变范围）；
@@ -1864,6 +2090,142 @@
     openModal("#shipModal");
   }
 
+  function openShipNew(target, opts = {}) {
+    const want = new Set(target.ids || []);
+    const members = data.orders.filter((o) => want.has(o.id));
+    if (members.length === 0 || members.length !== want.size) { toast("勾选的单已经变了，请重新勾选"); return; }
+    if (members.some((o) => o.status !== "在途" || isShipped(o))) { toast("勾选里有单已经不是「待寄」了，请重新勾选"); return; }
+    shipTarget = { kind: "new", ids: members.map((o) => o.id) };
+    shipSession = {
+      generation: ledgerGeneration,
+      ids: members.map((o) => o.id).sort(),
+      snaps: new Map(members.map((o) => [o.id, orderSnap(o)])),
+      trackingClear: false,
+    };
+    // 升级前就记下的老单默认「各自寄 / 只标记已寄」（不当场成批，免得改动老邮费的归期）
+    const allLegacy = !!meta.v41FirstSeen && members.every((o) => String(o.createdAt || "") < meta.v41FirstSeen);
+    shipTogether = opts.together === undefined ? !allLegacy : opts.together !== false;
+    const n = members.length;
+    const totalCost = members.reduce((a, o) => a + numberValue(o.cost), 0);
+    const modal = $("#shipModal");
+    modal.classList.add("ship-new");
+    $("#shipTitleText").textContent = "寄出";
+    $("#shipScopeLabel").textContent = `${n} 单`;
+    $("#shipTogetherRow").hidden = n < 2;
+    $("#shipDateRow").hidden = false;
+    $("#shipDate").value = todayStr();
+    $("#shipMembers").innerHTML = members.map((o) => `<div class="batch-item"><span class="bi-name">`
+      + `${escapeHtml(o.name || "未命名")}</span><span class="bi-cost">×${qtyOf(o)} · ${money(o.cost)}</span></div>`).join("");
+    const fold = $("#shipMembersBox");
+    if (fold) {
+      const label = $("#shipMembersLabel");
+      if (label) label.textContent = `这次寄的 ${n} 单 · 垫付合计 ${money(totalCost)}`;
+      fold.open = n <= 8;
+    }
+    shipBaseHint = n > 1 ? "可空；一起寄时写到这几单每一单上。" : "可空；没有单号也能标记寄出。";
+    updateShipTrackingHint();
+    $("#shipTracking").value = "";
+    $("#shipFee").value = "";
+    applyShipTogetherUi();
+    openModal("#shipModal");
+  }
+
+  function submitShipNew() {
+    const members = shipMembers();
+    const n = shipTarget.ids.length;
+    if (members.length !== n) { toast("勾选的单已经变了，这次没有保存，请重新勾选"); return false; }
+    const separate = n > 1 && !shipTogether;
+    const shipDate = cleanShipDate($("#shipDate").value);
+    if (!shipDate) { toast("寄出日期填写有误"); return false; }
+    const tracking = separate ? "" : cleanTracking($("#shipTracking").value);
+    const trackingGiven = tracking !== "";
+    const feeRaw = separate ? "" : String($("#shipFee").value || "").trim();
+    const feeGiven = feeRaw !== "";
+    if (feeGiven && !validAmountInputs([$("#shipFee")])) return false;
+    const fee = feeGiven ? numberValue(feeRaw) : 0;
+    if (feeGiven && fee < 0) { toast("邮费不能是负数"); return false; }
+    const feeCents = feeGiven ? toCents(fee) : 0;
+    const together = n > 1 && !separate;
+    const plan = together && feeGiven ? shipFeePlan(members, true, feeCents) : null;
+    if (together && feeGiven && !plan) { toast("分摊校验未通过，账本没有改动"); return false; }
+
+    const ids = shipTarget.ids.slice();
+    // 注意：withLedgerWrite 在有 Web Locks 时是**异步**的（排队拿锁）。关面板、报单这些后续动作
+    // 必须放在写入回调里、确认 saveData 成功之后再做（与 submitShip 同一写法），不能看返回值就关。
+    return withLedgerWrite(() => {
+      const now = shipMembers();
+      if (!shipSession || shipSession.generation !== ledgerGeneration
+        || JSON.stringify(now.map((o) => o.id).sort()) !== JSON.stringify(shipSession.ids)) {
+        toast("勾选的单已经变了，这次没有保存，请重新勾选"); return false;
+      }
+      if (now.some((o) => shipSession.snaps.get(o.id) !== orderSnap(o))) {
+        toast("这几单的内容已变化，这次没有保存，请重新核对"); return false;
+      }
+      if (now.some((o) => o.status !== "在途" || isShipped(o))) {
+        toast("勾选里有单已经不是「待寄」了，这次没有保存"); return false;
+      }
+      if (together) {
+        const broughtFee = now.reduce((a, o) => a + toCents(o.fee), 0);
+        const broughtIncome = now.reduce((a, o) => a + toCents(o.income), 0);
+        if (broughtIncome < 0) {
+          toast(`这几单的回款合计是 ${money(broughtIncome / 100)}（负数），账本表示不了负的整批回款，本次没寄出`);
+          return false;
+        }
+        const batchId = uid();
+        const batchFeeCents = feeGiven ? feeCents : broughtFee;
+        if (feeGiven) {
+          const feeById = new Map(now.map((o, i) => [o.id, plan[i]]));
+          now.forEach((o) => { o.fee = feeById.get(o.id) / 100; o.batchFeeShare = feeById.get(o.id); });
+        } else {
+          // 邮费留空：整批口径＝各单现有邮费之和，份额就记各单现有邮费（分）。否则份额全 0 时，
+          // 之后「退出本批」会按垫付权重反推扣减，与成员实际邮费对不上，表头亮假的「≠」。
+          now.forEach((o) => { o.batchFeeShare = Math.max(0, toCents(o.fee)); });
+        }
+        now.forEach((o) => {
+          if (trackingGiven) o.tracking = tracking;
+          o.shipDate = shipDate;
+          o.batchId = batchId;
+          o.batchDate = shipDate;
+          o.batchFee = batchFeeCents / 100;
+          o.batchIncome = broughtIncome / 100;
+          o.batchCount = now.length;
+        });
+      } else {
+        now.forEach((o) => {
+          o.shipDate = shipDate;
+          if (n === 1 && trackingGiven) o.tracking = tracking;
+          if (n === 1 && feeGiven) o.fee = fee;
+        });
+      }
+      if (!saveData()) return false;
+      ids.forEach((id) => selection.delete("o:" + id));
+      closeShipForm();
+      renderList();
+      if (separate) { toast(`已标记 ${n} 单寄出`); return true; }
+      // 寄完就报单：紧接着打开报单面板并写剪贴板（与「报单」按钮同一条复制路径）；复制失败面板里有按钮再点一次
+      openBaodan({ type: "ids", ids });
+      return true;
+    });
+  }
+
+  // v41：已寄出的散单改回待寄（寄错了/记错了）。只清寄出日期与单号；邮费、回款、状态一个字都不碰。
+  // 批内单不走这里（先「退出本批」，避免拆批口径）。
+  function unshipOrder(id) {
+    const o = data.orders.find((x) => x.id === id);
+    if (!o) return;
+    if (o.status !== "在途" || o.batchId) { toast("只有没成批、还在途的单能改回待寄"); return; }
+    if (!confirm(`把「${o.name || "未命名"}」改回待寄？\n会清掉它的寄出日期和单号（邮费保留）。`)) return;
+    const snap = orderSnap(o), gen = ledgerGeneration;
+    withLedgerWrite(() => {
+      const cur = data.orders.find((x) => x.id === id);
+      if (!cur || gen !== ledgerGeneration || orderSnap(cur) !== snap) { toast("这一单已变化，没有改动，请重新核对"); return false; }
+      cur.shipDate = ""; cur.tracking = "";
+      if (!saveData()) return false;
+      toast("已改回待寄");
+      return true;
+    });
+  }
+
   function closeShipForm() {
     closeModal("#shipModal");
     shipTarget = null;
@@ -1876,7 +2238,7 @@
   function updateShipTrackingHint() {
     const el = $("#shipTrackingHint");
     if (!el) return;
-    if (shipSession && shipSession.trackingClear) {
+    if (shipSession && shipSession.trackingClear && !(shipTarget && shipTarget.kind === "new")) {
       el.textContent = shipTarget && shipTarget.kind === "batch"
         ? "已点「清空」：保存会把这一批每一单的单号一起清掉。"
         : "已点「清空」：保存会清掉这一单的单号。";
@@ -1888,6 +2250,7 @@
   // 唯一的一次提交：所有校验与整笔写入计划都在任何改动之前算完，只调一次 saveData()。
   function submitShip() {
     if (!shipTarget) return;
+    if (shipTarget.kind === "new") return submitShipNew();
     const members = shipMembers();
     if (members.length === 0) { toast("这一单已经不在账本里了，这次没有保存"); return; }
     const isBatch = shipTarget.kind === "batch";
@@ -2330,6 +2693,8 @@
 
     f.classList.toggle("kind-income", income);
     f.querySelectorAll(".kind-order input, .kind-order select").forEach((input) => { input.disabled = income; });
+    // v41：编辑时隐藏的邮费格退出浏览器原生校验（disabled 不参与校验；值仍可读，保存取原单的值）
+    f.fee.disabled = income || !!editingId;
     $$("#formKind .seg").forEach((b) =>
       b.classList.toggle("on", b.dataset.kind === formKind));
     $("#formCostLabel").textContent = income ? "金额" : "垫付金额";
@@ -2903,6 +3268,12 @@
     st.status = "saved";
     st.pendingCheck = false;
     draftRender();
+    // v41：邮费与单号在记单表单里是隐藏格（只在寄出面板改）。旧版留下的草稿可能带着它们——
+    // 新建形态下一律清掉，免得看不见的邮费/单号被悄悄写进新单（有单号还会让它直接跳过「待寄」）。
+    if (!editingId) { f.fee.value = ""; f.tracking.value = ""; }
+    // 恢复的日期若不是今天，直接展开日期框，小字与将要保存的日期保持一致
+    f.querySelector(".fld-date").classList.toggle("open", !!editingId || f.date.value !== todayStr());
+    updateDateToggle();
     updateFormMoreSummary();
     applyKindUi();
     return true;
@@ -3145,6 +3516,10 @@
     $("#formIncomeHint").textContent = "";
     $("#formMore").open = false;
     $("#formTitle").textContent = "记一单";
+    f.classList.add("is-new");                         // v41：下一单也是新建形态
+    f.querySelector(".fld-date").classList.remove("open");
+    updateDateToggle();
+    $("#formShipInfo").hidden = true;
     $("#formKind").hidden = false;
     applyKindUi();
     applyChainUi();
@@ -3204,7 +3579,10 @@
       channelOpts.map((c) => [c, c === "" ? "未填写" : c]),
       currentChannel
     );
-    f.fee.value = src ? numberValue(src.fee) : "";      // 同上：0 写成 0（邮费可不填，留空仍按 0 算）
+    // 同上：0 写成 0（邮费可不填，留空仍按 0 算）。
+    // v41：邮费只在**编辑既有单**时回填（与单号同一条规矩）——「再来一单」是又一次寄件，邮费那时还没发生；
+    // 表单里这一格已隐藏（全站只在「寄出」面板里填邮费），沿用原单邮费会悄悄带进一笔看不见的钱。
+    f.fee.value = order ? numberValue(order.fee) : "";
     // 状态下拉：现役两态；编辑遗留「自留」单时把该单自己的旧状态补进去（只读项），
     // 否则下拉会因没有匹配项而回空、保存时把状态静默改写掉——v21 的红线就是不许改写旧状态
     const statusOpts = STATUSES.slice();
@@ -3223,7 +3601,7 @@
     if (order && order.batchId) {
       batchHint.hidden = false;
       batchHint.textContent = `这一单属于一起寄出的那一批（${order.batchDate || order.date}），`
-        + `邮费在批次那行、或这张单卡片上的「改本批邮费」里统一改；在这里单独改只会让它和整批口径不一致。`;
+        + `邮费是整批一笔，在下面「改寄出信息」里按整批改。`;
     } else {
       batchHint.hidden = true;
       batchHint.textContent = "";
@@ -3241,6 +3619,14 @@
       incomeHint.textContent = "";
     }
     $("#formTitle").textContent = order ? "编辑订单" : "记一单";
+    // v41：新建表单只留 商品名 / 垫付 / 数量（日期默认今天，点那行小字才展开；状态一律在途不出现）。
+    // 编辑时日期、状态照常；单号与邮费只读写出一行 + 「改寄出信息」链接（全站只有寄出面板能改它们）。
+    f.classList.toggle("is-new", !order);
+    f.querySelector(".fld-date").classList.toggle("open", !!order);
+    updateDateToggle();
+    const shipInfo = $("#formShipInfo");
+    shipInfo.hidden = !order;
+    if (order) $("#formShipInfoText").textContent = shipInfoText(order);
     $("#formMore").open = !!(order && order.status !== "在途");
     // v25：编辑表单**不加**类型切换（一律按货单形态回显，用户在该形态下自由改）
     $("#formKind").hidden = !!order;
@@ -3253,6 +3639,28 @@
     // 基线必须在表单**建好之后**取：之后只有真改动才会与它不同（离开保护与草稿判据共用）
     formBaseline = controlState(f);
     setTimeout(() => f.goods.focus(), 120);
+  }
+
+  // v41：编辑表单里那一行只读的寄出信息
+  function shipInfoText(o) {
+    if (!isShipped(o)) return "还没寄出（寄出请在卡片上点「寄出」）";
+    const bits = [];
+    const when = o.shipDate || o.batchDate;
+    bits.push(when ? `已寄出 ${when.slice(5)}` : "已寄出");
+    if (cleanTracking(o.tracking)) bits.push(`单号 ${cleanTracking(o.tracking)}`);
+    bits.push(o.batchId ? `本单摊到邮费 ${money(o.fee)}` : `邮费 ${money(o.fee)}`);
+    return bits.join(" · ");
+  }
+
+  function updateDateToggle() {
+    const f = $("#orderForm");
+    const t = $("#formDateToggle");
+    if (!t) return;
+    const isNew = f.classList.contains("is-new");
+    const open = f.querySelector(".fld-date").classList.contains("open");
+    t.hidden = !isNew || open;
+    const v = f.date.value;
+    t.textContent = v === todayStr() ? `日期：今天 ${v.slice(5)} · 改` : `日期：${v || "未填"} · 改`;
   }
 
   // force=true 只给"确实保存成功"那几条路用（避免保存成功后再弹一次"要丢改动吗"）——
@@ -3335,11 +3743,15 @@
     const name = String(f.goods.value || "").trim();
     const date = f.date.value || todayStr();
     if (!name) { toast(isIncome ? "先填名称" : "先填商品名称"); return; }
-    if (!validAmountInputs([f.cost, f.fee])) return;
+    // v41：编辑时邮费格是隐藏的（界面上只在寄出面板改），它装着原单的值、原样回写。
+    // 值没动过就不校验它：否则一份从导入/云端带进来的三位小数邮费会让保存被一个看不见的格子拦死。
+    const editingOrder = editingAtSubmit ? data.orders.find((o) => o.id === editingAtSubmit) : null;
+    const feeUntouched = !!editingOrder && String(f.fee.value) === String(numberValue(editingOrder.fee));
+    if (!validAmountInputs(feeUntouched ? [f.cost] : [f.cost, f.fee])) return;
 
     // 03 期：把原生校验那几条在 JS 里补上（`#formSaveNext` 绕过了 required/min/step），
     // 让「保存」与「保存并继续」逐条同强度。负金额／三位小数从这里起就进不来。
-    const rawProblem = amountTextProblem(f, [["cost", "垫付金额"], ["fee", "邮费"]]);
+    const rawProblem = amountTextProblem(f, feeUntouched ? [["cost", "垫付金额"]] : [["cost", "垫付金额"], ["fee", "邮费"]]);
     if (rawProblem) { toast(rawProblem); return; }
 
     // —— v25 收入单：只填一个金额，没有垫付/邮费/数量，落库全部用**现有字段** ——
@@ -3367,6 +3779,7 @@
         // v31：收入单不会寄件，单号恒空（那一格在收入模式下是 .kind-order、隐藏且不参与校验，
         // 与邮费/数量同一条规矩：隐藏字段取库里的定值，不回读界面）
         tracking: "",
+        shipDate: "",                                // v41：收入单不寄件
         createdAt: new Date().toISOString(),
       };
       data.orders.push(order);
@@ -3429,7 +3842,7 @@
       income: existing ? existing.income : null,
       incomeDate: existing ? existing.incomeDate : null,
       status: f.status.value,
-      fee: numberValue(f.fee.value),
+      fee: feeUntouched ? editingOrder.fee : numberValue(f.fee.value),   // v41：没动过就原值带回（见上方校验处的说明）
       // 编辑不改变批次归属（改的是这一单自己的字段；整批口径仍以批量结算时为准，v24 起
       // 整批金额就是这一批的唯一权威值，成员单上的金额只是它的分摊）；
       // 份额字段原样带过——它记的是「本批摊到这一单多少」，退出/重组扣减要靠它。
@@ -3445,6 +3858,8 @@
       // v31：新建与编辑**同一条表达式**——编辑时这一格由 openForm 回填了原值，用户改成什么就存什么；
       // 清空这一格再保存＝把这一单的单号去掉（与「邮费留空＝删掉」同一条规矩，界面里也有「清空」小按钮）
       tracking: cleanTracking(f.tracking.value),
+      // v41：编辑不改寄出日期（它只归「寄出 / 改回待寄」两个入口管）；新单一律未寄
+      shipDate: existing ? existing.shipDate : "",
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
     if (existing) Object.assign(existing, order, { id: existing.id });
@@ -3919,6 +4334,9 @@
       x.batchIncome = Math.max(0, toCents(x.batchIncome) - outIncome) / 100;
     });
     leavers.forEach((x) => {
+      // v41：离开批次前把「寄出过」这件事留下——没有寄出日期的（升级前成批的老单）沿用批次日期，
+      // 否则没单号的老成员一退批就会被当成没寄、掉回「待寄」。已有寄出日期的不动。
+      if (!x.shipDate) x.shipDate = cleanShipDate(x.batchDate);
       x.batchId = ""; x.batchDate = ""; x.batchFee = 0; x.batchIncome = 0; x.batchCount = 0;
       x.batchFeeShare = 0; x.batchIncomeShare = 0;
     });
@@ -3935,8 +4353,17 @@
   // 完全更改，这并不需要我去重新选」（v23 的追加语义已删除）。
   // 从批次表头、以及每张批内单卡片上的「改本批邮费」进来时预选该批全部成员（含已回款的），
   // 于是「改错的钱」变成点一下 → 填新值 → 结算。
-  function openBatchModal(preselectBatchId) {
-    const pool = data.orders.filter((o) => o.status === "在途");
+  // v41：opts.mode = "pay" ＝「回款」模式——账本页勾选（一整批 / 若干散单）或批次表头「回款」进来。
+  // 同一个弹窗、同一条写账路径（submitBatchImpl），只是：范围在打开那一刻定死（名单不可再勾）、
+  // 邮费格隐藏（留空＝不动）、必须填对方总回款。散单 ≥2 单时按既有规则当场合成一批。
+  let batchMode = "full";
+  function openBatchModal(preselectBatchId, opts = {}) {
+    batchMode = opts.mode === "pay" ? "pay" : "full";
+    const payIds = batchMode === "pay" && Array.isArray(opts.ids) ? new Set(opts.ids) : null;
+    const pool = batchMode === "pay"
+      ? data.orders.filter((o) => (payIds ? payIds.has(o.id) && o.status === "在途" : false))
+      : data.orders.filter((o) => o.status === "在途");
+    if (batchMode === "pay" && payIds && pool.length !== payIds.size) { toast("勾选的单已经变了，请重新勾选"); batchMode = "full"; return; }
     if (preselectBatchId) {
       // 这一批的**全部成员**都要列进来：弹窗平时只列在途单，已经收过款的那批一进来就空了，
       // 「邮费记错了」却正好常常是在回款之后才发现的
@@ -3969,6 +4396,7 @@
       id: o.id, name: o.name, cost: o.cost, batchId: o.batchId,
       checked: preselectBatchId ? o.batchId === preselectBatchId : true,
     }));
+    if (batchMode === "pay" && preselectBatchId) batchItems = batchItems.filter((it) => it.checked);
     // v38（报告 B2）：结算会话的快照——勾选、金额预期与分摊权重都建立在**打开这一刻**的账本上；
     // 提交前对表（代次 + 所选成员逐单），对不上就拒绝落库。
     batchSession = {
@@ -3981,6 +4409,22 @@
     $("#batchFee").value = "";
     $("#batchIncome").value = "";
     $("#batchDate").value = todayStr();
+    const pay = batchMode === "pay";
+    $("#batchModal").classList.toggle("pay-mode", pay);
+    $("#batchTitle").textContent = pay ? "回款" : "批量结算";
+    $("#batchModal .batch-sub").textContent = pay
+      ? (preselectBatchId ? "这一整批一起回款：填对方打过来的总数，按垫付占比摊到每一单。"
+        : "这几单一起回款，会合成一批：填对方打过来的总数，按垫付占比摊到每一单。")
+      : "勾选本次一起寄出的在途单，邮费和回款按垫付占比分摊";
+    $("#batchSubmit").textContent = pay ? "确认回款" : "结算";
+    const paidIn = pay ? batchItems.map((it) => data.orders.find((o) => o.id === it.id))
+      .filter((o) => o && o.status !== "在途") : [];
+    const warn = $("#batchPayWarn");
+    warn.hidden = paidIn.length === 0;
+    warn.textContent = paidIn.length
+      ? `这一批里有 ${paidIn.length} 单已经回过款（${paidIn.slice(0, 2).map((o) => o.name || "未命名").join("、")}${paidIn.length > 2 ? "…" : ""}）。`
+        + `确认后整批按新总数重新分摊，它们的回款也会一起改成新分摊的数。只想给没回款的那几单记钱，请改用各自卡片上的「回款」。`
+      : "";
     renderBatchList();
     openModal("#batchModal");
     batchBaseline = controlState($("#batchModal"));   // 04 期：渲染之后取基线
@@ -4049,6 +4493,8 @@
     if (force !== true && !batchLeaveGuard()) return false;
     closeModal("#batchModal");
     batchItems = [];
+    batchMode = "full";
+    $("#batchModal").classList.remove("pay-mode");
     batchSession = null;   // v38：会话随弹窗关闭一起作废
     batchBaseline = null;
     return true;
@@ -4075,17 +4521,17 @@
         if (g && g.feeCents > 0) tags.push(`已分摊邮费 ${money(g.feeCents / 100)}`);
         if (g && g.incomeCents > 0) tags.push(`已回款 ${money(g.incomeCents / 100)}`);
         parts.push(`<label class="batch-item bg-row">
-          <input type="checkbox" data-group="${escapeHtml(it.batchId)}"${onCount === idxs.length ? " checked" : ""}${onCount > 0 && onCount < idxs.length ? ` data-partial="1"` : ""}>
+          <input type="checkbox"${batchMode === "pay" ? " disabled" : ""} data-group="${escapeHtml(it.batchId)}"${onCount === idxs.length ? " checked" : ""}${onCount > 0 && onCount < idxs.length ? ` data-partial="1"` : ""}>
           <span class="bg-title">一起寄 · ${escapeHtml(g ? g.date : "")}</span>
           <span class="bi-cost">${idxs.length} 单</span>
         </label>`);
-        if (tags.length > 0) parts.push(`<div class="bg-tags">${tags.join(" · ")}${onCount === idxs.length ? `　再填金额＝把这一批改成那个数` : ""}</div>`);
+        if (tags.length > 0) parts.push(`<div class="bg-tags">${tags.join(" · ")}${onCount === idxs.length && batchMode !== "pay" ? `　再填金额＝把这一批改成那个数` : ""}</div>`);
       } else if (!it.batchId && !sepShown && seen.size > 0) {
         sepShown = true;
         parts.push(`<div class="bg-sep">未成批（单寄的单子）</div>`);
       }
       parts.push(`<label class="batch-item${it.batchId ? " in-group" : ""}">
-        <input type="checkbox" data-idx="${i}"${it.checked ? " checked" : ""}>
+        <input type="checkbox" data-idx="${i}"${it.checked ? " checked" : ""}${batchMode === "pay" ? " disabled" : ""}>
         <span class="bi-name">${escapeHtml(it.name || "未命名")}</span>
         <span class="bi-cost">${money(it.cost)}</span>
       </label>`);
@@ -4100,6 +4546,15 @@
   function updateBatchSummary() {
     const sel = batchItems.filter((it) => it.checked);
     const totalCents = sel.reduce((a, b) => a + toCents(b.cost), 0);
+    if (batchMode === "pay" && sel.length > 0) {
+      // v41：回款模式补一句利润预览（回款 − 垫付 − 各单现有邮费；与卡片利润同一口径）
+      const feeCents = sel.reduce((a, it) => a + toCents((data.orders.find((o) => o.id === it.id) || {}).fee), 0);
+      const raw = String($("#batchIncome").value || "").trim();
+      const profit = raw !== "" && Number.isFinite(Number(raw)) ? toCents(raw) - totalCents - feeCents : null;
+      $("#batchSummary").innerHTML = `${sel.length} 单 · 垫付 ${money(totalCents / 100)}${feeCents ? ` · 邮费 ${money(feeCents / 100)}` : ""}`
+        + (profit === null ? "" : ` · 利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit / 100)}</b>`);
+      return;
+    }
     $("#batchSummary").textContent = sel.length === 0
       ? "还没勾选任何单子"
       : `已选 ${sel.length} 单 · 垫付合计 ${money(totalCents / 100)}`;
@@ -4155,14 +4610,21 @@
     if (!validAmountInputs([$("#batchFee"), $("#batchIncome")])) return;
     // 留空＝这一项一个字不动（保住「先只摊邮费、回款到了再补一趟」的两趟打法）；
     // 填数字＝把这一项**改成这个数**（不是加上去）；填 0＝删掉这一项。
-    const feeGiven = String($("#batchFee").value || "").trim() !== "";
+    const feeGiven = batchMode !== "pay" && String($("#batchFee").value || "").trim() !== "";
     const incomeGiven = String($("#batchIncome").value || "").trim() !== "";
+    if (batchMode === "pay" && !incomeGiven) { toast("先填对方打过来的总回款"); $("#batchIncome").focus(); return; }
+    // 回款模式里填 0 会写成「回款 0、状态仍在途」，提示却像已回款——直接拦下（要删回款走「改本批回款」）
+    if (batchMode === "pay" && !(toCents($("#batchIncome").value) > 0)) { toast("回款金额要大于 0"); $("#batchIncome").focus(); return; }
     const feeCents = feeGiven ? Math.max(0, toCents($("#batchFee").value)) : 0;
     const incomeCents = incomeGiven ? Math.max(0, toCents($("#batchIncome").value)) : 0;
     const weights = orders.map((o) => Math.max(0, toCents(o.cost)));
     const prev = sel.prev;
     const batchId = sel.reuseId || uid();
-    const batchDate = (prev && prev.date) || $("#batchDate").value || todayStr();
+    // v41：回款模式把几张散单当场合成一批时，批次日期取它们**最早的寄出日期**（那才是一起寄的那天；
+    // 邮费按批次日期归期）；都没记寄出日期才退回本次到账日期。既有批次保持原日期（规则不变）。
+    const earliestShip = batchMode === "pay"
+      ? orders.map((o) => o.shipDate || "").filter(Boolean).sort()[0] || "" : "";
+    const batchDate = (prev && prev.date) || earliestShip || $("#batchDate").value || todayStr();
 
     // ---- v38（报告 B3 / D1 / D2）：先把整笔写入计划算完、校验通过，再动一个字节 ----
     // 原批次被带走的份额必须在改动任何单之前算完（改完再算读到的就是已经写过的值）。
@@ -4269,6 +4731,7 @@
       o.batchCount = orders.length;
     });
 
+    const payMode = batchMode === "pay";
     if (!saveData()) return;
     closeBatchModal(true);   // 04 期：保存成功用显式 bypass
     const amounts = [];
@@ -4279,7 +4742,8 @@
     // v38：留空那两趟也不再写 0 —— 整批口径按**被带入成员的实际合计**建立（D2），
     // 所以措辞说「成员金额没动」（成员那一格确实一个字没动，整批口径跟它们对齐）。
     let msg;
-    if (!feeGiven && !incomeGiven) msg = "这一批的成员与日期已记下，成员金额没动";
+    if (payMode) msg = `已回款 ${money(incomeCents / 100)} · ${orders.length} 单${!prev && orders.length > 1 ? "（合成一批）" : ""}`;
+    else if (!feeGiven && !incomeGiven) msg = "这一批的成员与日期已记下，成员金额没动";
     else if (prev) msg = `已改成本批${amounts.join(" · ")} · ${orders.length} 单`;
     else msg = `已结算 ${orders.length} 单${orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : ""} · ${amounts.join(" · ")}`;
     toast(msg);
@@ -4538,10 +5002,14 @@
   async function openBaodan(scope) {
     baodanRevision += 1; baodanCopySeq += 1;
     const fromBatch = !!(scope && scope.type === "batch");
-    baodanScope = { type: fromBatch ? "batch" : "filter", batchId: fromBatch ? scope.batchId : "" };
+    // v41：第三种范围——「这几单」（寄出后自动报单 / 散单卡片上的「报单」）。范围在打开那一刻定死。
+    const fromIds = !!(scope && scope.type === "ids");
+    baodanScope = { type: fromBatch ? "batch" : fromIds ? "ids" : "filter", batchId: fromBatch ? scope.batchId : "" };
+    const idSet = fromIds ? new Set(scope.ids || []) : null;
     baodanCandidates = fromBatch
       ? data.orders.filter((o) => o.batchId === baodanScope.batchId)
-      : filteredOrders();
+      : fromIds ? data.orders.filter((o) => idSet.has(o.id))
+        : filteredOrders();
     // 默认全选：常规「寄出一批 → 报单 → 去微信粘贴」。要拆两次报或剔掉赠品就在清单里取消勾选
     baodanSel = new Set(baodanCandidates.map((o) => o.id));
     // v38（报告 B7）：报单会话绑账本代次 + 候选单快照。云端换包之后候选单与账本脱钩，继续用旧面板
@@ -4551,10 +5019,11 @@
       snaps: new Map(baodanCandidates.map((o) => [o.id, orderSnap(o)])),
     };
     const head = baodanCandidates[0];
-    if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : "";
+    if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : fromIds ? (head.shipDate || head.batchDate || "") : "";
     baodanScope.title = fromBatch
       ? `一起寄出 · ${head ? (head.batchDate || head.date) : ""} · ${baodanCandidates.length} 单`
-      : `账本当前筛选「${currentFilter}」· ${baodanCandidates.length} 单`;
+      : fromIds ? `寄出 · ${head ? (head.shipDate || head.batchDate || todayStr()) : ""} · ${baodanCandidates.length} 单`
+        : `账本当前页签「${currentFilter}」· ${baodanCandidates.length} 单`;
     // v31：单号那一格预填**范围里最常见的非空单号**。这里只取预填值，**不存快照**——
     // 提示行按「本次勾选的单」现算（见 bdTrackingHint），这样写库统一之后它自己就消失了。
     baodanTrackingTouched = false;      // 新开一次面板＝这一格还没被用户动过（写账本的必要条件）
@@ -4735,7 +5204,8 @@
       if (remote === null || remote === undefined) return { kind: "empty" };
       const problem = ledgerProblem(remote.data, true);
       if (problem) return { kind: "failed", error: problem };
-      return { kind: "data", data: normalizeData(remote.data), updatedAt: remote.updatedAt || "", identity: owner };
+      return { kind: "data", data: normalizeData(remote.data), updatedAt: remote.updatedAt || "", identity: owner,
+        rawVersion: remote.data && remote.data.version };
     } catch (error) {
       if (stale()) return { kind: "stale" };
       return { kind: "failed", error: error && error.message ? error.message : String(error) };
@@ -4788,6 +5258,7 @@
       const remoteBase = clone(result.data);
       const updatedAt = merged ? new Date().toISOString() : result.updatedAt;
       if (!await setLedger(incoming, updatedAt, { sync: merged > 0 })) return { kind: "blocked" };
+      markLegacyLedger(result.rawVersion, incoming.orders);
       rememberSyncBase(remoteBase, result.identity);
       if (merged) toast(`已并入本机 ${merged} 单，正在安排同步`);
       else if (declined) toast(`已采用云端版本（本机 ${declined} 单未并入）`);
@@ -4865,7 +5336,7 @@
         toast("配对未完成，未上传本机账本"); return;
       }
       if (!checkWriteBoundary()) { await rollback(); return; }
-      const incoming = result.kind === "data" ? clone(result.data) : { version: 1, orders: [] };
+      const incoming = result.kind === "data" ? clone(result.data) : { version: LEDGER_VERSION, orders: [] };
       const conflicts = conflictingIds(incoming);
       if (conflicts.length && (!preserveConflict(incoming, "配对时存在不同记录")
         || !confirm(`有 ${conflicts.length} 单与云端不同。已保留两份恢复副本。\n确定采用云端对应记录并继续配对？取消会恢复原身份。`))) {
@@ -4879,7 +5350,8 @@
         { meta: { lastSyncedAt: null, lastSyncError: "" } })) { await rollback(); return; }
       committed = true;
       if (stale()) return;
-      rememberSyncBase(result.kind === "data" ? result.data : { version: 1, orders: [] }, appliedIdentity);
+      if (result.kind === "data") markLegacyLedger(result.rawVersion, result.data.orders);
+      rememberSyncBase(result.kind === "data" ? result.data : { version: LEDGER_VERSION, orders: [] }, appliedIdentity);
       scheduleSync();
       toast(extra.length ? `已配对，并找回本机 ${extra.length} 单` : "同步码已导入"); renderSettings();
     } catch (error) {
@@ -4908,11 +5380,11 @@
       window.luhuoSync.resetIdentity();
       captureStorageBaseline();
       syncBlocked = ""; syncBase = null;
-      if (!setLedgerNow({ version: 1, orders: [] }, null,
-        { meta: { lastSyncedAt: null, lastSyncError: "", filter: "在途" } })) {
+      if (!setLedgerNow({ version: LEDGER_VERSION, orders: [] }, null,
+        { meta: { lastSyncedAt: null, lastSyncError: "", filter: "待寄" } })) {
         localStorage.setItem(IDENTITY_KEY, previousIdentity); syncBase = previousBase; captureStorageBaseline(); return;
       }
-      currentFilter = "在途";
+      currentFilter = "待寄"; selection.clear();
       render(); renderSettings(); toast("已重置为新账本");
     } catch {
       try { localStorage.setItem(IDENTITY_KEY, previousIdentity); captureStorageBaseline(); } catch { /* Remain blocked. */ }
@@ -4941,6 +5413,7 @@
         if (!confirm(`导入 ${incoming.orders.length} 单，覆盖当前账本（${data.orders.length} 单）？\n建议先导出备份。`)) return;
         if (localIssue && !preserveConflict(incoming, "导入修正版本前的本机原数据")) return;
         if (!await setLedger(incoming, new Date().toISOString(), { sync: true, recovery: true })) return;
+        markLegacyLedger(parsed.version, incoming.orders);
         toast("导入完成");
       } catch {
         toast("文件格式不对，导入失败");
@@ -4993,8 +5466,13 @@
   }
 
   function switchView(view) {
-    $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + view));
+    // v41：底部只剩「账本 / 统计」。"dash"（旧看板）是 "report" 的别名：统计页＝总览（#view-dash）＋报表
+    if (view === "dash") view = "report";
+    $$(".view").forEach((v) => v.classList.toggle("active",
+      v.id === "view-" + view || (view === "report" && v.id === "view-dash")));
     $$(".tabbar button").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
+    $$("#listMoreMenu").forEach((m) => { m.hidden = true; });
+    if (view !== "list" && selection.size) { selection.clear(); renderList(); }
     window.scrollTo(0, 0);
   }
 
@@ -5034,6 +5512,20 @@
   function handleCardAction(btn) {
     if (btn.dataset.act === "btoggle") { toggleBatchBlock(btn); return; }
     const { act, id } = btn.dataset;
+    // v41：卡片「更多」只切这一张卡的显隐（不重渲染整列表，保住滚动位置）
+    if (act === "more") {
+      const box = btn.closest(".order-card") && btn.closest(".order-card").querySelector(".order-more");
+      if (!box) return;
+      box.hidden = !box.hidden;
+      btn.setAttribute("aria-expanded", String(!box.hidden));
+      btn.textContent = box.hidden ? "更多" : "收起";
+      return;
+    }
+    if (act === "shipnew") { openShipForm({ kind: "new", ids: [id] }); return; }
+    if (act === "unship") { unshipOrder(id); return; }
+    if (act === "bd1") { openBaodan({ type: "ids", ids: [id] }); return; }
+    if (act === "bpay") { openBatchModal(btn.dataset.batch || "", { mode: "pay" }); return; }
+    if (act === "bship") { openShipForm({ kind: "batch", batchId: btn.dataset.batch || "" }); return; }
     if (act === "pay") openPayForm(id);
     else if (act === "dup") duplicateOrder(id);
     else if (act === "edit") openForm(data.orders.find((x) => x.id === id));
@@ -5120,9 +5612,73 @@
     $("#settingsBtn").addEventListener("click", openSettings);
     $("#fab").addEventListener("click", () => openForm(null));
 
+    // ---- v41：账本页顶部 ⋯ 菜单、勾选操作条、两条提示 ----
+    const moreMenu = $("#listMoreMenu");
+    $("#listMoreBtn").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      moreMenu.hidden = !moreMenu.hidden;
+      $("#listMoreBtn").setAttribute("aria-expanded", String(!moreMenu.hidden));
+    });
+    moreMenu.addEventListener("click", () => { moreMenu.hidden = true; $("#listMoreBtn").setAttribute("aria-expanded", "false"); });
+    document.addEventListener("click", (ev) => {
+      if (!moreMenu.hidden && !ev.target.closest("#listMoreMenu, #listMoreBtn")) {
+        moreMenu.hidden = true; $("#listMoreBtn").setAttribute("aria-expanded", "false");
+      }
+    });
+    $("#orderList").addEventListener("change", (ev) => {
+      const cb = ev.target.closest("input[data-sel]");
+      if (!cb) return;
+      if (cb.checked) selection.add(cb.dataset.sel); else selection.delete(cb.dataset.sel);
+      renderSelBar();
+    });
+    $("#selClear").addEventListener("click", () => {
+      selection.clear();
+      $$("#orderList input[data-sel]").forEach((cb) => { cb.checked = false; });
+      renderSelBar();
+    });
+    $("#selGo").addEventListener("click", runSelection);
+    $("#checkHint").addEventListener("click", () => { openLookup(); setLookupTab("check"); });
+    $("#upgradeHintGo").addEventListener("click", () => {
+      const list = upgradeCandidates();
+      currentFilter = "待寄"; meta.filter = currentFilter; persistMeta();
+      selection.clear();
+      list.forEach((o) => selection.add("o:" + o.id));
+      renderList();
+      toast(`已勾上 ${list.length} 单，取消没寄的那几单，再点「寄出」`);
+    });
+    $("#upgradeHintDone").addEventListener("click", () => {
+      meta.v41HintDone = true; persistMeta(); renderListHints();
+    });
+    $$("#shipTogetherRow .seg").forEach((b) => b.addEventListener("click", () => {
+      shipTogether = b.dataset.together === "1";
+      applyShipTogetherUi();
+    }));
+    $("#batchIncome").addEventListener("input", updateBatchSummary);
+    $("#formDateToggle").addEventListener("click", () => {
+      const f = $("#orderForm");
+      f.querySelector(".fld-date").classList.add("open");
+      updateDateToggle();
+      setTimeout(() => { try { f.date.focus(); if (f.date.showPicker) f.date.showPicker(); } catch { /* 有的浏览器不让程序弹日期选择器 */ } }, 30);
+    });
+    $("#orderForm").date.addEventListener("change", updateDateToggle);
+    $$("#orderForm .stepper button").forEach((b) => b.addEventListener("click", () => {
+      const q = $("#orderForm").qty;
+      const next = Math.max(1, (Math.round(numberValue(q.value)) || 1) + Number(b.dataset.step));
+      q.value = next;
+      q.dispatchEvent(new Event("input", { bubbles: true }));
+    }));
+    $("#formShipInfoBtn").addEventListener("click", async () => {
+      const o = editingId && data.orders.find((x) => x.id === editingId);
+      if (!o) return;
+      const target = o.batchId ? { kind: "batch", batchId: o.batchId } : { kind: "loose", id: o.id };
+      const closed = await closeForm();
+      if (closed) openShipForm(target);
+    });
+
     $("#filterChips").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-filter]");
       if (!btn) return;
+      if (currentFilter !== btn.dataset.filter) selection.clear();
       currentFilter = btn.dataset.filter;
       meta.filter = currentFilter;
       persistMeta();
@@ -5405,6 +5961,7 @@
   // ---- 启动 ----
   async function start() {
     loadLocal();
+    if (legacyLoaded && !meta.v41FirstSeen) { meta.v41FirstSeen = new Date().toISOString(); persistMeta(); }
     populateSelects();
     bind();
     render();

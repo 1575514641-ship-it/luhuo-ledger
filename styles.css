@@ -456,7 +456,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 /* 快递单号是唯一可能比格子长的单行字段（maxlength=40 的单号在 360px 一行装不下）。
    让它画省略号：用户看得见「号没显示全」，而不是被硬切掉半个字形。
    两处同款字段（记单表单的 name=tracking、报单面板的 #baodanTracking）同修。 */
-#baodanTracking, .sheet input[name="tracking"] { text-overflow: ellipsis; }
+/* v41：寄出面板的 #shipTracking 现在是单号的唯一修改入口，同款字段一并画省略号（它没有 name 属性，按 id 点名） */
+#baodanTracking, #shipTracking, .sheet input[name="tracking"] { text-overflow: ellipsis; }
 .sheet select {
   padding-right: 34px;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%238b8477' stroke-width='2.5' stroke-linecap='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
@@ -900,3 +901,142 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .chk-item .ci-act button:active { background: var(--accent-soft); }
 .chk-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 22px 0; }
+
+/* ================= v41：按「买入 → 寄出 → 回款」重排 ================= */
+/* 账本顶部摘要：垫付在外 + 待寄/待回款单数 + 查账 + ⋯ */
+.ledger-sum {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--hero-bg); border: 1px solid var(--hero-line); border-radius: 16px;
+  padding: 10px 12px 10px 14px; margin-bottom: 10px; color: var(--hero-ink);
+}
+.ls-main { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.ls-label { font-size: 12px; color: var(--hero-label); }
+.ls-value { font-size: 20px; font-weight: 700; color: var(--hero-value); font-variant-numeric: tabular-nums; }
+.ls-counts { font-size: 12px; color: var(--hero-label); white-space: nowrap; }
+.list-acts { position: relative; display: flex; gap: 8px; flex: 0 0 auto; }
+.ls-btn { width: 44px; height: 44px; background: rgba(255, 255, 255, .7); border-color: var(--hero-line); color: var(--hero-ink); }
+.pop-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; min-width: 170px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 14px 34px -14px rgba(15, 40, 36, .45); padding: 4px; display: flex; flex-direction: column;
+}
+.pm-item {
+  border: 0; background: none; text-align: left; font: inherit; font-size: 14px; color: var(--ink);
+  padding: 0 12px; min-height: 44px; border-radius: 9px; cursor: pointer;
+}
+.pm-item:active, .pm-item:hover { background: var(--accent-soft); }
+/* 两条按需出现的细提示 */
+.list-hint {
+  display: block; width: 100%; text-align: left; font: inherit; font-size: 13px;
+  border: 1px solid var(--line); background: var(--card); color: var(--accent);
+  border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; min-height: 44px; cursor: pointer;
+}
+.list-hint.upgrade { color: var(--ink); cursor: default; border-color: var(--teal-line); }
+.list-hint.upgrade p { margin: 0 0 8px; line-height: 1.55; }
+.uh-acts { display: flex; gap: 8px; }
+.uh-acts .btn { flex: 1; }
+
+/* 勾选框（卡片左上 / 批次表头左侧） */
+.order-card.has-sel { position: relative; padding-left: 48px; }
+.order-card .sel-box {
+  position: absolute; left: 0; top: 0; width: 46px; height: 52px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.sel-box input { width: 20px; height: 20px; accent-color: var(--accent); margin: 0; cursor: pointer; }
+.batch-head.has-sel { position: relative; padding-left: 46px; }
+.batch-head .bh-sel {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 44px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+/* 表头的「回款」在收起态也看得见（其它 .bh-act 仍只在展开态显示） */
+.bh-pay {
+  flex: 0 0 auto; white-space: nowrap; min-height: 44px; padding: 0 14px;
+  border: 1px solid rgba(20, 184, 166, .35); background: var(--accent-soft); color: var(--accent);
+  border-radius: 99px; font-size: 13px; font-weight: 700; cursor: pointer;
+}
+.bh-pay:active { transform: scale(.96); }
+.batch-block:not(.collapsed) .bh-meta-row { flex-wrap: wrap; }
+
+/* 卡片：一个主按钮 + 「更多」 */
+.order-actions .more-toggle { color: var(--muted); }
+.order-more { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+
+/* 勾选操作条：吸底在页签栏之上 */
+.sel-bar {
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 35;
+  bottom: calc(78px + env(safe-area-inset-bottom));
+  width: min(532px, calc(100% - 24px));
+  display: flex; align-items: center; gap: 8px;
+  background: var(--primary); color: #e6f2f0; border-radius: 16px; padding: 8px 8px 8px 14px;
+  box-shadow: 0 14px 30px -12px rgba(14, 31, 28, .6);
+}
+.sb-info { flex: 1 1 auto; min-width: 0; font-size: 13px; line-height: 1.35; }
+.sb-info b { font-size: 14px; }
+.sb-info span { color: #9fc9c1; }
+.sel-bar .btn { width: auto; flex: 0 0 auto; min-height: 44px; padding: 0 16px; }
+.sel-bar .btn.ghost { background: transparent; color: #cfe5e0; border-color: rgba(230, 242, 240, .25); }
+.sel-bar .btn.primary:disabled { opacity: .45; }
+body.has-sel #fab { display: none; }
+body.has-sel main { padding-bottom: 80px; }
+
+/* 统计页：#view-dash（总览）与 #view-report 同时显示 */
+.fold-card > summary { cursor: pointer; font-weight: 600; font-size: 14px; list-style: none; min-height: 28px; display: flex; align-items: center; }
+.fold-card > summary::-webkit-details-marker { display: none; }
+.fold-card > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .15s; }
+.fold-card[open] > summary::after { transform: rotate(180deg); }
+.fold-card .fold-body { margin-top: 10px; }
+.fold-card .fold-body h2 { margin-top: 14px; }
+/* ⓘ 口径说明：默认收起，点开才显示 */
+.info-note { margin-top: 6px; }
+.info-note > summary { cursor: pointer; font-size: 11px; color: var(--muted); list-style: none; display: inline-block; padding: 4px 0; }
+.info-note > summary::-webkit-details-marker { display: none; }
+.info-note.center { text-align: center; }
+.info-note .foot-note { margin-top: 2px; }
+
+/* 记单表单：新建只留 商品名 / 垫付 / 数量；日期一行小字；邮费单号不在这里改 */
+#orderForm .ship-fld { display: none; }
+#orderForm.is-new .fld-status { display: none; }
+#orderForm.is-new .fld-date:not(.open) { display: none; }
+#orderForm.is-new .date-row { display: block; }
+.date-toggle {
+  display: block; border: 0; background: none; padding: 0 0 12px; margin: -2px 0 0;
+  font: inherit; font-size: 13px; color: var(--accent); cursor: pointer; min-height: 32px; text-align: left;
+}
+.fld-qty input { padding-right: 92px; }
+.stepper { position: absolute; right: 4px; bottom: 4px; display: flex; gap: 4px; }
+.stepper button {
+  width: 40px; height: 36px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--ink); font-size: 18px; line-height: 1; cursor: pointer;
+}
+.stepper button:active { background: var(--accent-soft); }
+.ship-info {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--muted); background: var(--bg); border-radius: 10px; padding: 8px 10px; margin-bottom: 11px;
+}
+.link-btn { border: 0; background: none; color: var(--accent); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; min-height: 36px; padding: 0 2px; }
+/* 「货单 / 收入」切换：只显示另一种，做成标题下的小链接 */
+#formKind.kind-link { background: none; padding: 0; margin: -8px 0 8px; justify-content: flex-end; }
+#formKind.kind-link .seg { flex: 0 0 auto; padding: 4px 2px; color: var(--accent); font-weight: 600; min-height: 32px; }
+#formKind.kind-link .seg.on { display: none; }
+
+/* 寄出面板 */
+.ship-together { margin-bottom: 12px; }
+.ship-together .seg { min-height: 40px; }
+#shipModal.ship-separate .ship-tk-row,
+#shipModal.ship-separate .ship-fee-row,
+#shipModal.ship-separate #shipTrackingHint,
+#shipModal.ship-separate #shipFeeHint,
+#shipModal.ship-separate .ship-rule { display: none; }
+/* 回款模式（批量结算弹窗复用）：名单只读、邮费不在这里改 */
+#batchModal.pay-mode .batch-fee-fld,
+#batchModal.pay-mode .full-only,
+#batchModal.pay-mode #batchNote,
+#batchModal.pay-mode #batchDateHint { display: none !important; }
+#formIncomeHint, #formBatchHint { margin-bottom: 10px; }
+#batchModal.pay-mode .row2 { grid-template-columns: 1fr; }
+.batch-summary b.pos { color: var(--accent); }
+.batch-summary b.neg { color: var(--neg); }
+.app-version b { color: var(--accent); }
+.batch-pay-warn { font-size: 12px; line-height: 1.55; color: var(--neg); background: var(--neg-soft); border-radius: 10px; padding: 8px 10px; margin: 0 0 10px; }
+/* v41：在途单的标签写阶段（待寄 / 待回款）；待寄用暖一点的提示色，和「待回款」区分 */
+.status-tag.st-toship { background: #fdf3e2; color: #9a6a1c; }

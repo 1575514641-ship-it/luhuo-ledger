@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=40">
+  <link rel="stylesheet" href="./styles.css?v=41">
 </head>
 <body>
   <header class="topbar">
@@ -35,7 +35,9 @@
         <button id="noticeExportBtn" type="button" class="btn ghost">导出当前账本</button>
       </div>
     </div>
-    <!-- 看板 -->
+    <!-- v41：看板与报表合成底部的「统计」一页。#view-dash 只剩总览（英雄卡 + 四格 KPI），
+         它与 #view-report 一起显示（switchView("report") 同时点亮两段；"dash" 是 "report" 的别名）。
+         原看板的「订单状态」「近 6 个月」两张卡与报表走势重复，收进报表页底部的折叠块 #dashMore。 -->
     <section id="view-dash" class="view">
       <div class="hero card">
         <span class="hero-label">垫付在外未回笼</span>
@@ -63,35 +65,52 @@
         </div>
       </div>
 
-      <div class="card">
-        <h2>订单状态 <small>垫付占比</small></h2>
-        <div class="status-wrap">
-          <div id="statusDonut"></div>
-          <div id="statusList" class="status-rows"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>近 6 个月 <span class="legend" id="dashFlowLegend"></span></h2>
-        <div id="dashFlow"></div>
-        <div id="monthList"></div>
-        <p class="foot-note">最右一列＝本月回款－本月垫付；正数表示收回的更多。未扣邮费，不等于利润。</p>
-      </div>
     </section>
 
     <!-- 账本 -->
     <section id="view-list" class="view">
-      <div class="chips-row">
-        <div id="filterChips" class="chips"></div>
-        <!-- v28：两个按钮包在一个盒子里，窄屏上整盒下移（不拆成两个按钮各占一行） -->
+      <!-- v41：账本页顶部一行摘要——垫付在外 + 查账（🔍）+ ⋯ 菜单。
+           原「查账 / 批量结算 / 报单」三个按钮：查账换成图标（同一个 #lookupBtn）；批量结算与按页签报单
+           收进 ⋯ 菜单（同一个 #batchBtn / #baodanBtn，行为一字未改）——日常的寄出与回款走页签里的勾选操作条。 -->
+      <div class="ledger-sum">
+        <div class="ls-main">
+          <span class="ls-label">垫付在外</span>
+          <b id="lsOutstanding" class="ls-value">¥0</b>
+          <span id="lsCounts" class="ls-counts"></span>
+        </div>
         <div class="list-acts">
           <!-- 01 期：查账（搜索 + 年月日定位）。它是**只读查找视图**，与账本页筛选/写入范围无关 -->
-          <button id="lookupBtn" type="button" class="batch-btn">查账</button>
-          <button id="batchBtn" type="button" class="batch-btn">批量结算</button>
-          <button id="baodanBtn" type="button" class="batch-btn">报单</button>
+          <button id="lookupBtn" type="button" class="icon-btn ls-btn" aria-label="查账" title="查账（搜索 / 按日期找）">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
+          <button id="listMoreBtn" type="button" class="icon-btn ls-btn" aria-label="更多操作" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+          </button>
+          <div id="listMoreMenu" class="pop-menu" hidden>
+            <button id="baodanBtn" type="button" class="pm-item">按当前页签报单</button>
+            <button id="batchBtn" type="button" class="pm-item">高级：批量结算</button>
+          </div>
         </div>
       </div>
+      <!-- v41：两条按需出现的细提示——核对清单有要动手的项 / 升级后有老单还没标记寄出 -->
+      <button id="checkHint" type="button" class="list-hint" hidden></button>
+      <div id="upgradeHint" class="list-hint upgrade" hidden>
+        <p id="upgradeHintText"></p>
+        <div class="uh-acts">
+          <button id="upgradeHintGo" type="button" class="btn ghost">去勾选</button>
+          <button id="upgradeHintDone" type="button" class="btn ghost">知道了</button>
+        </div>
+      </div>
+      <div class="chips-row">
+        <div id="filterChips" class="chips"></div>
+      </div>
       <div id="orderList"></div>
+      <!-- v41：勾选操作条（待寄 → 寄出；待回款 → 回款）。只活在内存里，切页签/重渲染时按现存单收敛 -->
+      <div id="selBar" class="sel-bar" hidden>
+        <div class="sb-info"><b id="selCount">已选 0</b><span id="selSub"></span></div>
+        <button id="selClear" type="button" class="btn ghost">取消</button>
+        <button id="selGo" type="button" class="btn primary">寄出</button>
+      </div>
     </section>
 
     <!-- 报表 -->
@@ -125,31 +144,42 @@
       <div class="card">
         <h2>盈利商品占比 <small>按回款日期</small></h2>
         <div id="chartDonut"></div>
-        <p class="foot-note">仅展示本期回款中合计利润为正的商品，未扣除亏损商品；盈利合计不等于净盈亏。</p>
+        <details class="info-note"><summary aria-label="口径说明">ⓘ 口径</summary><p class="foot-note">仅展示本期回款中合计利润为正的商品，未扣除亏损商品；盈利合计不等于净盈亏。</p></details>
       </div>
       <div class="card">
         <h2>商品榜 <small>本期回款 · 利润 Top 5</small></h2>
         <div id="reportProducts"></div>
-        <p class="foot-note">按回款日期归期，利润已扣垫付和邮费；单数是本期有回款记录的单数，零元回款也计入。</p>
+        <details class="info-note"><summary aria-label="口径说明">ⓘ 口径</summary><p class="foot-note">按回款日期归期，利润已扣垫付和邮费；单数是本期有回款记录的单数，零元回款也计入。</p></details>
       </div>
-      <p class="foot-note center">口径：单数和垫付按下单日期；回款、利润和商品榜按回款日期；邮费成批按批次日期、单寄按下单日期。</p>
+      <details id="dashMore" class="card fold-card">
+        <summary>订单状态 · 近 6 个月</summary>
+        <div class="fold-body">
+          <h2>订单状态 <small>垫付占比</small></h2>
+          <div class="status-wrap">
+            <div id="statusDonut"></div>
+            <div id="statusList" class="status-rows"></div>
+          </div>
+          <h2>近 6 个月 <span class="legend" id="dashFlowLegend"></span></h2>
+          <div id="dashFlow"></div>
+          <div id="monthList"></div>
+          <p class="foot-note">最右一列＝本月回款－本月垫付；正数表示收回的更多。未扣邮费，不等于利润。</p>
+        </div>
+      </details>
+      <details class="info-note center"><summary aria-label="统计口径">ⓘ 统计口径</summary><p class="foot-note center">口径：单数和垫付按下单日期；回款、利润和商品榜按回款日期；邮费成批按批次日期、单寄按下单日期。</p></details>
     </section>
   </main>
 
   <button id="fab" aria-label="记一单"><span class="fab-plus">＋</span>记一单</button>
 
+  <!-- v41：底部只剩「账本 / 统计」两个页签（看板并进统计页顶部，见 #view-dash 的说明） -->
   <nav class="tabbar">
-    <button data-view="dash">
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
-      看板
-    </button>
     <button data-view="list">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
       账本
     </button>
     <button data-view="report">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
-      报表
+      统计
     </button>
   </nav>
 
@@ -162,9 +192,11 @@
            平时这里只显示暂存状态（已暂存 / 未保存在草稿 / 待核对），不占地方。 -->
       <div id="formDraftBar" class="draft-bar" hidden></div>
       <!-- v25：类型切换（只改表单形态，不落库、不是类型字段）。编辑既有记录时整条隐藏 -->
-      <div id="formKind" class="segment">
-        <button type="button" class="seg on" data-kind="order">货单</button>
-        <button type="button" class="seg" data-kind="income">收入</button>
+      <!-- v41：切换条改成标题右侧的一个小链接（只显示「另一种」：货单时显示「记一笔收入」、收入时显示「← 记货单」）。
+           控件与 data-kind 不变，applyKindUi / setFormKind 的逻辑一字未动，只是样式（.kind-link）。 -->
+      <div id="formKind" class="segment kind-link">
+        <button type="button" class="seg on" data-kind="order">← 记货单</button>
+        <button type="button" class="seg" data-kind="income">记一笔收入</button>
       </div>
       <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
       <!-- 03 期：近期商品名建议。**临时从已有订单派生**（不建模板库、不加账本字段、不合并同名单）；
@@ -174,9 +206,8 @@
       <div class="row2" id="formCostRow">
         <!-- 收入模式下这一格就是「金额」（回款金额），label 文案由 applyKindUi 换 -->
         <label class="fld"><span id="formCostLabel">垫付金额</span><input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
-        <!-- v24：小「清空」＝把邮费置空（留空按 0 算，老口径）。按钮必须排在 input **之后**：
-             <label> 的关联控件是它第一个可关联后代，而 button 也是可关联元素 -->
-        <label class="fld kind-order">邮费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"><button type="button" class="fld-clear" data-clear="fee">清空</button></label>
+        <!-- v41：数量挪到垫付旁边，带 −/＋ 步进（按钮排在 input 之后，保住 label 与 input 的关联） -->
+        <label class="fld kind-order fld-qty">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"><span class="stepper"><button type="button" data-step="-1" aria-label="数量减一">−</button><button type="button" data-step="1" aria-label="数量加一">＋</button></span></label>
       </div>
       <!-- v24：批内单的「邮费该在哪改」提示（一起寄的一批只有一笔邮费，统一改在批次上）。
            文案与显隐由 openForm 逐次决定；未成批的单不显示 -->
@@ -185,28 +216,40 @@
            编辑表单里没有回款栏，用户想改金额最容易错填到「垫付金额」；改金额的入口是卡片上的「改回款」）。
            文案与显隐由 openForm 逐次决定 -->
       <p id="formIncomeHint" class="foot-note" hidden></p>
-      <div class="row2">
-        <label class="fld">日期<input name="date" type="date" required></label>
-        <label class="fld kind-order">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"></label>
+      <!-- v41：新建时日期默认今天，只显示一行小字（#formDateToggle），点了才展开日期框；编辑时日期框照常显示 -->
+      <button type="button" id="formDateToggle" class="date-toggle" hidden></button>
+      <div class="row2 date-row">
+        <label class="fld fld-date">日期<input name="date" type="date" required></label>
+        <!-- v41：邮费与快递单号**不在记单/编辑表单里改**——全站只有「寄出」面板这一个入口（见 #shipModal）。
+             两格仍留在表单里（.ship-fld 隐藏）：编辑保存时按原值回写，草稿/再来一单的既有字段口径不变。
+             v24：小「清空」＝把邮费置空（留空按 0 算，老口径）。按钮必须排在 input **之后**：
+             <label> 的关联控件是它第一个可关联后代，而 button 也是可关联元素 -->
+        <label class="fld kind-order ship-fld">邮费<input name="fee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"><button type="button" class="fld-clear" data-clear="fee">清空</button></label>
       </div>
       <!-- v33：渠道那一格（#formChannelField）是**同一个控件**，按形态搬家：货单住下面的「更多」里、
            收入模式由 applyKindUi 搬回这个空位（收入单的渠道仍默认可见）。全表单始终只有一个 name="channel" -->
       <div id="formChannelHome"></div>
       <!-- v33：快递单号从「更多」挪到这里——它才是常填的那一格（默认可见，整行输入）；
            收入模式下整格隐藏（.kind-order），保存时写空串（见 submitForm） -->
-      <label class="fld kind-order">快递单号（可空）<input name="tracking" maxlength="40" autocomplete="off" placeholder="SF1234567890"></label>
+      <label class="fld kind-order ship-fld">快递单号（可空）<input name="tracking" maxlength="40" autocomplete="off" placeholder="SF1234567890"></label>
+      <!-- v41：编辑时只读写出这一单的寄出信息 + 「改寄出信息」链接（打开 #shipModal）；新建不显示 -->
+      <div id="formShipInfo" class="ship-info kind-order" hidden>
+        <span id="formShipInfoText"></span>
+        <button type="button" id="formShipInfoBtn" class="link-btn">改寄出信息 ›</button>
+      </div>
       <details class="more kind-order" id="formMore">
         <summary id="formMoreSummary">更多（渠道：收货商）</summary>
         <div class="more-body">
           <label class="fld" id="formChannelField"><span id="formChannelLabel">出掉渠道</span><select name="channel"></select></label>
-          <label class="fld">状态<select name="status"></select></label>
+          <!-- v41：新建一律在途，状态只在编辑时出现 -->
+          <label class="fld fld-status">状态<select name="status"></select></label>
         </div>
       </details>
       <label class="fld">备注<input name="note" maxlength="300" placeholder="想记点什么（可空）"></label>
       <!-- 03 期：连续录入。「保存并继续」只在**新建货单**时渲染（编辑/收入单都不给，见 applyChainUi）；
            「保留本次渠道」默认不勾，只有用户显式勾上、并在本次连续录入里手选过渠道，下一单才暂时沿用，
            普通保存 / 关窗 / 取消都结束本次连续录入，重新打开表单不记住这个选择。 -->
-      <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">保留本次渠道（只影响这次连着记的下一单）</label>
+      <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">下一单沿用这个渠道</label>
       <div class="sheet-actions">
         <button type="button" id="formCancel" class="btn ghost">取消</button>
         <button type="submit" class="btn primary">保存</button>
@@ -243,10 +286,12 @@
     <div class="sheet">
       <h2>批量结算</h2>
       <p class="batch-sub">勾选本次一起寄出的在途单，邮费和回款按垫付占比分摊</p>
+      <!-- v41：回款模式下，这一批里若有人已经单独回过款，提前说清「会一起重新分摊」 -->
+      <p id="batchPayWarn" class="batch-pay-warn" hidden></p>
       <div id="batchList" class="batch-list"></div>
       <div class="row2">
-        <label class="fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
-        <label class="fld">对方总回款 <small>留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
+        <label class="fld batch-fee-fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
+        <label class="fld">对方总回款 <small class="full-only">留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
       </div>
       <!-- 这一批现在记着多少钱 + 这三条规矩（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉）。
            v24 起没有「覆盖 / 追加」的选择，由 app.js 决定显不显示这一行 -->
@@ -273,23 +318,27 @@
     <div class="sheet">
       <h2>报单 <small id="baodanScopeLabel">-</small></h2>
       <p class="batch-sub">点「报单」时已经复制好了，直接去微信粘贴；要改动就先改下面的内容再点一次复制</p>
-      <div class="bd-toolbar">
-        <button type="button" id="baodanAll" class="batch-btn">全选</button>
-        <span id="baodanPickInfo" class="bd-info">已选 0/0 单</span>
-      </div>
-      <div id="baodanList" class="batch-list"></div>
-      <div id="baodanMerge"></div>
-      <div id="baodanSummary" class="batch-summary">还没勾选订单</div>
-      <!-- v31：快递单号——写进报单文本第 2 行「快递单号 X」（这一格为空时那一行整行不渲染）。
-           打开面板时按**范围里最常见的非空单号**预填，但那只是预填：**只有用户自己改了这一格**才写账本
-           （改完立刻重算文本并**重新复制**剪贴板，见 app.js 的 commitBaodanTracking）。
-           「清空」小按钮沿用现有 .fld-clear，走的也是同一条路 -->
-      <label class="fld">快递单号<input id="baodanTracking" maxlength="40" autocomplete="off" placeholder="可空；改了它＝记到这次报的单上"><button type="button" class="fld-clear" id="baodanTrackingClear" data-clear="tracking">清空</button></label>
-      <div id="baodanTrackingHint" class="bd-merge"></div>
-      <p class="foot-note">改这一格＝把这次报的这几单（上面勾选的）都改成它，并立刻更新剪贴板；不改它、光点「复制报单」不会动账本。</p>
+      <!-- v41：报单面板以「文本 + 复制」为主；勾选哪些单与单号这两项调整收进折叠块（控件与逻辑一字未改） -->
       <!-- 复制出去的就是这个框里现在的文字：想改格式（称呼/单号/数量写法）直接在这里改 -->
       <textarea id="baodanText" rows="7" spellcheck="false" placeholder="勾选订单后这里会出现报单内容"></textarea>
-      <p class="foot-note">格式：首行「日期 待结」，填了单号就多一行「快递单号 X」，再一行一件、行尾带数量 ×N；件数按每条单的数量相加（不是条数）。动勾选或改单号会重算，自己手改的内容请先复制走。</p>
+      <div id="baodanSummary" class="batch-summary">还没勾选订单</div>
+      <details id="baodanAdjust" class="members-fold">
+        <summary>调整：报哪几单 · 快递单号</summary>
+        <div class="bd-toolbar">
+          <button type="button" id="baodanAll" class="batch-btn">全选</button>
+          <span id="baodanPickInfo" class="bd-info">已选 0/0 单</span>
+        </div>
+        <div id="baodanList" class="batch-list"></div>
+        <div id="baodanMerge"></div>
+        <!-- v31：快递单号——写进报单文本第 2 行「快递单号 X」（这一格为空时那一行整行不渲染）。
+             打开面板时按**范围里最常见的非空单号**预填，但那只是预填：**只有用户自己改了这一格**才写账本
+             （改完立刻重算文本并**重新复制**剪贴板，见 app.js 的 commitBaodanTracking）。
+             「清空」小按钮沿用现有 .fld-clear，走的也是同一条路 -->
+        <label class="fld">快递单号<input id="baodanTracking" maxlength="40" autocomplete="off" placeholder="可空；改了它＝记到这次报的单上"><button type="button" class="fld-clear" id="baodanTrackingClear" data-clear="tracking">清空</button></label>
+        <div id="baodanTrackingHint" class="bd-merge"></div>
+        <p class="foot-note">改这一格＝把这次报的这几单（上面勾选的）都改成它，并立刻更新剪贴板；不改它、光点「复制报单」不会动账本。</p>
+      </details>
+      <details class="info-note"><summary>ⓘ 格式</summary><p class="foot-note">格式：首行「日期 待结」，填了单号就多一行「快递单号 X」，再一行一件、行尾带数量 ×N；件数按每条单的数量相加（不是条数）。动勾选或改单号会重算，自己手改的内容请先复制走。</p></details>
       <div class="sheet-actions">
         <button type="button" id="baodanClose" class="btn ghost">关闭</button>
         <button type="button" id="baodanCopy" class="btn primary">复制报单</button>
@@ -342,16 +391,22 @@
        一次点保存＝一个候选账本、一次业务提交：单号与邮费同生共死，不串接两个各自落盘的旧回调。 -->
   <div id="shipModal" class="modal">
     <div class="sheet">
-      <h2 id="shipTitle">补寄出信息 <small id="shipScopeLabel">-</small></h2>
+      <h2 id="shipTitle"><span id="shipTitleText">寄出信息</span> <small id="shipScopeLabel">-</small></h2>
       <p class="batch-sub" id="shipScopeNote"></p>
       <!-- 2026-09-27 补强 D：单号/邮费两个输入框挪到**成员名单之前**——大批次不必先滚过整份名单
            才能录入；成员名单收进可折叠的 #shipMembersBox（摘要恒显示范围与单数，折叠不改范围），
            app.js 的 openShipForm 会写 #shipMembersLabel 并按名单长度决定默认展开与否 -->
-      <label class="fld">快递单号<input id="shipTracking" maxlength="40" autocomplete="off" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipTrackingClear">清空</button></label>
+      <!-- v41：「寄出」新模式（从待寄勾选/卡片进来）才显示：几单时选一起寄还是各自寄 + 寄出日期 -->
+      <div id="shipTogetherRow" class="segment ship-together" hidden>
+        <button type="button" class="seg on" data-together="1">一起寄（一个单号）</button>
+        <button type="button" class="seg" data-together="0">各自寄 / 只标记已寄</button>
+      </div>
+      <label class="fld" id="shipDateRow" hidden>寄出日期<input id="shipDate" type="date"></label>
+      <label class="fld ship-tk-row">快递单号<input id="shipTracking" maxlength="40" autocomplete="off" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipTrackingClear">清空</button></label>
       <p class="foot-note" id="shipTrackingHint"></p>
-      <label class="fld">邮费<input id="shipFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipFeeClear">清空</button></label>
+      <label class="fld ship-fee-row">邮费<input id="shipFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipFeeClear">清空</button></label>
       <p class="foot-note" id="shipFeeHint"></p>
-      <p class="foot-note">填数字＝改成这个数、留空＝不动、填 0＝明确改成 0（邮费＝0 常见于包邮，按「清空」小按钮也是置 0）。回款金额、状态与到账日期这一趟一个字都不碰。</p>
+      <details class="info-note ship-rule"><summary>ⓘ 填写规则</summary><p class="foot-note">填数字＝改成这个数、留空＝不动、填 0＝明确改成 0（邮费＝0 常见于包邮，按「清空」小按钮也是置 0）。回款金额、状态与到账日期这一趟一个字都不碰。</p></details>
       <details id="shipMembersBox" class="members-fold">
         <summary><span id="shipMembersLabel">成员明细</span></summary>
         <div id="shipMembers" class="batch-list"></div>
@@ -369,6 +424,7 @@
   <div id="settingsModal" class="modal">
     <div class="sheet">
       <h2>设置</h2>
+      <p class="set-line app-version">版本 <b id="appVersion">v41</b>（升级后两台设备都要刷新，看到这个版本号才算更新成功）</p>
       <div class="set-block">
         <h3>云同步</h3>
         <p class="set-line">接口：<span id="syncEndpoint">-</span></p>
@@ -407,7 +463,7 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=40"></script>
-  <script src="./app.js?v=40"></script>
+  <script src="./sync.js?v=41"></script>
+  <script src="./app.js?v=41"></script>
 </body>
 </html>
