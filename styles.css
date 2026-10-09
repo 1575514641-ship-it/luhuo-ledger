@@ -2,28 +2,33 @@
    设计参考：Revolut/Wise 的 balance-card 锚点 + 克制三色 + 发丝线描边 */
 :root {
   color-scheme: light;
-  --bg: #f0f7f6;
+  /* v41 · 青瓷·精修：保留青绿主调，去渐变光晕；赚红亏绿（--gain / --loss 专管盈亏，--neg 只管告警） */
+  --bg: #f3f6f5;
   --card: #ffffff;
-  --ink: #14201e;
-  --muted: #7d938e;
-  --line: #ddeae7;
-  --primary: #0e1f1c;
-  --accent: #0d9488;
-  --accent-2: #14b8a6;
-  --accent-soft: #dcf1ee;
+  --ink: #152321;
+  --muted: #7a8c88;
+  --line: #e2eae8;
+  --primary: #123b36;
+  --accent: #0f857a;
+  --accent-2: #14a596;
+  --accent-soft: #e1f1ee;
   --warn: #64748b;
   --warn-soft: rgba(125, 143, 161, .14);
-  --neg: #a4442f;
-  --neg-soft: #f7e9e4;
-  --glass: rgba(250, 253, 252, .92);
-  --hero-bg: linear-gradient(140deg, #dcf3ed, #c2e9e0);
-  --hero-ink: #11433c;
-  --hero-value: #0b7c72;
-  --hero-label: rgba(17, 67, 60, .62);
-  --hero-line: rgba(13, 148, 136, .32);
-  --radius: 18px;
-  --shadow: 0 1px 2px rgba(15, 40, 36, .04), 0 14px 34px -22px rgba(15, 40, 36, .3);
-  --teal-line: rgba(20, 148, 136, .4);
+  --neg: #a94a33;
+  --neg-soft: #f8ebe6;
+  --gain: #d23f31;
+  --gain-soft: #fbe9e6;
+  --loss: #2e8b4e;
+  --loss-soft: #e5f3e9;
+  --glass: rgba(250, 253, 252, .94);
+  --hero-bg: #e7f3f0;
+  --hero-ink: #103b35;
+  --hero-value: #0b6f65;
+  --hero-label: rgba(16, 59, 53, .6);
+  --hero-line: #cfe5df;
+  --radius: 14px;
+  --shadow: 0 1px 2px rgba(15, 40, 36, .04), 0 10px 26px -20px rgba(15, 40, 36, .28);
+  --teal-line: rgba(15, 133, 122, .35);
 }
 
 
@@ -37,7 +42,6 @@ html {
 body {
   overflow-x: clip;
   background:
-    radial-gradient(1100px 280px at 50% -100px, rgba(20, 184, 166, .1), transparent 70%),
     var(--bg);
   color: var(--ink);
   font: 15px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
@@ -57,8 +61,7 @@ body {
 .brand { display: flex; align-items: center; gap: 9px; }
 .brand-dot {
   width: 9px; height: 9px; border-radius: 3px;
-  background: linear-gradient(135deg, #5eead4, #0d9488);
-  box-shadow: 0 0 10px rgba(45, 212, 191, .45);
+  background: var(--accent);
 }
 .brand h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: 2px; }
 .icon-btn {
@@ -108,12 +111,11 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   position: relative; overflow: hidden;
   background: var(--hero-bg);
   border: 1px solid var(--hero-line);
-  border-radius: 20px;
-  color: var(--hero-ink); padding: 19px 17px 17px; margin-bottom: 12px;
-  display: flex; flex-direction: column; gap: 2px;
-  box-shadow: 0 16px 36px -18px rgba(5, 20, 17, .65);
+  border-radius: 16px;
+  color: var(--hero-ink); padding: 14px 16px; margin-bottom: 9px;
+  display: flex; flex-direction: column; gap: 1px;
 }
-.hero::after {
+.hero::after { display: none;
   content: ""; position: absolute; right: -34px; top: -44px;
   width: 150px; height: 150px; border-radius: 50%;
   background: radial-gradient(circle, rgba(20, 184, 166, .14), transparent 70%);
@@ -136,8 +138,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .kpi-value { font-size: 20px; font-weight: 700; letter-spacing: .3px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .kpi-value.small { font-size: 15px; padding-top: 4px; }
 .kpi-hint { font-size: 11px; color: var(--muted); }
-.kpi-value.pos { color: var(--accent); }
-.kpi-value.neg { color: var(--neg); }
+.kpi-value.pos { color: var(--gain); }
+.kpi-value.neg { color: var(--loss); }
 
 /* ---- 行 ---- */
 .status-row, .month-row, .prod-row {
@@ -166,8 +168,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
    10.8px）。min-width:0 允许压缩；overflow-wrap:anywhere 同时把 min-content 压到一个字宽
    （break-word 不会），于是极长金额在格内折行、四位五位数这类正常金额一行放得下、排版不变。 */
 .month-cell { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
-.month-cell.pos { color: var(--accent); font-weight: 600; }
-.month-cell.neg { color: var(--neg); font-weight: 600; }
+.month-cell.pos { color: var(--gain); font-weight: 600; }
+.month-cell.neg { color: var(--loss); font-weight: 600; }
 /* v38：看板「近 6 个月」最右一列原来**没有列名**（只有卡片脚注在讲它是什么，而脚注在卡片底部）。
    补一个短标识「差」，走更小字号 + 弱色、紧贴数字。字号 10px 是刻意的：这一列在三档窄屏上已经被
    ¥100,001,999.99 这类极端金额顶到过边（v33 修过一次裁切），标识不能把那一列的可用宽度再吃掉一截。 */
@@ -189,8 +191,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .chip b { font-weight: 600; color: var(--muted); margin-left: 2px; }
 .chip.on {
-  background: #0e1f1c; border-color: #0e1f1c; color: #e6f2f0;
-  box-shadow: 0 4px 12px -4px rgba(14, 31, 28, .5);
+  background: var(--primary); border-color: var(--primary); color: #e6f2f0;
+  box-shadow: 0 3px 10px -5px rgba(14, 31, 28, .5);
 }
 .chip.on b { color: var(--accent-2); }
 
@@ -249,8 +251,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   color: var(--ink);
   overflow-wrap: anywhere;
 }
-.order-profit b.pos { color: var(--accent); }
-.order-profit b.neg { color: var(--neg); }
+.order-profit b.pos { color: var(--gain); }
+.order-profit b.neg { color: var(--loss); }
 /* v35：可点的利润数字 —— 按钮抹平成与纯文本一模一样（照 .bh-top 的手法），
    只留 pointer 表示「点一下能改」。点击区跟着 b 的行高走，不额外撑高卡片 */
 .order-profit.editable .profit-edit {
@@ -283,14 +285,14 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .order-money span { min-width: 0; font-variant-numeric: tabular-nums; }
 .order-money span:nth-child(even) { text-align: right; }
 .order-money b { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
-.order-money b.pos { color: var(--accent); }
-.order-money b.neg { color: var(--neg); }
+.order-money b.pos { color: var(--gain); }
+.order-money b.neg { color: var(--loss); }
 .order-note { font-size: 12px; color: var(--muted); margin-top: 7px; }
 
 /* 批次：一起寄出的一组单子，表头走整批口径，成员卡片左侧青瓷竖条 */
 .batch-head {
-  background: linear-gradient(135deg, #eefaf7, #dff3ee);
-  border: 1px solid var(--teal-line);
+  background: #ecf6f3;
+  border: 1px solid var(--hero-line);
   border-radius: 14px 14px 10px 10px;
   padding: 9px 14px 10px; margin-bottom: 7px;
 }
@@ -319,8 +321,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
   color: var(--hero-value);
 }
-.bh-profit.pos { color: var(--accent); }
-.bh-profit.neg { color: var(--neg); }
+.bh-profit.pos { color: var(--gain); }
+.bh-profit.neg { color: var(--loss); }
 .bh-profit.pending { color: var(--muted); font-weight: 600; }
 .bh-count { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: var(--hero-value); font-variant-numeric: tabular-nums; }
 /* 箭头只有 ▾ 一个字符：收起态靠 CSS 转 -90° 变成 ▸。切态只改类，不再重渲染 DOM */
@@ -385,8 +387,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 #fab {
   position: fixed; right: 16px; bottom: calc(86px + env(safe-area-inset-bottom)); z-index: 30;
   border: 0; border-radius: 99px;
-  background: linear-gradient(135deg, #5eead4, #0d9488);
-  color: #0a1a17;
+  background: var(--accent);
+  color: #fff;
   font-size: 15px; font-weight: 700; padding: 13px 19px;
   box-shadow: 0 10px 24px -6px rgba(13, 148, 136, .55); cursor: pointer;
   display: flex; align-items: center; gap: 6px;
@@ -513,9 +515,9 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .btn:active { transform: scale(.98); }
 .btn.primary {
-  background: linear-gradient(135deg, #5eead4, #0d9488); border-color: transparent;
-  color: #0a1a17; font-weight: 700;
-  box-shadow: 0 6px 16px -5px rgba(13, 148, 136, .5);
+  background: var(--accent); border-color: transparent;
+  color: #fff; font-weight: 700;
+  box-shadow: 0 4px 12px -6px rgba(15, 133, 122, .55);
 }
 .btn.ghost { background: var(--bg); }
 .btn.danger { color: var(--neg); border-color: var(--neg-soft); background: var(--neg-soft); }
@@ -533,8 +535,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
   padding: 9px 12px; margin: 2px 0 4px; color: var(--muted);
 }
 .profit-preview b { font-size: 16px; font-variant-numeric: tabular-nums; }
-.profit-preview b.pos { color: var(--accent); }
-.profit-preview b.neg { color: var(--neg); }
+.profit-preview b.pos { color: var(--gain); }
+.profit-preview b.neg { color: var(--loss); }
 
 /* ---- 批量结算 ---- */
 .chips-row { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
@@ -652,8 +654,8 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .summary p { margin: 4px 0; font-size: 14px; line-height: 1.7; }
 .summary p:first-child { margin-top: 0; }
 .summary b { font-variant-numeric: tabular-nums; }
-.summary b.pos { color: var(--accent); }
-.summary b.neg { color: var(--neg); }
+.summary b.pos { color: var(--gain); }
+.summary b.neg { color: var(--loss); }
 
 .legend { font-weight: 400; font-size: 11px; }
 .lg-dot {
@@ -726,16 +728,16 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 }
 .prod-nums { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .prod-nums b { font-size: 13px; margin-left: 4px; }
-.prod-nums b.pos { color: var(--accent); }
-.prod-nums b.neg { color: var(--neg); }
+.prod-nums b.pos { color: var(--gain); }
+.prod-nums b.neg { color: var(--loss); }
 .prod-row:first-child { border-top: 0; }
 .prod-bar-track {
   height: 6px; background: var(--bg); border-radius: 99px; overflow: hidden;
   margin-top: 6px; display: block;
 }
 .prod-bar { display: block; height: 100%; border-radius: 99px; min-width: 3px; }
-.prod-bar.pos { background: linear-gradient(90deg, #5eead4, #0d9488); }
-.prod-bar.neg { background: linear-gradient(90deg, #e0917a, #bb5a3f); }
+.prod-bar.pos { background: var(--gain); opacity: .85; }
+.prod-bar.neg { background: var(--loss); opacity: .85; }
 .empty-mini { color: var(--muted); font-size: 13px; padding: 6px 0; text-align: center; }
 
 /* ---- toast ---- */
@@ -1034,9 +1036,189 @@ body.has-sel main { padding-bottom: 80px; }
 #batchModal.pay-mode #batchDateHint { display: none !important; }
 #formIncomeHint, #formBatchHint { margin-bottom: 10px; }
 #batchModal.pay-mode .row2 { grid-template-columns: 1fr; }
-.batch-summary b.pos { color: var(--accent); }
-.batch-summary b.neg { color: var(--neg); }
+.batch-summary b.pos { color: var(--gain); }
+.batch-summary b.neg { color: var(--loss); }
 .app-version b { color: var(--accent); }
 .batch-pay-warn { font-size: 12px; line-height: 1.55; color: var(--neg); background: var(--neg-soft); border-radius: 10px; padding: 8px 10px; margin: 0 0 10px; }
 /* v41：在途单的标签写阶段（待寄 / 待回款）；待寄用暖一点的提示色，和「待回款」区分 */
 .status-tag.st-toship { background: #fdf3e2; color: #9a6a1c; }
+
+/* ================= v41：版面收紧一档（字号与留白；点按区仍 ≥44px） ================= */
+body { font-size: 14px; }
+main { padding: 10px 12px 18px; }
+.card { padding: 12px 13px 11px; margin-bottom: 9px; }
+.order-card { padding: 10px 12px; margin-bottom: 8px; }
+.order-name { font-size: 14px; }
+.order-mid { font-size: 11.5px; margin: 2px 0 6px; }
+.order-money { font-size: 12.5px; padding: 6px 10px; gap: 3px 10px; }
+.order-actions { margin-top: 7px; gap: 6px; }
+.act { padding: 4px 12px; border-radius: 8px; }
+.ledger-sum { padding: 7px 10px 7px 12px; margin-bottom: 8px; border-radius: 14px; }
+.ls-value { font-size: 18px; }
+.chips { padding-bottom: 8px; gap: 5px; }
+.chip { padding: 5px 10px; font-size: 12.5px; }
+.hero-value { font-size: 28px; }
+.kpi-value { font-size: 17px; }
+.kpi-grid { gap: 8px; margin-bottom: 9px; }
+.batch-head { padding: 7px 12px 8px; }
+.topbar { padding: calc(8px + env(safe-area-inset-top)) 14px 9px; }
+.brand h1 { font-size: 16px; }
+.sheet h2 { font-size: 16px; margin-bottom: 12px; }
+
+/* v41：每月利润 */
+.mp-summary { font-size: 12px; color: var(--muted); margin: -4px 0 6px; font-variant-numeric: tabular-nums; }
+.mp-summary b { color: var(--ink); }
+.mp-summary b.pos { color: var(--gain); }
+.mp-summary b.neg { color: var(--loss); }
+.mp-chart svg { display: block; overflow: visible; }
+.mp-bar { cursor: pointer; }
+.mp-bar:focus { outline: none; }
+.mp-bar:focus rect:nth-child(2) { stroke: var(--ink); stroke-width: 1; }
+.mp-lab { font-size: 9.5px; fill: var(--muted); }
+.mp-bar.on .mp-lab { fill: var(--ink); font-weight: 700; }
+.mp-val { font-size: 9.5px; font-weight: 700; fill: var(--ink); }
+.mp-zero { stroke: var(--line); stroke-width: 1; }
+/* v41：更多统计折叠块 */
+.rep-more { margin-bottom: 9px; }
+.rep-more > summary {
+  list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 6px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 13px; min-height: 44px; font-weight: 600; font-size: 14px; margin-bottom: 9px;
+}
+.rep-more > summary::-webkit-details-marker { display: none; }
+.rep-more > summary small { font-weight: 400; font-size: 11px; color: var(--muted); }
+.rep-more > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .15s; }
+.rep-more[open] > summary::after { transform: rotate(180deg); }
+/* v42：卡片上的回报率（利润 ÷ 垫付） */
+.order-roi { display: block; font-style: normal; font-size: 10.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ================= v42：卡片重排（紧凑、一眼看全） =================
+   第 1 行：商品名 ……… 利润（大字）
+   第 2 行：阶段标签 + 日期 · 件数 · 渠道 · 单号 ……… 利润小字（利润 · 回报率）
+   第 3 行：垫付 · 回款 · 邮费 ……… 主按钮 + ⋯
+   点卡片空白处或 ⋯ 展开其余动作。 */
+.order-card { padding: 10px 12px 9px; }
+.order-top { align-items: baseline; }
+.order-side { max-width: 50%; }
+.order-profit { display: grid; grid-template-columns: auto auto; justify-content: end; column-gap: 4px; row-gap: 0; align-items: baseline; }
+.order-profit b, .order-profit .profit-edit { grid-column: 1 / -1; font-size: 15px; line-height: 1.2; }
+.order-profit > span { display: inline; font-size: 10.5px; color: var(--muted); }
+.order-profit .order-roi { display: inline; font-size: 10.5px; color: var(--muted); font-style: normal; font-variant-numeric: tabular-nums; }
+.order-profit .order-roi::before { content: "· "; }
+.order-mid { display: flex; align-items: center; flex-wrap: wrap; gap: 0 6px; margin: 3px 0 6px; }
+.order-mid .status-tag { font-size: 10.5px; padding: 1px 7px; margin-right: 1px; }
+.order-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: nowrap; min-height: 44px; }
+.order-foot .order-money {
+  display: flex; flex-wrap: wrap; gap: 2px 12px; background: none; padding: 0; border-radius: 0;
+  flex: 1 1 auto; min-width: 0; font-size: 12px;
+}
+.order-foot .order-money span:nth-child(even) { text-align: left; }
+.order-foot .order-money b { font-weight: 600; }
+.order-foot .order-actions { margin-top: 0; flex: 0 0 auto; gap: 6px; }
+.order-actions .act.primary { min-width: 64px; }
+.order-actions .more-toggle {
+  width: 44px; padding: 0; font-size: 18px; letter-spacing: 1px; color: var(--muted);
+  border-color: transparent; background: transparent;
+}
+.order-card.more-open .more-toggle { background: var(--bg); color: var(--ink); }
+.order-card .order-more { margin-top: 8px; padding-top: 8px; }
+.order-card { cursor: default; transition: box-shadow .15s; }
+.order-card:active:not(:has(button:active, input:active, label:active)) { box-shadow: 0 0 0 2px var(--accent-soft); }
+.order-income-pending { font-size: 11px; color: var(--neg); }
+
+/* v42：撤销条——吸底在页签栏上方；出现时「记一单」让位，提示气泡上移避免叠在一起 */
+.undo-bar {
+  /* 层级在弹出面板（50）之下：面板开着时撤销条被遮住，绝不挡面板里的按钮（07.8 抓到过） */
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 40;
+  bottom: calc(78px + env(safe-area-inset-bottom));
+  width: min(532px, calc(100% - 24px));
+  display: flex; align-items: center; gap: 10px;
+  background: var(--primary); color: #e6f2f0; border-radius: 14px; padding: 4px 6px 4px 14px;
+  box-shadow: 0 12px 28px -12px rgba(14, 31, 28, .6); font-size: 13px;
+  animation: undoIn .18s ease;
+}
+.undo-bar span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.undo-bar button {
+  flex: 0 0 auto; min-height: 44px; padding: 0 14px; border: 0; background: none;
+  color: #7fe0d2; font: inherit; font-weight: 700; cursor: pointer;
+}
+@keyframes undoIn { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+body.has-undo #fab { display: none; }
+body.has-undo .toast { bottom: calc(136px + env(safe-area-inset-bottom)); }
+/* v42：同步状态是按钮（点一下立即同步）；外观保持小标签，点按区靠内边距撑大 */
+button.sync-badge { border: 0; font: inherit; font-size: 11px; cursor: pointer; padding: 2px 9px; position: relative; }
+button.sync-badge::after { content: ""; position: absolute; inset: -8px -4px; }
+button.sync-badge:active { opacity: .7; }
+/* v42：面板顶部的小横条，提示可以往下滑关闭 */
+.sheet { position: relative; padding-top: 22px; }
+.sheet::before { content: ""; position: absolute; top: 8px; left: 50%; width: 36px; height: 4px; margin-left: -18px; border-radius: 2px; background: var(--line); }
+/* v42：页签行右侧的「全选」 */
+.chips-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.chips-row .chips { flex: 1 1 auto; min-width: 0; }
+.sel-all { flex: 0 0 auto; border: 0; background: none; color: var(--accent); font: inherit; font-size: 13px; font-weight: 600; min-height: 32px; padding: 0 2px; cursor: pointer; }
+/* v42：寄出（新模式）不需要「填写规则」；回款模式的名单只是展示，不显示勾选框 */
+#shipModal.ship-new .ship-rule { display: none; }
+#batchModal.pay-mode .batch-list input[type="checkbox"] { display: none; }
+#batchModal.pay-mode .batch-item { padding-left: 14px; }
+
+/* ================= v42 收尾：去重复、更轻 ================= */
+/* 统计页：总览只留英雄卡（累计数字并进一行）；四格 KPI 与月报重复，不再显示 */
+#view-dash .kpi-grid { display: none; }
+.hero-totals { font-size: 11.5px; color: var(--hero-label); margin-top: 6px; padding-top: 7px; border-top: 1px solid var(--hero-line); font-variant-numeric: tabular-nums; }
+.hero-totals b { color: var(--hero-ink); font-weight: 700; }
+.hero-totals b.pos { color: var(--gain); }
+.hero-totals b.neg { color: var(--loss); }
+/* 月报：四格数字一行排开；总结句只留「在途 / 比上一期」，第一句与四格重复 */
+#reportKpis { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+#reportKpis .kpi { padding: 9px 8px; }
+#reportKpis .kpi-label { font-size: 11px; }
+#reportKpis .kpi-value { font-size: 14px; }
+#view-report { display: none; }
+#view-report.active { display: flex; flex-direction: column; }
+#view-report > #reportKpis { order: 2; }
+#view-report > #reportSummary { order: 3; }
+#view-report > :not(#reportKpis):not(#reportSummary):not(.rep-head) { order: 4; }
+#reportSummary { background: none; border: 0; box-shadow: none; padding: 0 2px 4px; font-size: 12px; color: var(--muted); }
+#reportSummary p:first-child { display: none; }
+#reportSummary p { margin: 0 0 2px; }
+#reportSummary { border-left: 0; }
+#reportSummary p { font-size: 12px; line-height: 1.6; }
+/* v42：主按钮下面一行：「保存，再记一单 ›」+「沿用渠道」，轻、不抢主按钮 */
+.chain-row { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 6px; }
+.chain-row:has(> :not([hidden])) { min-height: 44px; }
+.chain-row .link-btn { min-height: 44px; font-size: 13px; }
+.chain-row .keep-channel { margin: 0; min-height: 44px; }
+/* v42：设置页分组卡片 */
+#settingsModal .sheet { background: var(--bg); }
+#settingsModal h2 .app-version { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.set-card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 13px; margin-bottom: 10px; }
+.set-card h3, .set-card > summary { margin: 0 0 8px; font-size: 13px; font-weight: 700; color: var(--ink); }
+.set-card .btn { width: 100%; margin-top: 8px; }
+.set-card .row2 .btn { margin-top: 8px; }
+.set-card .set-line { margin: 0 0 4px; font-size: 13px; color: var(--muted); }
+.set-card .set-line.err:empty { display: none; }
+.set-fold { border-top: 1px solid var(--line); padding: 2px 0; }
+.set-fold > summary { list-style: none; cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--ink); }
+.set-fold > summary::-webkit-details-marker { display: none; }
+.set-fold > summary small { color: var(--muted); font-size: 11.5px; }
+.set-fold > summary::after { content: "›"; margin-left: auto; color: var(--muted); transition: transform .15s; }
+.set-fold[open] > summary::after { transform: rotate(90deg); }
+.set-fold textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.set-fold[open] { padding-bottom: 10px; }
+.set-danger > summary { list-style: none; cursor: pointer; min-height: 32px; display: flex; align-items: center; color: var(--neg); margin: 0; }
+.set-danger > summary::-webkit-details-marker { display: none; }
+.set-danger > summary::after { content: "›"; margin-left: auto; color: var(--muted); }
+
+/* v42：轻量动效——只在「从无到有」的那一下动，时长短、位移小；系统要求减少动态时全部关掉 */
+@keyframes lh-rise { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes lh-up { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.order-card .order-more:not([hidden]) { animation: lh-rise .18s ease-out; }
+.batch-block.just-opened .order-card, .batch-block.just-opened .bh-note { animation: lh-rise .2s ease-out; }
+.sel-bar:not([hidden]) { animation: lh-up .22s cubic-bezier(.2, .8, .2, 1); }
+.set-fold[open] > :not(summary), .set-danger[open] > :not(summary), .fold-card[open] > :not(summary) { animation: lh-rise .18s ease-out; }
+.order-actions .more-toggle svg { display: block; margin: auto; }
+@media (prefers-reduced-motion: reduce) {
+  .order-card .order-more:not([hidden]), .batch-block.just-opened .order-card, .batch-block.just-opened .bh-note,
+  .sel-bar:not([hidden]), .set-fold[open] > :not(summary), .set-danger[open] > :not(summary), .fold-card[open] > :not(summary) { animation: none; }
+}
+#reportSummary p.rs-out { display: none; }

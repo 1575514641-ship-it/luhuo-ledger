@@ -12,14 +12,14 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=41">
+  <link rel="stylesheet" href="./styles.css?v=42">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="brand-dot"></span>
       <h1>撸货记账</h1>
-      <span id="syncStatus" class="sync-badge offline">本地</span>
+      <!-- v42：同步状态可点＝立即和云端核对一次 --><button type="button" id="syncStatus" class="sync-badge offline" aria-label="立即同步">本地</button>
     </div>
     <button id="settingsBtn" class="icon-btn" aria-label="设置">
       <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -43,6 +43,8 @@
         <span class="hero-label">垫付在外未回笼</span>
         <span id="kpiOutstanding" class="hero-value">¥0</span>
         <span id="kpiOutstandingHint" class="hero-hint">还没结算回来的钱</span>
+        <!-- v42：累计数字并进英雄卡一行，下面四格 KPI 不再单独占两行（DOM 保留、只是不显示） -->
+        <span id="heroTotals" class="hero-totals"></span>
       </div>
       <div class="kpi-grid">
         <div class="kpi card">
@@ -65,6 +67,12 @@
         </div>
       </div>
 
+      <!-- v41：每月利润——近 12 个月按回款月份的净盈亏（与下方月报同一口径 reportStats），点柱子切到那个月的月报 -->
+      <div class="card mp-card">
+        <h2>每月利润 <small>按回款月份 · 已扣垫付和邮费</small></h2>
+        <div id="mpSummary" class="mp-summary"></div>
+        <div id="monthProfit" class="mp-chart"></div>
+      </div>
     </section>
 
     <!-- 账本 -->
@@ -103,6 +111,8 @@
       </div>
       <div class="chips-row">
         <div id="filterChips" class="chips"></div>
+        <!-- v42：待寄 / 待回款页签里一键全选（再点一次全不选） -->
+        <button type="button" id="selAll" class="sel-all" hidden>全选</button>
       </div>
       <div id="orderList"></div>
       <!-- v41：勾选操作条（待寄 → 寄出；待回款 → 回款）。只活在内存里，切页签/重渲染时按现存单收敛 -->
@@ -129,6 +139,9 @@
       </div>
       <div id="reportSummary" class="card summary"></div>
       <div id="reportKpis" class="kpi-grid"></div>
+      <!-- v41：现金流 / 净盈亏分布 / 邮费 / 盈利商品 / 商品榜 / 订单状态与近 6 个月——都收进「更多统计」（默认收起，内容与口径一字未改） -->
+      <details id="repMore" class="rep-more">
+        <summary>更多统计 <small>现金流 · 邮费 · 商品 · 订单状态</small></summary>
       <div class="card">
         <h2>现金流走势 <span class="legend" id="flowLegend"></span></h2>
         <div id="chartFlow"></div>
@@ -164,6 +177,7 @@
           <div id="monthList"></div>
           <p class="foot-note">最右一列＝本月回款－本月垫付；正数表示收回的更多。未扣邮费，不等于利润。</p>
         </div>
+      </details>
       </details>
       <details class="info-note center"><summary aria-label="统计口径">ⓘ 统计口径</summary><p class="foot-note center">口径：单数和垫付按下单日期；回款、利润和商品榜按回款日期；邮费成批按批次日期、单寄按下单日期。</p></details>
     </section>
@@ -249,11 +263,14 @@
       <!-- 03 期：连续录入。「保存并继续」只在**新建货单**时渲染（编辑/收入单都不给，见 applyChainUi）；
            「保留本次渠道」默认不勾，只有用户显式勾上、并在本次连续录入里手选过渠道，下一单才暂时沿用，
            普通保存 / 关窗 / 取消都结束本次连续录入，重新打开表单不记住这个选择。 -->
-      <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">下一单沿用这个渠道</label>
       <div class="sheet-actions">
         <button type="button" id="formCancel" class="btn ghost">取消</button>
         <button type="submit" class="btn primary">保存</button>
-        <button type="button" id="formSaveNext" class="btn primary" hidden>保存并继续</button>
+      </div>
+      <!-- v42：「保存并继续」降为主按钮下面的一行轻链接；「下一单沿用这个渠道」跟它放在一起（只在新建货单时出现） -->
+      <div class="chain-row">
+        <button type="button" id="formSaveNext" class="link-btn" hidden>保存，再记一单 ›</button>
+        <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">沿用渠道</label>
       </div>
     </form>
   </div>
@@ -423,47 +440,57 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置</h2>
-      <p class="set-line app-version">版本 <b id="appVersion">v41</b>（升级后两台设备都要刷新，看到这个版本号才算更新成功）</p>
-      <div class="set-block">
-        <h3>云同步</h3>
-        <p class="set-line">接口：<span id="syncEndpoint">-</span></p>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v42</b></small></h2>
+      <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
+      <section class="set-card">
+        <h3>两台设备同步</h3>
         <p class="set-line">上次同步：<span id="syncLast">-</span></p>
         <p class="set-line err" id="syncErrLine"></p>
-        <p class="foot-note">手机和电脑各打开一次本页，把其中一台的同步码粘贴到另一台，两端即共用同一本账。</p>
-      </div>
-      <div class="set-block">
-        <h3>我的同步码</h3>
-        <textarea id="syncCodeText" readonly rows="3"></textarea>
-        <button type="button" id="copySyncCode" class="btn">复制同步码</button>
-      </div>
-      <div class="set-block">
-        <h3>导入另一台的同步码</h3>
-        <input id="applySyncInput" placeholder="粘贴 LUHUO1.… 开头的同步码">
-        <button type="button" id="applySyncBtn" class="btn">导入并配对</button>
-      </div>
-      <div class="set-block">
-        <h3>备份</h3>
+        <details class="set-fold">
+          <summary>我的同步码 <small>粘到另一台设备上</small></summary>
+          <textarea id="syncCodeText" readonly rows="3"></textarea>
+          <button type="button" id="copySyncCode" class="btn">复制同步码</button>
+        </details>
+        <details class="set-fold">
+          <summary>导入另一台的同步码</summary>
+          <input id="applySyncInput" placeholder="粘贴 LUHUO1.… 开头的同步码">
+          <button type="button" id="applySyncBtn" class="btn">导入并配对</button>
+        </details>
+        <details class="info-note">
+          <summary>ⓘ 说明</summary>
+          <p class="foot-note">手机和电脑各打开一次本页，把其中一台的同步码粘贴到另一台，两端即共用同一本账。升级后两台设备都要刷新，看到上面的版本号才算更新成功。</p>
+          <p class="foot-note">接口：<span id="syncEndpoint">-</span></p>
+        </details>
+      </section>
+      <section class="set-card">
+        <h3>备份与导出</h3>
+        <button type="button" id="exportCsvBtn" class="btn">导出表格（Excel 可打开）</button>
         <div class="row2">
           <button type="button" id="exportBtn" class="btn">导出 JSON 备份</button>
           <label class="btn btn-label">导入 JSON<input type="file" id="importFile" accept="application/json" hidden></label>
         </div>
+        <p class="foot-note">表格用来在电脑上翻看汇总；恢复账本请用 JSON 备份。</p>
         <button type="button" id="exportRecoveryBtn" class="btn" hidden>导出冲突 / 原始数据核对副本</button>
         <button type="button" id="restoreSnapshotBtn" class="btn" hidden>采用最近完整快照</button>
-      </div>
-      <div class="set-block">
-        <h3>危险操作</h3>
+      </section>
+      <details class="set-card set-danger">
+        <summary>危险操作</summary>
         <button type="button" id="resetIdentityBtn" class="btn danger">重置为本机新账本</button>
-      </div>
+      </details>
       <div class="sheet-actions">
         <button type="button" id="closeSettings" class="btn primary">完成</button>
       </div>
     </div>
   </div>
 
+  <!-- v42：撤销条（操作完成后 6 秒内可撤销） -->
+  <div id="undoBar" class="undo-bar" role="status" aria-live="polite" hidden>
+    <span id="undoText"></span>
+    <button type="button" id="undoBtn">撤销</button>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=41"></script>
-  <script src="./app.js?v=41"></script>
+  <script src="./sync.js?v=42"></script>
+  <script src="./app.js?v=42"></script>
 </body>
 </html>

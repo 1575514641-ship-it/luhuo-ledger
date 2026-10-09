@@ -1072,6 +1072,9 @@
     $("#kpiMonthFee").textContent = `本月邮费 ${money(monthFee.totalCents / 100)}`;
     $("#kpiMonthIncome").textContent = money(s.monthIncome);
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
+    const ht = $("#heroTotals");
+    if (ht) ht.innerHTML = `累计净赚 <b class="${s.settledProfit > 0 ? "pos" : s.settledProfit < 0 ? "neg" : ""}">${money(s.settledProfit)}</b>`
+      + ` · 累计垫付 ${money(s.totalCost)} · 回款 ${money(s.totalIncome)}`;
 
     // 订单状态：垫付占比小环形 + 三态行
     // 环形图 + 状态行都按 statusKeys（现役两态 + 数据里真有的遗留态），
@@ -1163,6 +1166,12 @@
   function renderSelBar() {
     const bar = $("#selBar");
     if (!bar) return;
+    const all = $("#selAll");
+    if (all) {
+      const keys = selectableKeys();
+      all.hidden = keys.size === 0;
+      all.textContent = keys.size > 0 && [...keys].every((k) => selection.has(k)) ? "全不选" : "全选";
+    }
     const show = selection.size > 0 && (currentFilter === "待寄" || currentFilter === "待回款");
     bar.hidden = !show;
     document.body.classList.toggle("has-sel", show);
@@ -1456,7 +1465,12 @@
     else expandedBatches.add(id);
     const expanded = expandedBatches.has(id);
     const block = btn.closest(".batch-block");
-    if (block) block.classList.toggle("collapsed", !expanded);
+    if (block) {
+      block.classList.toggle("collapsed", !expanded);
+      // v42：只在用户亲手展开的这一下给成员卡片一个轻入场（类随后自摘）；整列表重渲染不带这个类，不会每次都动。
+      block.classList.toggle("just-opened", expanded);
+      if (expanded) setTimeout(() => block.classList.remove("just-opened"), 400);
+    }
     btn.setAttribute("aria-expanded", String(expanded));
   }
 
@@ -1584,23 +1598,24 @@
         <div class="order-side">
           ${pendingIncome ? `<span class="order-income-pending">待记回款</span>` : ""}
           ${showProfit ? `<div class="order-profit${profitEditable ? " editable" : ""}">
-            <span>利润</span>
             ${profitEditable
               ? `<button type="button" class="profit-edit" data-act="pedit" data-id="${escapeHtml(o.id)}" title="点一下改这一项的利润（整批总利润不变）"><b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b></button>`
               : `<b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${money(profit)}</b>`}
+            <span>利润</span>${roiText(toCents(profit), toCents(o.cost)) ? `<i class="order-roi">${roiText(toCents(profit), toCents(o.cost))}</i>` : ""}
           </div>` : ""}
-          <span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>
         </div>
       </div>
       ${missFlag}
-      <div class="order-mid">${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}</div>
-      <div class="order-money">
-        <span>垫付 <b>${money(o.cost)}</b></span>
-        <span>回款 <b>${o.income === null ? "—" : money(o.income)}</b></span>
-        ${stage === "待寄" && !(toCents(o.fee) > 0) ? "" : `<span>邮费 <b>${money(o.fee)}</b></span>`}
-      </div>
+      <div class="order-mid"><span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>${escapeHtml(o.date)}${o.platform ? " · " + escapeHtml(o.platform) : ""} · ${o.qty} 件${o.channel ? " · " + escapeHtml(o.channel) : ""}${cleanTracking(o.tracking) ? " · 单号 " + escapeHtml(cleanTracking(o.tracking)) : ""}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}</div>
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
-      <div class="order-actions">${primary}<button class="act more-toggle" data-act="more" aria-expanded="false">更多</button></div>
+      <div class="order-foot">
+        <div class="order-money">
+          <span>垫付 <b>${money(o.cost)}</b></span>
+          ${o.income === null ? "" : `<span>回款 <b>${money(o.income)}</b></span>`}
+          ${stage === "待寄" && !(toCents(o.fee) > 0) ? "" : `<span>邮费 <b>${money(o.fee)}</b></span>`}
+        </div>
+        <div class="order-actions">${primary}<button class="act more-toggle" data-act="more" aria-expanded="false" aria-label="更多操作" title="更多操作"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button></div>
+      </div>
       <div class="order-more" hidden>${actions.join("")}</div>
     </div>`;
   }
@@ -2026,6 +2041,8 @@
     $("#shipDateRow").hidden = true;
     $("#shipTitleText").textContent = "寄出信息";
     $("#shipSubmit").textContent = "保存寄出信息";
+    $("#shipTracking").placeholder = "留空＝不改";
+    $("#shipFee").placeholder = "留空＝不改";
     const members = (() => {
       if (target.kind === "loose") {
         const o = data.orders.find((x) => x.id === target.id);
@@ -2126,6 +2143,8 @@
     updateShipTrackingHint();
     $("#shipTracking").value = "";
     $("#shipFee").value = "";
+    $("#shipTracking").placeholder = "可空";
+    $("#shipFee").placeholder = n > 1 ? "整批合计，可空" : "可空";
     applyShipTogetherUi();
     openModal("#shipModal");
   }
@@ -2164,6 +2183,7 @@
       if (now.some((o) => o.status !== "在途" || isShipped(o))) {
         toast("勾选里有单已经不是「待寄」了，这次没有保存"); return false;
       }
+      const undoBefore = clone(data.orders);
       if (together) {
         const broughtFee = now.reduce((a, o) => a + toCents(o.fee), 0);
         const broughtIncome = now.reduce((a, o) => a + toCents(o.income), 0);
@@ -2201,6 +2221,7 @@
       ids.forEach((id) => selection.delete("o:" + id));
       closeShipForm();
       renderList();
+      offerUndo(separate ? `已标记 ${n} 单寄出` : `已寄出 ${n} 单`, undoBefore);
       if (separate) { toast(`已标记 ${n} 单寄出`); return true; }
       // 寄完就报单：紧接着打开报单面板并写剪贴板（与「报单」按钮同一条复制路径）；复制失败面板里有按钮再点一次
       openBaodan({ type: "ids", ids });
@@ -2219,9 +2240,11 @@
     withLedgerWrite(() => {
       const cur = data.orders.find((x) => x.id === id);
       if (!cur || gen !== ledgerGeneration || orderSnap(cur) !== snap) { toast("这一单已变化，没有改动，请重新核对"); return false; }
+      const undoBefore = clone(data.orders);
       cur.shipDate = ""; cur.tracking = "";
       if (!saveData()) return false;
       toast("已改回待寄");
+      offerUndo("已改回待寄", undoBefore);
       return true;
     });
   }
@@ -2383,7 +2406,8 @@
   // （垫出抄成 #b97909、回款抄成 #17b26a、亏抄成 #d05f45），于是图例点与线/柱的颜色对不上
   // （垫出线是 #7d8fa1 的板岩色，图例却点了个琥珀）。渐变那两个 stop 是**渐隐端**、
   // 只参与面积图的中间过渡，别再把它们当成序列色去用。
-  const SERIES_COLOR = { cost: "#7d8fa1", income: "#14b8a6", gain: "#14b8a6", loss: "#c0724f" };
+  // v41：赚红亏绿（用户选定）。gain / loss 与 styles.css 的 --gain / --loss 同值
+  const SERIES_COLOR = { cost: "#7d8fa1", income: "#14b8a6", gain: "#d23f31", loss: "#2e8b4e" };
   let gradSeq = 0;
 
   // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
@@ -2569,7 +2593,8 @@
           : `比上一期${diff > 0 ? "多赚" : "少赚"} <b class="${diff > 0 ? "pos" : "neg"}">${money(Math.abs(diff))}</b>。`);
       }
     }
-    $("#reportSummary").innerHTML = lines.map((l) => `<p>${l}</p>`).join("");
+    // v42：「在途」那句与统计页顶部英雄卡重复，打上类名由 CSS 收起（文字仍在 DOM）。
+    $("#reportSummary").innerHTML = lines.map((l) => `<p${l.startsWith("现在还有") ? ' class="rs-out"' : ""}>${l}</p>`).join("");
 
     $("#reportKpis").innerHTML = `
       <div class="kpi card"><span class="kpi-label">单数</span><span class="kpi-value">${s.n}</span></div>
@@ -2661,7 +2686,79 @@
             <span class="prod-nums">回款 ${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
           </div>
           <div class="prod-bar-track"><span class="prod-bar ${g.profit >= 0 ? "pos" : "neg"}" style="width:${Math.round(Math.abs(g.profit) / maxP * 100)}%"></span></div>
-        </div>`).join("");
+        </div>`).join("");    renderMonthProfit();
+  }
+
+  // v41：每月利润（近 12 个月，按回款月份的净盈亏）。口径与月报**同一个函数** reportStats——
+  // 所以点某根柱子切到那个月的月报，看到的「净盈亏」必然与柱子一致。赚红亏绿（SERIES_COLOR）。
+  function renderMonthProfit() {
+    const box = $("#monthProfit");
+    if (!box) return;
+    const now = new Date();
+    const months = [];
+    for (let k = 11; k >= 0; k -= 1) {
+      const d = new Date(now.getFullYear(), now.getMonth() - k, 1);
+      const cur = { y: d.getFullYear(), m: d.getMonth() };
+      const r = repRange("month", cur);
+      months.push({ cur, label: `${cur.m + 1}月`, ym: r.label, cents: toCents(reportStats(r.start, r.end).profit) });
+    }
+    const sel = reportMode === "month" ? `${repCursor.y}-${pad2(repCursor.m + 1)}` : "";
+    const total = months.reduce((a, m) => a + m.cents, 0);
+    const active = months.filter((m) => m.cents !== 0).length;
+    // v42：回报率＝这 12 个月里有回款的单「利润合计 ÷ 垫付合计」（与月报同一归期：按回款日期）
+    const winStart = repRange("month", months[0].cur).start, winEnd = repRange("month", months[11].cur).end;
+    let roiCost = 0;
+    data.orders.forEach((o) => {
+      if (!hasIncome(o)) return;
+      const d = parseDate(o.incomeDate);
+      if (d && d >= winStart && d < winEnd) roiCost += toCents(o.cost);
+    });
+    const roi = roiText(total, roiCost);
+    $("#mpSummary").innerHTML = `近 12 个月合计 <b class="${total > 0 ? "pos" : total < 0 ? "neg" : ""}">${money(total / 100)}</b>`
+      + (roi ? ` · 回报率 <b class="${total > 0 ? "pos" : total < 0 ? "neg" : ""}">${roi}</b>` : "")
+      + (active ? ` · 有回款的月份平均 <b>${money(Math.round(total / active) / 100)}</b>` : "");
+    const W = 336, H = 150, top = 22, bottom = 22, gap = 6;
+    const maxAbs = Math.max(1, ...months.map((m) => Math.abs(m.cents)));
+    const hasNeg = months.some((m) => m.cents < 0);
+    const hasPos = months.some((m) => m.cents > 0);
+    const plotH = H - top - bottom;
+    const zeroY = top + (hasNeg && hasPos ? plotH / 2 : hasNeg ? 0 : plotH);
+    const scale = (hasNeg && hasPos ? plotH / 2 : plotH) / maxAbs;
+    const bw = (W - gap * 11) / 12;
+    const bars = months.map((m, i) => {
+      const x = i * (bw + gap);
+      const h = Math.max(m.cents === 0 ? 0 : 2, Math.abs(m.cents) * scale);
+      const y = m.cents >= 0 ? zeroY - h : zeroY;
+      const on = m.ym === sel;
+      const color = m.cents >= 0 ? SERIES_COLOR.gain : SERIES_COLOR.loss;
+      // 柱顶数字：上万写成「¥1.2万」；靠左/靠右两端的柱子把文字往里对齐，任何金额都不出图（37.22 抓到过出界）
+      const short = Math.abs(m.cents) >= 1000000
+        ? `${m.cents < 0 ? "-" : ""}¥${(Math.abs(m.cents) / 1000000).toFixed(Math.abs(m.cents) >= 100000000 ? 0 : 1)}万`
+        : money(m.cents / 100);
+      const anchor = i <= 1 ? "start" : i >= 10 ? "end" : "middle";
+      const tx = anchor === "start" ? x : anchor === "end" ? x + bw : x + bw / 2;
+      const val = on || (m.cents !== 0 && Math.abs(m.cents) === maxAbs)
+        ? `<text x="${tx.toFixed(1)}" y="${(m.cents >= 0 ? y - 5 : y + h + 12).toFixed(1)}" text-anchor="${anchor}" class="mp-val">${escapeHtml(short)}</text>` : "";
+      return `<g class="mp-bar${on ? " on" : ""}" data-ym="${m.cur.y}-${m.cur.m}" role="button" tabindex="0" aria-label="${escapeHtml(m.ym)} 利润 ${escapeHtml(money(m.cents / 100))}">
+        <rect x="${x.toFixed(1)}" y="${top - 6}" width="${bw.toFixed(1)}" height="${H - top - 2}" fill="transparent"/>
+        <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${color}" opacity="${on ? 1 : .55}"/>
+        ${val}
+        <text x="${(x + bw / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="mp-lab">${m.label}</text></g>`;
+    }).join("");
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="近 12 个月每月利润">
+      <line x1="0" x2="${W}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" class="mp-zero"/>${bars}</svg>`;
+  }
+
+  // 点某个月 → 下方月报切到那个月（模式切成「月」），并滚到月报
+  function pickProfitMonth(key) {
+    const [y, m] = String(key || "").split("-").map(Number);
+    if (!Number.isFinite(y) || !Number.isFinite(m)) return;
+    reportMode = "month";
+    $$("#repModes .seg").forEach((c) => c.classList.toggle("on", c.dataset.mode === "month"));
+    repCursor = { y, m };
+    renderReport();
+    const head = $(".rep-head");
+    if (head && head.scrollIntoView) head.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   // ---- 记单 / 编辑 ----
@@ -3951,6 +4048,7 @@
   function submitPay(ev) { ev.preventDefault(); return withFormIntent(ev.target, paySession, () => paySession, () => submitPayImpl(ev)); }
   function submitPayImpl(ev) {
     ev.preventDefault();
+    const undoBefore = clone(data.orders);   // v42：撤销用（写入回调里，这一刻还没改）
     const f = ev.target;
     const o = data.orders.find((x) => x.id === payTargetId);
     if (!o) return closePayForm();
@@ -3978,6 +4076,7 @@
     if (!saveData()) return;
     closePayForm(true);      // 04 期：保存成功用显式 bypass，别再问一次
     toast(wasEdit ? `已改回款 ${money(income)}，利润 ${money(orderProfit(o))}` : `已回款 ${money(income)}，利润 ${money(orderProfit(o))}`);
+    offerUndo(wasEdit ? `已改回款 ${money(income)}` : `已回款 ${money(income)}`, undoBefore);
   }
 
   // v24：表单里的「清空」小动作（记单/编辑的邮费栏、回款弹窗的回款金额栏）。
@@ -4010,6 +4109,7 @@
 
   function deleteOrder(id) { return withLedgerWrite(() => deleteOrderImpl(id)); }
   function deleteOrderImpl(id) {
+    const undoBefore = clone(data.orders);
     const o = data.orders.find((x) => x.id === id);
     if (!o) return;
     const mates = o.batchId ? data.orders.filter((x) => x.batchId === o.batchId) : [];
@@ -4017,10 +4117,11 @@
     const batchLine = n > 1
       ? `它属于一起寄出的 ${n} 单之一，删掉后该批还剩 ${n - 1} 单${n - 1 === 1 ? "（只剩它自己，「一起寄出」那一栏就没了）" : ""}。\n整批邮费/回款照旧记在剩下的单子上。\n`
       : n === 1 ? "它是「一起寄出」那批的最后一单，删掉这一批就没了。\n" : "";
-    if (!confirm(`删除「${o.name}」这一单？\n${batchLine}删除后无法恢复（云端也会删）。`)) return;
+    if (!confirm(`删除「${o.name}」这一单？\n${batchLine}删除后几秒内可在底部点「撤销」，之后就无法恢复（云端也会删）。`)) return;
     data.orders = data.orders.filter((x) => x.id !== id);
     if (!saveData()) return;
     toast("已删除");
+    offerUndo(`已删除「${o.name || "未命名"}」`, undoBefore);
   }
 
   // ---- v35：分项利润编辑的三个写/渲染动作 ----
@@ -4286,6 +4387,7 @@
   // 假漂移（D-3），而这句陈述又把同一批的金额告警顶掉，用户分不清是退出还是钱被改坏了。
   function leaveBatch(id) { return withLedgerWrite(() => leaveBatchImpl(id)); }
   function leaveBatchImpl(id) {
+    const undoBefore = clone(data.orders);
     const o = data.orders.find((x) => x.id === id);
     if (!o || !o.batchId) return;
     const mates = data.orders.filter((x) => x.batchId === o.batchId);
@@ -4342,6 +4444,7 @@
     });
     if (!saveData()) return;
     toast(others.length === 1 ? "已退出，那一批也解散了" : "已退出本批，这一单变成单寄");
+    offerUndo("已退出本批", undoBefore);
   }
 
   // ---- 批量结算（整批寄出 / 对方一笔总回款，按垫付占比分摊）----
@@ -4562,6 +4665,7 @@
 
   function submitBatch() { return withFormIntent($("#batchModal"), batchSession, () => batchSession, submitBatchImpl); }
   function submitBatchImpl() {
+    const undoBefore = clone(data.orders);
     const sel = selectedBatchInfo();
     const selIds = new Set(sel.orders.map((o) => o.id));
     // v38（报告 B10 / D3）：**分摊一律用当前 data.orders 里的成员顺序** —— 与「恢复默认分摊」
@@ -4747,6 +4851,7 @@
     else if (prev) msg = `已改成本批${amounts.join(" · ")} · ${orders.length} 单`;
     else msg = `已结算 ${orders.length} 单${orders.length > 1 ? `（一起寄 ${batchDate.slice(5)}）` : ""} · ${amounts.join(" · ")}`;
     toast(msg);
+    offerUndo(msg, undoBefore);
   }
 
   // ---- 报单（v28：寄出后给收货商报「型号 颜色 数量」）----
@@ -5402,6 +5507,47 @@
     toast("已导出备份文件");
   }
 
+  // v42：回报率＝利润 ÷ 垫付（只在垫付 > 0 时有意义；0 元购、收入单不显示）。按「分」算，保留 1 位小数。
+  function roiText(profitCents, costCents) {
+    if (!(costCents > 0)) return "";
+    const pct = Math.round((profitCents / costCents) * 1000) / 10;
+    return `${pct}%`;
+  }
+
+  // v42：导出给人看的表格（CSV）。UTF-8 带 BOM，Excel 打开中文不乱码；每格按 RFC 4180 转义；
+  // 以 = + - @ 开头的文本前面补一个单引号，防止被表格软件当成公式执行（CSV 注入）。
+  // 金额列写纯数字（两位小数），方便在表格里直接求和；这份文件不能导回网站，备份恢复请用 JSON。
+  function exportCsv() {
+    const cell = (v) => {
+      let t = v === null || v === undefined ? "" : String(v);
+      if (/^[=+\-@\t\r]/.test(t) && !/^-?\d+(\.\d+)?$/.test(t)) t = "'" + t;
+      return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
+    const num = (v) => (Number.isFinite(Number(v)) ? (Math.round(Number(v) * 100) / 100).toFixed(2) : "");
+    const head = ["下单日期", "商品", "数量", "渠道", "阶段", "垫付", "邮费", "回款", "回款日期", "利润", "回报率",
+      "寄出日期", "快递单号", "一起寄批次日期", "备注"];
+    const rows = data.orders.slice()
+      .sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? -1 : 1))
+      .map((o) => {
+        const hasInc = o.income !== null && o.income !== undefined;
+        const profitCents = hasInc || isSettled(o) ? toCents(orderProfit(o)) : null;
+        const stage = orderStage(o);
+        return [o.date, o.name, o.qty, o.channel, stage === "遗留" ? statusLabel(o.status) : stage,
+          num(o.cost), num(o.fee), hasInc ? num(o.income) : "", o.incomeDate || "",
+          profitCents === null ? "" : (profitCents / 100).toFixed(2),
+          profitCents === null ? "" : roiText(profitCents, toCents(o.cost)),
+          o.shipDate || "", cleanTracking(o.tracking), o.batchDate || "", o.note].map(cell).join(",");
+      });
+    const csv = "\ufeff" + [head.map(cell).join(","), ...rows].join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `撸货记账-${todayStr().replace(/-/g, "")}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    toast(`已导出表格 · ${data.orders.length} 单`);
+  }
+
   function importJson(file) {
     const reader = new FileReader();
     reader.onload = async () => {
@@ -5462,7 +5608,7 @@
   function dismissModal(modal) {
     const close = { formModal: closeForm, payModal: closePayForm, batchModal: closeBatchModal,
       baodanModal: closeBaodan, lookupModal: closeLookup, shipModal: closeShipForm, settingsModal: closeSettings };
-    if (modal && close[modal.id]) close[modal.id]();
+    if (modal && close[modal.id]) return close[modal.id]();
   }
 
   function switchView(view) {
@@ -5474,6 +5620,46 @@
     $$("#listMoreMenu").forEach((m) => { m.hidden = true; });
     if (view !== "list" && selection.size) { selection.clear(); renderList(); }
     window.scrollTo(0, 0);
+  }
+
+  // ---- v42：撤销（回款 / 整批回款与结算 / 寄出 / 删除 / 退出本批 / 改回待寄 之后 6 秒内） ----
+  // 只在**账本此刻仍与那次操作刚完成时一模一样**时才允许撤销：期间有任何别的改动（另一笔记账、
+  // 云端拉取换包、导入）都不撤——不在新账上硬套旧快照。撤销本身也走同一个写入事务与保存路径。
+  let undoState = null, undoTimer = null;
+  function offerUndo(label, before) {
+    if (!Array.isArray(before)) return;
+    undoState = { before, after: JSON.stringify(data.orders), generation: ledgerGeneration };
+    const bar = $("#undoBar");
+    if (!bar) return;
+    $("#undoText").textContent = label;
+    bar.hidden = false;
+    document.body.classList.add("has-undo");
+    clearTimeout(undoTimer);
+    // 面板开着时撤销条在面板下面看不见——这段时间不计入那 6 秒（比如寄出后自动弹出的报单面板）
+    const arm = () => { undoTimer = setTimeout(() => (topModal() ? arm() : hideUndo()), 6000); };
+    arm();
+  }
+  function hideUndo() {
+    clearTimeout(undoTimer);
+    const bar = $("#undoBar");
+    if (bar) bar.hidden = true;
+    document.body.classList.remove("has-undo");
+    undoState = null;
+  }
+  function doUndo() {
+    const st = undoState;
+    hideUndo();
+    if (!st) return;
+    return withLedgerWrite(() => {
+      if (st.generation !== ledgerGeneration || JSON.stringify(data.orders) !== st.after) {
+        toast("账本已经有新的改动，这一步没法撤销了");
+        return false;
+      }
+      data.orders = clone(st.before);
+      if (!saveData()) return false;
+      toast("已撤销");
+      return true;
+    });
   }
 
   let toastTimer = null;
@@ -5518,7 +5704,8 @@
       if (!box) return;
       box.hidden = !box.hidden;
       btn.setAttribute("aria-expanded", String(!box.hidden));
-      btn.textContent = box.hidden ? "更多" : "收起";
+      btn.setAttribute("aria-label", box.hidden ? "更多操作" : "收起操作");
+      btn.closest(".order-card").classList.toggle("more-open", !box.hidden);
       return;
     }
     if (act === "shipnew") { openShipForm({ kind: "new", ids: [id] }); return; }
@@ -5637,6 +5824,14 @@
       renderSelBar();
     });
     $("#selGo").addEventListener("click", runSelection);
+    $("#selAll").addEventListener("click", () => {
+      const keys = [...selectableKeys()];
+      const allOn = keys.length > 0 && keys.every((k) => selection.has(k));
+      selection.clear();
+      if (!allOn) keys.forEach((k) => selection.add(k));
+      $$("#orderList input[data-sel]").forEach((cb) => { cb.checked = selection.has(cb.dataset.sel); });
+      renderSelBar();
+    });
     $("#checkHint").addEventListener("click", () => { openLookup(); setLookupTab("check"); });
     $("#upgradeHintGo").addEventListener("click", () => {
       const list = upgradeCandidates();
@@ -5687,7 +5882,13 @@
 
     $("#orderList").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-act]");
-      if (btn) handleCardAction(btn);
+      if (btn) { handleCardAction(btn); return; }
+      // v42：点卡片空白处＝展开/收起这张卡的「更多」（按钮、勾选框、输入框、链接不算）
+      if (ev.target.closest("button, input, label, a, select, textarea, .order-more")) return;
+      if (window.getSelection && String(window.getSelection()).length) return;   // 正在选文字（复制单号）时不切
+      const card = ev.target.closest(".order-card");
+      const more = card && card.querySelector('.order-actions [data-act="more"]');
+      if (more) handleCardAction(more);
     });
 
     // v35：行内利润输入框 —— change（blur/回车）＝提交；Enter 只负责触发 change（blur）；
@@ -5936,6 +6137,14 @@
       repCursor = { y: now.getFullYear(), m: now.getMonth() };
       renderReport();
     });
+    $("#monthProfit").addEventListener("click", (ev) => {
+      const g = ev.target.closest("[data-ym]");
+      if (g) pickProfitMonth(g.dataset.ym);
+    });
+    $("#monthProfit").addEventListener("keydown", (ev) => {
+      const g = ev.target.closest("[data-ym]");
+      if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); pickProfitMonth(g.dataset.ym); }
+    });
     $("#repPrev").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, -1); renderReport(); });
     $("#repNext").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, 1); renderReport(); });
 
@@ -5947,6 +6156,61 @@
     });
     $("#applySyncBtn").addEventListener("click", applySyncCodeFromForm);
     $("#exportBtn").addEventListener("click", exportJson);
+    $("#exportCsvBtn").addEventListener("click", exportCsv);
+    $("#undoBtn").addEventListener("click", doUndo);
+    // v42：点顶部同步状态＝立刻和云端核对一次（另一台设备刚记的账马上拉过来）；
+    // 回到前台超过 1 分钟也自动核对一次（有弹窗开着时不打扰）。都走既有的 pullFromCloud，冲突与并入规则不变。
+    let manualSyncing = false, lastPullAt = Date.now();
+    const syncNow = async (silent) => {
+      if (manualSyncing) return;
+      if (!window.luhuoSync || !window.luhuoSync.isConfigured()) { if (!silent) toast("还没有配对同步码，去设置里配对"); return; }
+      manualSyncing = true;
+      const before = JSON.stringify(data.orders);
+      try {
+        const r = await pullFromCloud();
+        lastPullAt = Date.now();
+        if (syncPending && !syncBlocked && !localIssue) flushPendingSync();
+        if (silent || !r) return;
+        if (r.kind === "failed") toast("同步失败，联网后再点一次");
+        else if (r.kind === "blocked") toast("同步暂停中，请看页面上方的提示");
+        else if (JSON.stringify(data.orders) === before) toast("已是最新");
+      } finally { manualSyncing = false; }
+    };
+    $("#syncStatus").addEventListener("click", () => syncNow(false));
+    // v42：底部弹出的面板可以往下滑关闭（只在面板已滚到顶部、且不是在输入框里滑时生效）。
+    // 关闭走各面板自己的关闭函数——有未保存改动时照旧先问一句；被拦下就弹回原位。
+    $$(".modal .sheet").forEach((sheet) => {
+      let y0 = null, dy = 0;
+      sheet.addEventListener("touchstart", (ev) => {
+        if (sheet.scrollTop > 0 || ev.touches.length !== 1 || ev.target.closest("input, textarea, select, .batch-list, #orderList")) { y0 = null; return; }
+        y0 = ev.touches[0].clientY; dy = 0;
+      }, { passive: true });
+      sheet.addEventListener("touchmove", (ev) => {
+        if (y0 === null) return;
+        dy = ev.touches[0].clientY - y0;
+        if (dy <= 0) { sheet.style.transform = ""; return; }
+        sheet.style.transition = "none";
+        sheet.style.transform = `translateY(${Math.min(dy, 400)}px)`;
+      }, { passive: true });
+      const end = async () => {
+        if (y0 === null) return;
+        y0 = null;
+        sheet.style.transition = "transform .18s ease";
+        const modal = sheet.closest(".modal");
+        if (dy > 110 && modal) {
+          await dismissModal(modal);
+          if (modal.classList.contains("show")) sheet.style.transform = "";
+          else setTimeout(() => { sheet.style.transform = ""; sheet.style.transition = ""; }, 200);
+        } else sheet.style.transform = "";
+        dy = 0;
+      };
+      sheet.addEventListener("touchend", end);
+      sheet.addEventListener("touchcancel", end);
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible" || topModal() || Date.now() - lastPullAt < 60000) return;
+      syncNow(true);
+    });
     $("#importFile").addEventListener("change", (ev) => {
       if (ev.target.files[0]) importJson(ev.target.files[0]);
       ev.target.value = "";
