@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=43">
+  <link rel="stylesheet" href="./styles.css?v=45">
 </head>
 <body>
   <header class="topbar">
@@ -40,7 +40,7 @@
          原看板的「订单状态」「近 6 个月」两张卡与报表走势重复，收进报表页底部的折叠块 #dashMore。 -->
     <section id="view-dash" class="view">
       <div class="hero card">
-        <span class="hero-label">垫付在外未回笼</span>
+        <span class="hero-label">垫付在外</span>
         <span id="kpiOutstanding" class="hero-value">¥0</span>
         <span id="kpiOutstandingHint" class="hero-hint">还没结算回来的钱</span>
         <!-- v42：累计数字并进英雄卡一行，下面四格 KPI 不再单独占两行（DOM 保留、只是不显示） -->
@@ -200,11 +200,13 @@
   <!-- 记单 / 编辑 -->
   <div id="formModal" class="modal">
     <form id="orderForm" class="sheet">
+      <!-- v45：标题行＝标题 +「已暂存」淡字 + 右侧「记一笔收入」小链接（原来各占一行） -->
+      <div class="form-head">
       <h2 id="formTitle">记一单</h2>
+      <span id="formSavedTag" class="form-saved" hidden>已暂存</span>
       <!-- 04 期：新单草稿。它是**本机**的、按账本身份隔离的一份新单输入，不属账本、不上传。
            打开表单时若当前身份已有草稿，这里让用户选「继续」或「丢弃」——**绝不自动回填后直接写账**。
            平时这里只显示暂存状态（已暂存 / 未保存在草稿 / 待核对），不占地方。 -->
-      <div id="formDraftBar" class="draft-bar" hidden></div>
       <!-- v25：类型切换（只改表单形态，不落库、不是类型字段）。编辑既有记录时整条隐藏 -->
       <!-- v41：切换条改成标题右侧的一个小链接（只显示「另一种」：货单时显示「记一笔收入」、收入时显示「← 记货单」）。
            控件与 data-kind 不变，applyKindUi / setFormKind 的逻辑一字未动，只是样式（.kind-link）。 -->
@@ -212,6 +214,8 @@
         <button type="button" class="seg on" data-kind="order">← 记货单</button>
         <button type="button" class="seg" data-kind="income">记一笔收入</button>
       </div>
+      </div>
+      <div id="formDraftBar" class="draft-bar" hidden></div>
       <label class="fld">商品名称<input name="goods" placeholder="卖什么？" required maxlength="120"></label>
       <!-- 03 期：近期商品名建议。**临时从已有订单派生**（不建模板库、不加账本字段、不合并同名单）；
            点一个只改「商品名称」这一格，不动你已经填好的金额/渠道等任何值。
@@ -219,13 +223,13 @@
       <div id="formRecent" class="recent-names" hidden></div>
       <div class="row2" id="formCostRow">
         <!-- 收入模式下这一格就是「金额」（回款金额），label 文案由 applyKindUi 换 -->
-        <label class="fld"><span id="formCostLabel">垫付金额</span><input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0" required></label>
+        <label class="fld"><span id="formCostLabel">垫付金额</span><input name="cost" type="number" inputmode="decimal" min="0" step="0.01" placeholder="如 200" required></label>
         <!-- v41：数量挪到垫付旁边，带 −/＋ 步进（按钮排在 input 之后，保住 label 与 input 的关联） -->
         <label class="fld kind-order fld-qty">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"><span class="stepper"><button type="button" data-step="-1" aria-label="数量减一">−</button><button type="button" data-step="1" aria-label="数量加一">＋</button></span></label>
       </div>
-      <!-- v43：货单金额可以按「单价」填（新建默认），保存时 × 数量存成这一单的垫付合计；
-           costMode 是隐藏格（unit / total，草稿随表单一起存），#formCostCalc 实时写出合计或单价。 -->
-      <input type="hidden" name="costMode" value="total">
+      <!-- v44：货单金额格一律是「单价」，保存时 × 数量存成这一单的垫付合计；#formCostCalc 实时写出合计。
+           costMode 只为认旧草稿；costBase 记「由合计反推、除不尽」时的原合计（见 app.js setCostFromTotal）。 -->
+      <input type="hidden" name="costMode" value="unit"><input type="hidden" name="costBase" value="">
       <p id="formCostCalc" class="cost-calc kind-order" hidden></p>
       <!-- v24：批内单的「邮费该在哪改」提示（一起寄的一批只有一笔邮费，统一改在批次上）。
            文案与显隐由 openForm 逐次决定；未成批的单不显示 -->
@@ -312,7 +316,7 @@
       <div id="batchList" class="batch-list"></div>
       <div class="row2">
         <label class="fld batch-fee-fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
-        <label class="fld">对方总回款 <small class="full-only">留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
+        <label class="fld">对方总回款 <small class="full-only">留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="如 520"></label>
       </div>
       <!-- 这一批现在记着多少钱 + 这三条规矩（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉）。
            v24 起没有「覆盖 / 追加」的选择，由 app.js 决定显不显示这一行 -->
@@ -422,11 +426,13 @@
         <button type="button" class="seg on" data-together="1">一起寄（一个单号）</button>
         <button type="button" class="seg" data-together="0">各自寄 / 只标记已寄</button>
       </div>
-      <label class="fld" id="shipDateRow" hidden>寄出日期<input id="shipDate" type="date"></label>
       <label class="fld ship-tk-row">快递单号<input id="shipTracking" maxlength="40" autocomplete="off" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipTrackingClear">清空</button></label>
       <p class="foot-note" id="shipTrackingHint"></p>
       <label class="fld ship-fee-row">邮费<input id="shipFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="留空＝不改"><button type="button" class="fld-clear" id="shipFeeClear">清空</button></label>
       <p class="foot-note" id="shipFeeHint"></p>
+      <!-- v45：寄出日期几乎总是今天——新寄出时只显示一行小字（#shipDateToggle），点了才展开日期框 -->
+      <button type="button" id="shipDateToggle" class="date-toggle" hidden></button>
+      <label class="fld" id="shipDateRow" hidden>寄出日期<input id="shipDate" type="date"></label>
       <details class="info-note ship-rule"><summary>ⓘ 填写规则</summary><p class="foot-note">填数字＝改成这个数、留空＝不动、填 0＝明确改成 0（邮费＝0 常见于包邮，按「清空」小按钮也是置 0）。回款金额、状态与到账日期这一趟一个字都不碰。</p></details>
       <details id="shipMembersBox" class="members-fold">
         <summary><span id="shipMembersLabel">成员明细</span></summary>
@@ -444,7 +450,7 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置 <small class="app-version">版本 <b id="appVersion">v43</b></small></h2>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v45</b></small></h2>
       <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
       <section class="set-card">
         <h3>两台设备同步</h3>
@@ -494,7 +500,7 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=43"></script>
-  <script src="./app.js?v=43"></script>
+  <script src="./sync.js?v=45"></script>
+  <script src="./app.js?v=45"></script>
 </body>
 </html>

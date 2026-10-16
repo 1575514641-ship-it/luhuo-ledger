@@ -1226,5 +1226,43 @@ button.sync-badge:active { opacity: .7; }
 .cost-calc { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: -4px 0 8px; font-size: 13px; color: var(--muted); }
 .cost-calc[hidden] { display: none; }
 .cost-calc b { color: var(--ink); font-weight: 700; }
-.cost-calc .link-btn { flex: 0 0 auto; min-height: 44px; margin: -6px 0; padding: 0 2px; font-size: 13px; }
 .kind-income .cost-calc { display: none; }
+/* v45：垫付后面的「件数×单价」小字 */
+.order-money .om-unit { font-style: normal; margin-left: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* v45：左右滑切页签时列表的轻入场（减少动态时关闭） */
+@keyframes lh-from-r { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+@keyframes lh-from-l { from { opacity: 0; transform: translateX(-18px); } to { opacity: 1; transform: none; } }
+#orderList.swipe-l { animation: lh-from-r .18s ease-out; }
+#orderList.swipe-r { animation: lh-from-l .18s ease-out; }
+@media (prefers-reduced-motion: reduce) { #orderList.swipe-l, #orderList.swipe-r { animation: none; } }
+/* v45：近期商品名最多 5 个、固定一行，放不下就左右滑（不换行、不把单价往下挤） */
+.recent-names { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; margin-right: -16px; padding-right: 16px; }
+.recent-names::-webkit-scrollbar { display: none; }
+.recent-names .rn, .recent-names .rn-label { flex: 0 0 auto; white-space: nowrap; }
+/* v45：记单表单标题行（标题 + 已暂存 + 记一笔收入） */
+.form-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; }
+.form-head h2 { margin: 0; }
+.form-head .form-saved { font-size: 12px; color: var(--muted); }
+.form-head .form-saved[hidden] { display: none; }
+.form-head #formKind.kind-link { margin: 0 0 0 auto; }
+/* v45：批次表头——展开时日期单号那行占满一行，按钮在下面一排靠右：报单 · 回款 · 改快递 */
+.batch-block:not(.collapsed) .bh-meta-row > .bh-meta { flex: 1 0 100%; }
+.batch-block:not(.collapsed) .bh-meta-row > [data-act="baodan"] { margin-left: auto; }
+.bh-meta .bh-bit { white-space: nowrap; }
+/* v45：先报单后回款——下一步那个按钮着色；另一个是白底次要按钮，只在展开后出现 */
+.bh-pay.bh-sec { background: var(--card); color: var(--accent); }
+.batch-block.collapsed .bh-pay.bh-sec { display: none; }
+.order-money .om-cost { white-space: nowrap; }
+.order-foot .order-money { min-width: 0; }
+.order-money .om-cost .om-unit { margin-left: 5px; font-size: 11px; letter-spacing: -.1px; }
+.order-foot .order-actions .act.primary { min-width: 56px; }
+.order-foot .order-actions .act { padding-left: 11px; padding-right: 11px; }
+/* v45：卡片按钮——次要动作是绿色文字，下一步是浅绿胶囊（btn1）；批次表头的次要按钮同款 */
+.order-foot .order-actions .act:not(.primary):not(.more-toggle) { border: 0; background: none; color: var(--accent); font-weight: 600; padding: 0 8px; }
+.order-foot .order-actions .act.primary { border-radius: 99px; border: 0; padding: 0 16px; font-weight: 700; }
+.bh-pay.bh-sec { border-color: transparent; background: none; }
+.batch-head .bh-meta-row > .bh-act[data-act="bship"], .batch-head .bh-meta-row > .bh-act[data-act="batchfee"], .batch-head .bh-meta-row > .bh-act[data-act="breset"] { border-color: transparent; background: none; color: var(--accent); font-weight: 600; }
+/* v45：寄出面板（新寄出）只留要填的两格：说明行与「清空」小按钮都不显示 */
+#shipModal.ship-new #shipTrackingHint, #shipModal.ship-new #shipFeeHint, #shipModal.ship-new .fld-clear { display: none; }
+#shipModal #shipDateToggle { margin: 2px 0 10px; }
+.order-foot .order-actions .act:not(.primary):not(.more-toggle) { min-width: 44px; }   /* v45：点击区 ≥44px（07.7） */
