@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=42">
+  <link rel="stylesheet" href="./styles.css?v=43">
 </head>
 <body>
   <header class="topbar">
@@ -223,6 +223,10 @@
         <!-- v41：数量挪到垫付旁边，带 −/＋ 步进（按钮排在 input 之后，保住 label 与 input 的关联） -->
         <label class="fld kind-order fld-qty">数量<input name="qty" type="number" inputmode="numeric" min="1" step="1" value="1"><span class="stepper"><button type="button" data-step="-1" aria-label="数量减一">−</button><button type="button" data-step="1" aria-label="数量加一">＋</button></span></label>
       </div>
+      <!-- v43：货单金额可以按「单价」填（新建默认），保存时 × 数量存成这一单的垫付合计；
+           costMode 是隐藏格（unit / total，草稿随表单一起存），#formCostCalc 实时写出合计或单价。 -->
+      <input type="hidden" name="costMode" value="total">
+      <p id="formCostCalc" class="cost-calc kind-order" hidden></p>
       <!-- v24：批内单的「邮费该在哪改」提示（一起寄的一批只有一笔邮费，统一改在批次上）。
            文案与显隐由 openForm 逐次决定；未成批的单不显示 -->
       <p id="formBatchHint" class="foot-note kind-order" hidden></p>
@@ -440,7 +444,7 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置 <small class="app-version">版本 <b id="appVersion">v42</b></small></h2>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v43</b></small></h2>
       <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
       <section class="set-card">
         <h3>两台设备同步</h3>
@@ -490,7 +494,7 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=42"></script>
-  <script src="./app.js?v=42"></script>
+  <script src="./sync.js?v=43"></script>
+  <script src="./app.js?v=43"></script>
 </body>
 </html>

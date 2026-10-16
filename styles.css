@@ -1222,3 +1222,9 @@ button.sync-badge:active { opacity: .7; }
   .sel-bar:not([hidden]), .set-fold[open] > :not(summary), .set-danger[open] > :not(summary), .fold-card[open] > :not(summary) { animation: none; }
 }
 #reportSummary p.rs-out { display: none; }
+/* v43：单价 × 数量的换算行（紧贴金额格下方，一行小字 + 切换链接） */
+.cost-calc { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: -4px 0 8px; font-size: 13px; color: var(--muted); }
+.cost-calc[hidden] { display: none; }
+.cost-calc b { color: var(--ink); font-weight: 700; }
+.cost-calc .link-btn { flex: 0 0 auto; min-height: 44px; margin: -6px 0; padding: 0 2px; font-size: 13px; }
+.kind-income .cost-calc { display: none; }

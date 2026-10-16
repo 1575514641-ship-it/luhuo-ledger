@@ -2794,10 +2794,53 @@
     f.fee.disabled = income || !!editingId;
     $$("#formKind .seg").forEach((b) =>
       b.classList.toggle("on", b.dataset.kind === formKind));
-    $("#formCostLabel").textContent = income ? "金额" : "垫付金额";
+    updateCostUi();
     $("#formChannelLabel").textContent = income ? "渠道" : "出掉渠道";
     f.goods.placeholder = income ? "这笔钱是什么？" : "卖什么？";
     updateFormMoreSummary();
+  }
+
+  // v43：金额那一格按「单价」还是「合计」填。新建货单默认单价（保存时 × 数量），编辑旧单默认合计
+  // （账本里存的一直是这一单的垫付合计，单价不落库）；数量 > 1 时下方一行写出换算并给一个切换链接。
+  // 收入单不涉及（没有数量）。costMode 为空串（旧草稿没有这一格）一律按合计理解，绝不把旧值再乘一遍。
+  function formQty(f) { return Math.max(1, Math.round(numberValue(f.qty.value)) || 1); }
+  function costIsUnit(f) { return formKind !== "income" && f.costMode.value === "unit"; }
+  function formCostTotal(f) {
+    const v = numberValue(f.cost.value);
+    return costIsUnit(f) ? Math.round(v * 100) * formQty(f) / 100 : v;
+  }
+  function updateCostUi() {
+    const f = $("#orderForm");
+    if (!f || !f.costMode) return;
+    const income = formKind === "income";
+    const unit = costIsUnit(f);
+    const qty = formQty(f);
+    $("#formCostLabel").textContent = income ? "金额" : unit ? "单价" : qty > 1 ? "垫付合计" : "垫付金额";
+    const calc = $("#formCostCalc");
+    if (!calc) return;
+    if (income || qty <= 1) { calc.hidden = true; calc.innerHTML = ""; return; }
+    const raw = String(f.cost.value || "").trim();
+    const cents = Math.round(numberValue(raw) * 100);
+    const text = unit
+      ? (raw ? `合计 <b>${money(cents * qty / 100)}</b>（${qty} × ${money(cents / 100)}）` : `按单价填，保存时 × ${qty} 件算合计`)
+      : (raw ? `${qty} 件合计，单价约 ${money(Math.round(cents / qty) / 100)}` : `这里填 ${qty} 件的合计`);
+    calc.innerHTML = `<span>${text}</span><button type="button" class="link-btn" id="formCostMode">${unit ? "改填合计" : "改填单价"}</button>`;
+    calc.hidden = false;
+  }
+  function toggleCostMode() {
+    const f = $("#orderForm");
+    const qty = formQty(f);
+    const raw = String(f.cost.value || "").trim();
+    const cents = Math.round(numberValue(raw) * 100);
+    if (costIsUnit(f)) {
+      f.costMode.value = "total";
+      if (raw) f.cost.value = String(cents * qty / 100);
+    } else {
+      f.costMode.value = "unit";
+      if (raw) f.cost.value = String(Math.round(cents / qty) / 100);
+    }
+    f.dispatchEvent(new Event("input", { bubbles: true }));   // 走草稿暂存
+    updateCostUi();
   }
 
   // 切类型：隐藏的字段**不清空**（切回来值还在），共有字段（名称/金额/日期/渠道/备注）保留。
@@ -2990,7 +3033,7 @@
   //   ⑦ 清理只在槽仍是本次 draftId+revision 时做（草稿 set/remove 与正式写共用同一把 Web Lock）。
   //   ⑧ 无 Web Locks 时**不承诺跨页持续草稿**：绝不静默覆盖已存在的槽；确认不了的旧草稿只标"待核对"。
   const DRAFT_KEY_PREFIX = "luhuo-new-order-draft-v1";
-  const DRAFT_FIELDS = ["goods", "cost", "fee", "date", "qty", "channel", "status", "note", "tracking"];
+  const DRAFT_FIELDS = ["goods", "cost", "fee", "date", "qty", "channel", "status", "note", "tracking", "costMode"];
   // 内存态：{ owner, draftId, revision, orderId, savedAt, status, savedFields, pendingCheck, conflict }
   let draftState = null;
   let draftTimer = null;
@@ -3351,6 +3394,8 @@
     nameAuto = false;
     channelTouched = true;                       // 回填的渠道算"已经定过"，切类型不该被默认值顶掉
     DRAFT_FIELDS.forEach((k) => { if (f[k] && fields[k] !== undefined) f[k].value = String(fields[k]); });
+    // v43：v42 及以前的草稿没有 costMode，那时金额格就是合计 —— 按合计恢复，不再乘数量
+    if (fields.costMode !== "unit" && fields.costMode !== "total") f.costMode.value = "total";
     if (f.status && !STATUSES.includes(f.status.value)) fillSelect(f.status, STATUSES.map((s) => [s, statusLabel(s)]), "在途");
     const chVal = String(f.channel.value || "");
     const chOpts = CHANNELS.slice();
@@ -3595,6 +3640,7 @@
     prefillPlatform = "";
     f.goods.value = "";
     f.cost.value = "";                  // 全新一单：金额从空开始（**绝不复用上一笔的价**）
+    f.costMode.value = "unit";          // v43：新建货单按单价填
     f.fee.value = "";
     f.tracking.value = "";              // 单号必然不同，空着比填错强
     f.note.value = "";
@@ -3660,6 +3706,15 @@
     // 的原生校验拦死（点保存像没反应）；而收入单的 cost 恒为 0，这条编辑路径天天要走。
     f.cost.value = src ? numberValue(src.cost) : "";
     f.qty.value = src ? src.qty : 1;
+    // v43：编辑旧单按合计回显（账本存的就是合计）；新建按单价；「再来一单」能整除才换成单价，
+    // 除不尽（如 200 元 3 件）就按合计带过来，免得 66.67 × 3 = 200.01 凭空多出一分。
+    f.costMode.value = order ? "total" : "unit";
+    if (!order && src) {
+      const q = Math.max(1, Math.round(numberValue(src.qty)) || 1);
+      const c = Math.round(numberValue(src.cost) * 100);
+      if (q > 1 && c % q === 0) f.cost.value = String(c / q / 100);
+      else if (q > 1) f.costMode.value = "total";
+    }
     f.date.value = order ? order.date : todayStr();     // 预填/新建一律用今天
     // v33：渠道下拉照**状态下拉那一套既有做法**——打开表单时把这一单自己的渠道补进选项。
     // 旧写法只写 `f.channel.value = src.channel`：渠道不在 CHANNELS 六项里时（比如一份手写备份或者
@@ -3894,7 +3949,7 @@
     // 03 期：只有「新建货单」这条路可能要求连续录入（收入单/编辑都不给那个入口，这里再兜一道）
     const wantChain = !!chain && !editingAtSubmit && !isIncome;
 
-    const cost = numberValue(f.cost.value);
+    const cost = formCostTotal(f);       // v43：按单价填时 × 数量（整数分相乘）
     if (cost < 0) { toast("垫付金额不能是负数"); return; }
     // v38（报告 B2）：编辑会话先对表再往下走 —— 三条失效路各说各的话，**都在任何写入之前**：
     //   ① 原单已不在账本里（被别的入口删掉）：**必须拒绝**，绝不能落进下面那条「新建」分支
@@ -6012,6 +6067,8 @@
     // 任何一格的输入/选择变动都尝试暂存（防抖 400ms）。**只在新单这条路上生效**（draftSchedule 自己判），
     // 编辑既有单完全不碰草稿。
     $("#orderForm").addEventListener("input", () => { if (!editingId) draftSchedule(); });
+    $("#orderForm").addEventListener("input", (e) => { if (e.target && (e.target.name === "cost" || e.target.name === "qty")) updateCostUi(); });
+    $("#formCostCalc").addEventListener("click", (e) => { if (e.target.closest("#formCostMode")) toggleCostMode(); });
     $("#orderForm").addEventListener("change", () => { if (!editingId) draftSchedule(); });
     // ---- 03 期：连续录入与历史商品名建议 ----
     $("#formSaveNext").addEventListener("click", submitFormNext);
