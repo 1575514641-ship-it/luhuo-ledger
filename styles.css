@@ -142,16 +142,7 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .kpi-value.neg { color: var(--loss); }
 
 /* ---- 行 ---- */
-.status-row, .month-row, .prod-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px;
-}
-.status-wrap { display: flex; align-items: center; gap: 14px; }
-.status-wrap > div:first-child { flex: 0 0 auto; }
-.status-rows { flex: 1; min-width: 0; }
-.status-row:first-child, .month-row:first-child, .prod-row:first-child { border-top: 0; }
-.status-nums em, .prod-nums { font-style: normal; font-weight: 600; font-variant-numeric: tabular-nums; }
-.status-nums i { font-style: normal; color: var(--muted); font-size: 12px; margin-left: 6px; }
+/* v46：「更多统计」删除后，订单状态 / 近 6 个月 / 商品榜那几种行的样式一并删掉；状态标签仍给卡片用 */
 .status-tag {
   display: inline-flex; align-items: center; gap: 5px;
   font-size: 11px; padding: 3px 9px; border-radius: 99px; font-weight: 500;
@@ -160,20 +151,6 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .st-out { background: var(--warn-soft); color: var(--warn); }
 .st-done { background: var(--accent-soft); color: var(--accent); }
 .st-loss { background: var(--neg-soft); color: var(--neg); }
-.month-row { gap: 8px; }
-.month-name { font-weight: 600; width: 62px; font-variant-numeric: tabular-nums; }
-/* v33：与上面 `.kpi-value` 同一处根因——`.month-cell` 是 flex item（`flex:1` = basis 0%），
-   但默认 min-width:auto 时它的**最小尺寸＝那行不换行数字的 min-content**，近亿元金额下
-   三格一起把这一行顶出卡片、末格（「差」那一列）被 body{overflow-x:clip} 裁掉（390px 实测
-   10.8px）。min-width:0 允许压缩；overflow-wrap:anywhere 同时把 min-content 压到一个字宽
-   （break-word 不会），于是极长金额在格内折行、四位五位数这类正常金额一行放得下、排版不变。 */
-.month-cell { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
-.month-cell.pos { color: var(--gain); font-weight: 600; }
-.month-cell.neg { color: var(--loss); font-weight: 600; }
-/* v38：看板「近 6 个月」最右一列原来**没有列名**（只有卡片脚注在讲它是什么，而脚注在卡片底部）。
-   补一个短标识「差」，走更小字号 + 弱色、紧贴数字。字号 10px 是刻意的：这一列在三档窄屏上已经被
-   ¥100,001,999.99 这类极端金额顶到过边（v33 修过一次裁切），标识不能把那一列的可用宽度再吃掉一截。 */
-.month-cell .mc-tag { font-style: normal; font-size: 10px; color: var(--muted); margin-right: 2px; }
 .empty-mini { color: var(--muted); font-size: 13px; padding: 6px 0; text-align: center; }
 
 /* ---- 账本 ---- */
@@ -657,87 +634,6 @@ main { max-width: 560px; margin: 0 auto; padding: 14px 14px 20px; }
 .summary b.pos { color: var(--gain); }
 .summary b.neg { color: var(--loss); }
 
-.legend { font-weight: 400; font-size: 11px; }
-.lg-dot {
-  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-  margin-right: 3px; vertical-align: -1px;
-}
-/* 手写 SVG 图：默认 overflow:hidden 会把贴着画布边缘的刻度文字与数据点裁掉
-   （年视图首尾那两颗 r=2.6 的圆点、以及「4月/9月」这类边缘标签各被切掉约 2px，v22 由横向裁切探测发现）。
-   画布外的这一点点（≤3px）落在 .card 的内边距里，放开裁切即可，观感不变。
-   注意看板页的走势图容器是 #dashFlow、报表页是 #chartFlow，两张图用的是同一个渲染函数。 */
-#chartFlow svg, #chartProfit svg, #dashFlow svg { display: block; overflow: visible; }
-
-.donut-wrap { display: flex; align-items: center; gap: 16px; }
-.donut-wrap svg { flex: 0 0 auto; }
-.donut-legend { flex: 1; min-width: 0; }
-.donut-legend-row {
-  display: flex; align-items: center; gap: 6px;
-  padding: 5px 0; border-top: 1px solid var(--line); font-size: 12px;
-}
-.donut-legend-row:first-child { border-top: 0; }
-.dl-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dl-val { color: var(--muted); font-variant-numeric: tabular-nums; }
-
-/* 邮费统计：整批一起寄的合并成一行 */
-.fee-total {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
-  padding-bottom: 9px; border-bottom: 1px solid var(--line);
-  font-size: 12px; color: var(--muted); letter-spacing: .04em;
-}
-.fee-total b { font-size: 19px; color: var(--ink); font-variant-numeric: tabular-nums; }
-.fee-row { padding: 9px 0; border-top: 1px solid var(--line); }
-.fee-total + .fee-row { border-top: 0; }
-.fee-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 13px; }
-.fee-name { font-weight: 600; flex: 0 0 auto; }
-.fee-nums { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
-.fee-names { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.5; word-break: break-word; }
-
-/* v33：商品榜左边多了「回款」两个字，行宽更紧——名称与「回款 N 单 ¥X」在不足时分行，
-   比例条仍独占下一行；数字不省略、也不靠缩到难读的字号容纳。 */
-.prod-line {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 4px 8px;
-  flex-wrap: wrap;
-}
-.prod-line > .prod-name {
-  flex: 1 1 120px;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.prod-line > .prod-nums {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-  margin-left: auto;
-  text-align: right;
-  overflow-wrap: anywhere;
-}
-/* 商品榜每行＝「名字/单数/利润」一行 + 下面一条满宽比例条。
-   注意 .prod-row 在共享规则里是 display:flex（和 .status-row/.month-row 写在一起），
-   那样 .prod-bar-track 就成了同一行的 flex 项、被内容挤成 1–3px 宽——比例条等于没画
-   （v22 由横向裁切探测发现：track 3px、bar 3px，5 行全一样）。这里改回 block，
-   比例条回到行下方、占满整行宽度。 */
-.prod-row { display: block; padding: 8px 0; border-top: 1px solid var(--line); }
-.prod-name { font-weight: 500; }
-.pending-tag {
-  font-style: normal; font-size: 10px; color: var(--warn); background: var(--warn-soft);
-  padding: 1px 6px; border-radius: 99px; margin-left: 4px;
-}
-.prod-nums { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.prod-nums b { font-size: 13px; margin-left: 4px; }
-.prod-nums b.pos { color: var(--gain); }
-.prod-nums b.neg { color: var(--loss); }
-.prod-row:first-child { border-top: 0; }
-.prod-bar-track {
-  height: 6px; background: var(--bg); border-radius: 99px; overflow: hidden;
-  margin-top: 6px; display: block;
-}
-.prod-bar { display: block; height: 100%; border-radius: 99px; min-width: 3px; }
-.prod-bar.pos { background: var(--gain); opacity: .85; }
-.prod-bar.neg { background: var(--loss); opacity: .85; }
 .empty-mini { color: var(--muted); font-size: 13px; padding: 6px 0; text-align: center; }
 
 /* ---- toast ---- */
@@ -982,12 +878,6 @@ body.has-sel #fab { display: none; }
 body.has-sel main { padding-bottom: 80px; }
 
 /* 统计页：#view-dash（总览）与 #view-report 同时显示 */
-.fold-card > summary { cursor: pointer; font-weight: 600; font-size: 14px; list-style: none; min-height: 28px; display: flex; align-items: center; }
-.fold-card > summary::-webkit-details-marker { display: none; }
-.fold-card > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .15s; }
-.fold-card[open] > summary::after { transform: rotate(180deg); }
-.fold-card .fold-body { margin-top: 10px; }
-.fold-card .fold-body h2 { margin-top: 14px; }
 /* ⓘ 口径说明：默认收起，点开才显示 */
 .info-note { margin-top: 6px; }
 .info-note > summary { cursor: pointer; font-size: 11px; color: var(--muted); list-style: none; display: inline-block; padding: 4px 0; }
@@ -1078,17 +968,6 @@ main { padding: 10px 12px 18px; }
 .mp-bar.on .mp-lab { fill: var(--ink); font-weight: 700; }
 .mp-val { font-size: 9.5px; font-weight: 700; fill: var(--ink); }
 .mp-zero { stroke: var(--line); stroke-width: 1; }
-/* v41：更多统计折叠块 */
-.rep-more { margin-bottom: 9px; }
-.rep-more > summary {
-  list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 6px;
-  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 12px 13px; min-height: 44px; font-weight: 600; font-size: 14px; margin-bottom: 9px;
-}
-.rep-more > summary::-webkit-details-marker { display: none; }
-.rep-more > summary small { font-weight: 400; font-size: 11px; color: var(--muted); }
-.rep-more > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .15s; }
-.rep-more[open] > summary::after { transform: rotate(180deg); }
 /* v42：卡片上的回报率（利润 ÷ 垫付） */
 .order-roi { display: block; font-style: normal; font-size: 10.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
 
@@ -1164,10 +1043,6 @@ button.sync-badge:active { opacity: .7; }
 /* ================= v42 收尾：去重复、更轻 ================= */
 /* 统计页：总览只留英雄卡（累计数字并进一行）；四格 KPI 与月报重复，不再显示 */
 #view-dash .kpi-grid { display: none; }
-.hero-totals { font-size: 11.5px; color: var(--hero-label); margin-top: 6px; padding-top: 7px; border-top: 1px solid var(--hero-line); font-variant-numeric: tabular-nums; }
-.hero-totals b { color: var(--hero-ink); font-weight: 700; }
-.hero-totals b.pos { color: var(--gain); }
-.hero-totals b.neg { color: var(--loss); }
 /* 月报：四格数字一行排开；总结句只留「在途 / 比上一期」，第一句与四格重复 */
 #reportKpis { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
 #reportKpis .kpi { padding: 9px 8px; }
@@ -1175,9 +1050,6 @@ button.sync-badge:active { opacity: .7; }
 #reportKpis .kpi-value { font-size: 14px; }
 #view-report { display: none; }
 #view-report.active { display: flex; flex-direction: column; }
-#view-report > #reportKpis { order: 2; }
-#view-report > #reportSummary { order: 3; }
-#view-report > :not(#reportKpis):not(#reportSummary):not(.rep-head) { order: 4; }
 #reportSummary { background: none; border: 0; box-shadow: none; padding: 0 2px 4px; font-size: 12px; color: var(--muted); }
 #reportSummary p:first-child { display: none; }
 #reportSummary p { margin: 0 0 2px; }
@@ -1215,11 +1087,11 @@ button.sync-badge:active { opacity: .7; }
 .order-card .order-more:not([hidden]) { animation: lh-rise .18s ease-out; }
 .batch-block.just-opened .order-card, .batch-block.just-opened .bh-note { animation: lh-rise .2s ease-out; }
 .sel-bar:not([hidden]) { animation: lh-up .22s cubic-bezier(.2, .8, .2, 1); }
-.set-fold[open] > :not(summary), .set-danger[open] > :not(summary), .fold-card[open] > :not(summary) { animation: lh-rise .18s ease-out; }
+.set-fold[open] > :not(summary), .set-danger[open] > :not(summary) { animation: lh-rise .18s ease-out; }
 .order-actions .more-toggle svg { display: block; margin: auto; }
 @media (prefers-reduced-motion: reduce) {
   .order-card .order-more:not([hidden]), .batch-block.just-opened .order-card, .batch-block.just-opened .bh-note,
-  .sel-bar:not([hidden]), .set-fold[open] > :not(summary), .set-danger[open] > :not(summary), .fold-card[open] > :not(summary) { animation: none; }
+  .sel-bar:not([hidden]), .set-fold[open] > :not(summary), .set-danger[open] > :not(summary) { animation: none; }
 }
 #reportSummary p.rs-out { display: none; }
 /* v43：单价 × 数量的换算行（紧贴金额格下方，一行小字 + 切换链接） */
@@ -1266,3 +1138,57 @@ button.sync-badge:active { opacity: .7; }
 #shipModal.ship-new #shipTrackingHint, #shipModal.ship-new #shipFeeHint, #shipModal.ship-new .fld-clear { display: none; }
 #shipModal #shipDateToggle { margin: 2px 0 10px; }
 .order-foot .order-actions .act:not(.primary):not(.more-toggle) { min-width: 44px; }   /* v45：点击区 ≥44px（07.7） */
+
+/* ================= v46 ================= */
+/* A：列表底部留白——滚到底时最后一张卡片（含展开的整批）的按钮都在悬浮按钮上沿之上。
+   悬浮按钮上沿离视口底 ≈ 86 + 48 = 134px，body 已留 84px，这里再补 72px（合计 156px，余 22px）。 */
+#view-list { padding-bottom: 72px; }
+/* A：往下滚时「＋ 记一单」收成圆形「＋」，往上滚或停下后恢复（位置不变，点击区 48px ≥ 44px） */
+.fab-text { display: inline-block; max-width: 4em; overflow: hidden; white-space: nowrap; transition: max-width .18s ease, opacity .18s ease; }
+#fab { transition: transform .15s, padding .18s ease, gap .18s ease; }
+#fab.mini { padding: 0; width: 48px; height: 48px; justify-content: center; gap: 0; }
+#fab.mini .fab-text { max-width: 0; opacity: 0; }
+@media (prefers-reduced-motion: reduce) { .fab-text, #fab { transition: none; } }
+
+/* C：设置图标上的备份提醒小圆点 */
+#settingsBtn { position: relative; }
+.set-dot { position: absolute; top: 5px; right: 5px; width: 8px; height: 8px; border-radius: 50%; background: var(--neg); box-shadow: 0 0 0 2px var(--card); }
+.set-dot[hidden] { display: none; }
+
+/* D：整批展开后，子单收进整批卡片里一行一单（收起态与表头不变） */
+.batch-block:not(.collapsed) {
+  background: var(--card); border: 1px solid var(--hero-line); border-radius: 14px;
+  margin-bottom: 9px;   /* 不设 overflow:hidden：圆角交给表头自己，免得子行真溢出时被悄悄裁掉、版面探测看不见 */
+}
+.batch-block:not(.collapsed) > .batch-head { border: 0; border-radius: 13px 13px 0 0; margin-bottom: 0; }
+.order-card.bm-row {
+  border: 0; border-left: 0; border-radius: 0; box-shadow: none; margin: 0;
+  padding: 0 12px; border-top: 1px solid var(--line); background: none;
+}
+.bm-line { display: flex; align-items: center; gap: 8px; min-height: 48px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.bm-line .order-name { flex: 1 1 auto; min-width: 0; font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-line .bm-unit { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.bm-line .bm-cost { flex: 0 0 auto; color: var(--muted); white-space: nowrap; }
+.bm-line .bm-cost b { color: var(--ink); font-weight: 600; }
+.bm-line .more-toggle { flex: 0 0 auto; min-width: 44px; padding: 0; border: 0; background: none; color: var(--muted); }
+.bm-row .order-more { margin-top: 0; padding: 8px 0 10px; }
+.bm-row .bm-detail { flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; color: var(--muted); }
+.bm-row .bm-detail .order-profit { display: inline-flex; align-items: baseline; gap: 4px; }
+.bm-row .bm-detail .order-roi { display: inline; }
+.bm-row .bm-detail b.pos { color: var(--gain); }
+.bm-row .bm-detail b.neg { color: var(--loss); }
+
+/* E：待回款卡片日期行末尾的「· 已等 N 天」（灰字，不随天数变色） */
+.wait-days { color: var(--muted); white-space: nowrap; }
+
+/* F：统计页一张卡——周期切换 → 柱状图 → 四个指标 →「比上一期」→「近 12 个月合计」 */
+.stat-card .rep-head { padding-bottom: 6px; }
+.mp-cap { margin: 4px 0 4px; font-size: 13px; font-weight: 600; color: var(--ink); }
+.mp-cap small { font-weight: 400; font-size: 11px; color: var(--muted); margin-left: 4px; }
+.stat-card #reportKpis { margin: 10px 0 6px; }
+.stat-card #reportKpis .kpi { background: var(--bg); border: 0; box-shadow: none; }
+.stat-card #reportSummary { padding: 0 2px; margin: 0; }
+.stat-card .mp-summary { margin: 4px 2px 0; }
+
+/* G：「沿用渠道」挪进「更多」后紧贴渠道那一格 */
+.more-body .keep-channel { margin: -2px 0 10px; min-height: 44px; }

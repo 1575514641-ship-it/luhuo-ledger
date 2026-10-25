@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=45">
+  <link rel="stylesheet" href="./styles.css?v=46">
 </head>
 <body>
   <header class="topbar">
@@ -21,8 +21,10 @@
       <h1>撸货记账</h1>
       <!-- v42：同步状态可点＝立即和云端核对一次 --><button type="button" id="syncStatus" class="sync-badge offline" aria-label="立即同步">本地</button>
     </div>
+    <!-- v46：备份提醒——云同步与导出都超过 7 天（或从未）时右上角一个小圆点（#settingsDot），不弹窗 -->
     <button id="settingsBtn" class="icon-btn" aria-label="设置">
       <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span id="settingsDot" class="set-dot" hidden></span>
     </button>
   </header>
 
@@ -37,14 +39,12 @@
     </div>
     <!-- v41：看板与报表合成底部的「统计」一页。#view-dash 只剩总览（英雄卡 + 四格 KPI），
          它与 #view-report 一起显示（switchView("report") 同时点亮两段；"dash" 是 "report" 的别名）。
-         原看板的「订单状态」「近 6 个月」两张卡与报表走势重复，收进报表页底部的折叠块 #dashMore。 -->
+         v46：「更多统计」整块（含「订单状态 · 近 6 个月」）删除；每月利润图并进下面 #view-report 的那一张卡。 -->
     <section id="view-dash" class="view">
       <div class="hero card">
         <span class="hero-label">垫付在外</span>
         <span id="kpiOutstanding" class="hero-value">¥0</span>
         <span id="kpiOutstandingHint" class="hero-hint">还没结算回来的钱</span>
-        <!-- v42：累计数字并进英雄卡一行，下面四格 KPI 不再单独占两行（DOM 保留、只是不显示） -->
-        <span id="heroTotals" class="hero-totals"></span>
       </div>
       <div class="kpi-grid">
         <div class="kpi card">
@@ -65,13 +65,6 @@
           <span class="kpi-label">累计垫付 / 回款</span>
           <span id="kpiTotal" class="kpi-value small">¥0 / ¥0</span>
         </div>
-      </div>
-
-      <!-- v41：每月利润——近 12 个月按回款月份的净盈亏（与下方月报同一口径 reportStats），点柱子切到那个月的月报 -->
-      <div class="card mp-card">
-        <h2>每月利润 <small>按回款月份 · 已扣垫付和邮费</small></h2>
-        <div id="mpSummary" class="mp-summary"></div>
-        <div id="monthProfit" class="mp-chart"></div>
       </div>
     </section>
 
@@ -124,66 +117,34 @@
     </section>
 
     <!-- 报表 -->
+    <!-- v46：一张卡＝周期切换 → 每月利润柱状图（近 12 个月，按回款月份）→ 四个指标 →「比上一期…」→「近 12 个月合计 · 回报率」。
+         点柱子跳到那个月；季 / 年模式下跳到包含该月的季度 / 年份（模式不变）。口径与 v45 一字未改（reportStats）。 -->
     <section id="view-report" class="view">
-      <div class="card rep-head">
-        <div id="repModes" class="segment">
-          <button class="seg on" data-mode="month">月</button>
-          <button class="seg" data-mode="quarter">季</button>
-          <button class="seg" data-mode="year">年</button>
-        </div>
-        <div class="rep-nav">
-          <button id="repPrev" class="nav-btn" aria-label="上一期">‹</button>
-          <span id="repLabel" class="rep-label">-</span>
-          <button id="repNext" class="nav-btn" aria-label="下一期">›</button>
-        </div>
-      </div>
-      <div id="reportSummary" class="card summary"></div>
-      <div id="reportKpis" class="kpi-grid"></div>
-      <!-- v41：现金流 / 净盈亏分布 / 邮费 / 盈利商品 / 商品榜 / 订单状态与近 6 个月——都收进「更多统计」（默认收起，内容与口径一字未改） -->
-      <details id="repMore" class="rep-more">
-        <summary>更多统计 <small>现金流 · 邮费 · 商品 · 订单状态</small></summary>
-      <div class="card">
-        <h2>现金流走势 <span class="legend" id="flowLegend"></span></h2>
-        <div id="chartFlow"></div>
-      </div>
-      <div class="card">
-        <h2>净盈亏分布 <span class="legend" id="profitLegend"></span></h2>
-        <div id="chartProfit"></div>
-      </div>
-      <div class="card">
-        <h2>邮费统计 <small>整批一起寄的合并看</small></h2>
-        <div id="reportFees"></div>
-      </div>
-      <div class="card">
-        <h2>盈利商品占比 <small>按回款日期</small></h2>
-        <div id="chartDonut"></div>
-        <details class="info-note"><summary aria-label="口径说明">ⓘ 口径</summary><p class="foot-note">仅展示本期回款中合计利润为正的商品，未扣除亏损商品；盈利合计不等于净盈亏。</p></details>
-      </div>
-      <div class="card">
-        <h2>商品榜 <small>本期回款 · 利润 Top 5</small></h2>
-        <div id="reportProducts"></div>
-        <details class="info-note"><summary aria-label="口径说明">ⓘ 口径</summary><p class="foot-note">按回款日期归期，利润已扣垫付和邮费；单数是本期有回款记录的单数，零元回款也计入。</p></details>
-      </div>
-      <details id="dashMore" class="card fold-card">
-        <summary>订单状态 · 近 6 个月</summary>
-        <div class="fold-body">
-          <h2>订单状态 <small>垫付占比</small></h2>
-          <div class="status-wrap">
-            <div id="statusDonut"></div>
-            <div id="statusList" class="status-rows"></div>
+      <div class="card stat-card">
+        <div class="rep-head">
+          <div id="repModes" class="segment">
+            <button class="seg on" data-mode="month">月</button>
+            <button class="seg" data-mode="quarter">季</button>
+            <button class="seg" data-mode="year">年</button>
           </div>
-          <h2>近 6 个月 <span class="legend" id="dashFlowLegend"></span></h2>
-          <div id="dashFlow"></div>
-          <div id="monthList"></div>
-          <p class="foot-note">最右一列＝本月回款－本月垫付；正数表示收回的更多。未扣邮费，不等于利润。</p>
+          <div class="rep-nav">
+            <button id="repPrev" class="nav-btn" aria-label="上一期">‹</button>
+            <span id="repLabel" class="rep-label">-</span>
+            <button id="repNext" class="nav-btn" aria-label="下一期">›</button>
+          </div>
         </div>
-      </details>
-      </details>
-      <details class="info-note center"><summary aria-label="统计口径">ⓘ 统计口径</summary><p class="foot-note center">口径：单数和垫付按下单日期；回款、利润和商品榜按回款日期；邮费成批按批次日期、单寄按下单日期。</p></details>
+        <p class="mp-cap">每月利润 <small>按回款月份 · 已扣垫付和邮费</small></p>
+        <div id="monthProfit" class="mp-chart"></div>
+        <div id="reportKpis" class="kpi-grid"></div>
+        <div id="reportSummary" class="summary"></div>
+        <div id="mpSummary" class="mp-summary"></div>
+      </div>
+      <details class="info-note center"><summary aria-label="统计口径">ⓘ 统计口径</summary><p class="foot-note center">口径：单数和垫付按下单日期；回款和利润按回款日期。</p></details>
     </section>
   </main>
 
-  <button id="fab" aria-label="记一单"><span class="fab-plus">＋</span>记一单</button>
+  <!-- v46：往下滚时收成圆形「＋」（.mini），往上滚或停下后恢复；aria-label 始终是「记一单」 -->
+  <button id="fab" aria-label="记一单"><span class="fab-plus">＋</span><span class="fab-text">记一单</span></button>
 
   <!-- v41：底部只剩「账本 / 统计」两个页签（看板并进统计页顶部，见 #view-dash 的说明） -->
   <nav class="tabbar">
@@ -263,6 +224,8 @@
         <summary id="formMoreSummary">更多（渠道：收货商）</summary>
         <div class="more-body">
           <label class="fld" id="formChannelField"><span id="formChannelLabel">出掉渠道</span><select name="channel"></select></label>
+          <!-- v46：「沿用渠道」从主按钮下面挪到渠道旁边（控件、id 与行为不变，只在新建货单时出现） -->
+          <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">沿用渠道</label>
           <!-- v41：新建一律在途，状态只在编辑时出现 -->
           <label class="fld fld-status">状态<select name="status"></select></label>
         </div>
@@ -275,10 +238,9 @@
         <button type="button" id="formCancel" class="btn ghost">取消</button>
         <button type="submit" class="btn primary">保存</button>
       </div>
-      <!-- v42：「保存并继续」降为主按钮下面的一行轻链接；「下一单沿用这个渠道」跟它放在一起（只在新建货单时出现） -->
+      <!-- v42：「保存并继续」降为主按钮下面的一行轻链接（只在新建货单时出现）；v46：「沿用渠道」挪进了「更多」 -->
       <div class="chain-row">
         <button type="button" id="formSaveNext" class="link-btn" hidden>保存，再记一单 ›</button>
-        <label class="keep-channel" id="formKeepChannelWrap" hidden><input type="checkbox" id="formKeepChannel">沿用渠道</label>
       </div>
     </form>
   </div>
@@ -450,7 +412,7 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置 <small class="app-version">版本 <b id="appVersion">v45</b></small></h2>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v46</b></small></h2>
       <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
       <section class="set-card">
         <h3>两台设备同步</h3>
@@ -474,6 +436,9 @@
       </section>
       <section class="set-card">
         <h3>备份与导出</h3>
+        <!-- v46：备份提醒。导出时间只记在独立键 luhuo-backup-hint-v1（不进账本、不进同步包） -->
+        <p class="set-line">上次云同步成功：<span id="backupSyncAgo">从未</span></p>
+        <p class="set-line">上次导出：<span id="backupExportAgo">从未</span></p>
         <button type="button" id="exportCsvBtn" class="btn">导出表格（Excel 可打开）</button>
         <div class="row2">
           <button type="button" id="exportBtn" class="btn">导出 JSON 备份</button>
@@ -500,7 +465,7 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=45"></script>
-  <script src="./app.js?v=45"></script>
+  <script src="./sync.js?v=46"></script>
+  <script src="./app.js?v=46"></script>
 </body>
 </html>

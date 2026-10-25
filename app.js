@@ -52,6 +52,9 @@
   const SYNC_BASE_KEY = "luhuo-ledger-sync-base-v1";
   const RECOVERY_KEY = "luhuo-ledger-recovery-v1";
   const IDENTITY_KEY = "luhuo-sync-identity-v1";
+  // v46：备份提醒用的**独立**键——只记「上次导出 JSON 备份」的时刻 { lastExportAt }。不属账本、不进同步包，
+  // 也不在写入边界 / 存储事件盯着的那几个键里；读坏了、写不进去都只当「从未」，绝不影响记账。
+  const BACKUP_HINT_KEY = "luhuo-backup-hint-v1";
 
   // v21 起「自留」退出模型：能创建的状态只有在途/已回款（货自己留着用就不算生意，用户宁可删单）。
   // 但旧账本里已经存在的「自留」（含更老的「翻车自留」）**原样保留、绝不静默改写**：
@@ -740,22 +743,11 @@
   // 展示/汇总用的状态集合 = 现役两态 + 数据里实际出现的遗留态（旧「自留」）。
   // 必须带上遗留态，否则那些单子的垫付既不进环形图也不进状态行，
   // 「垫付合计」就会大于各状态之和、占比凑不满 100%。
-  function statusKeys() {
-    const keys = STATUSES.slice();
-    LEGACY_STATUSES.forEach((s) => {
-      if (data.orders.some((o) => o.status === s) && !keys.includes(s)) keys.push(s);
-    });
-    return keys;
-  }
-
   function computeStats() {
     const orders = data.orders;
     let totalCost = 0, totalIncome = 0, outstanding = 0, outCount = 0, settledProfit = 0;
     let monthCost = 0, monthIncome = 0;
     const cm = currentMonth();
-    const keys = statusKeys();
-    const byStatus = {}; keys.forEach((s) => { byStatus[s] = { count: 0, cost: 0 }; });
-    const byMonth = {};
 
     orders.forEach((o) => {
       totalCost += o.cost;
@@ -764,31 +756,10 @@
       else settledProfit += orderProfit(o);
       if (monthStr(o.date) === cm) monthCost += o.cost;
       if (o.incomeDate && hasIncome(o) && monthStr(o.incomeDate) === cm) monthIncome += o.income;
-      if (byStatus[o.status]) {
-        byStatus[o.status].count += 1;
-        byStatus[o.status].cost += o.cost;
-      }
-      const m = monthStr(o.date);
-      byMonth[m] = byMonth[m] || { cost: 0, income: 0 };
-      byMonth[m].cost += o.cost;
-      if (hasIncome(o)) {
-        // 归期按回款日期；没有回款日期时落在 "" 这格（近 6 个月列表里没有它 → 只进总收入、不进某个月）
-        const mi = monthStr(o.incomeDate);
-        byMonth[mi] = byMonth[mi] || { cost: 0, income: 0 };
-        byMonth[mi].income += o.income;
-      }
     });
-
-    const months = [];
-    const now = new Date();
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
-      const row = byMonth[key] || { cost: 0, income: 0 };
-      months.push({ month: key, cost: row.cost, income: row.income, diff: row.income - row.cost });
-    }
+    // v46：「订单状态 · 近 6 个月」随「更多统计」删除，按状态 / 按月的汇总（byStatus / months）一并删掉
     settledProfit = displayedAmount(settledProfit);
-    return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, byStatus, statusKeys: keys, months, count: orders.length };
+    return { totalCost, totalIncome, outstanding, outCount, settledProfit, monthCost, monthIncome, count: orders.length };
   }
 
   // ---- 批次（一起寄出的一批单子）----
@@ -1042,7 +1013,43 @@
     renderLedgerNotice();
   }
 
+  // ---- v46：备份提醒（设置页两行 + 设置图标小圆点）----
+  // 「上次云同步成功」沿用 meta.lastSyncedAt（syncToCloud 成功时写的「YYYY-MM-DD HH:MM」，UTC）；
+  // 「上次导出」读 BACKUP_HINT_KEY。天数按本机日历日算。两样都超过 7 天（或都从未有过）才亮小圆点，不弹窗。
+  function daysSince(date) {
+    if (!(date instanceof Date) || isNaN(date)) return null;
+    const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const now = new Date();
+    const b = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return Math.max(0, Math.round((b - a) / 86400000));
+  }
+  function lastSyncDays() {
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(String(meta.lastSyncedAt || ""));
+    return m ? daysSince(new Date(`${m[1]}T${m[2]}:00Z`)) : null;
+  }
+  function lastExportDays() {
+    try {
+      const v = JSON.parse(localStorage.getItem(BACKUP_HINT_KEY) || "null");
+      return v && typeof v.lastExportAt === "string" ? daysSince(new Date(v.lastExportAt)) : null;
+    } catch { return null; }
+  }
+  function recordExport() {
+    try { localStorage.setItem(BACKUP_HINT_KEY, JSON.stringify({ lastExportAt: new Date().toISOString() })); }
+    catch { /* 记不下来只影响提醒，不影响导出本身 */ }
+    renderBackupHint();
+  }
+  function renderBackupHint() {
+    const ago = (n) => (n === null ? "从未" : n === 0 ? "今天" : `${n} 天前`);
+    const stale = (n) => n === null || n > 7;
+    const sync = lastSyncDays(), exp = lastExportDays();
+    const a = $("#backupSyncAgo"), b = $("#backupExportAgo"), dot = $("#settingsDot");
+    if (a) a.textContent = ago(sync);
+    if (b) b.textContent = ago(exp);
+    if (dot) dot.hidden = !(stale(sync) && stale(exp));
+  }
+
   function renderSyncBadge() {
+    renderBackupHint();
     if (!window.luhuoSync) return;
     if (localIssue || syncBlocked || ledgerProblem(data)) {
       window.luhuoSync.setStatus("error", localIssue || syncBlocked || ledgerProblem(data));
@@ -1075,42 +1082,7 @@
     $("#kpiMonthFee").textContent = `本月邮费 ${money(monthFee.totalCents / 100)}`;
     $("#kpiMonthIncome").textContent = money(s.monthIncome);
     $("#kpiTotal").textContent = `${money(s.totalCost)} / ${money(s.totalIncome)}`;
-    const ht = $("#heroTotals");
-    if (ht) ht.innerHTML = `累计净赚 <b class="${s.settledProfit > 0 ? "pos" : s.settledProfit < 0 ? "neg" : ""}">${money(s.settledProfit)}</b>`
-      + ` · 累计垫付 ${money(s.totalCost)} · 回款 ${money(s.totalIncome)}`;
-
-    // 订单状态：垫付占比小环形 + 三态行
-    // 环形图 + 状态行都按 statusKeys（现役两态 + 数据里真有的遗留态），
-    // 这样各块垫付之和恒等于分母「垫付合计」，占比加起来正好 100%
-    const stColors = { "在途": "#7d8fa1", "已回款": "#14b8a6", "自留": "#c0724f" };
-    const donutItems = s.statusKeys.map((st) => ({ name: st, value: s.byStatus[st].cost })).filter((x) => x.value > 0);
-    $("#statusDonut").innerHTML = s.totalCost > 0
-      ? chartDonutSVG(donutItems, s.totalCost, "垫付合计", donutItems.map((it) => stColors[it.name]))
-      : `<div class="empty-mini">暂无垫付</div>`;
-    $("#statusList").innerHTML = s.statusKeys.map((st) => {
-      const b = s.byStatus[st];
-      return `<div class="status-row">
-        <span class="status-tag ${STATUS_CLASS[st]}">${escapeHtml(statusLabel(st))}</span>
-        <span class="status-nums"><em>${b.count} 单</em><i>${money(b.cost)}</i></span>
-      </div>`;
-    }).join("");
-
-    // 近 6 个月迷你走势（垫出/回款）
-    // v33：图例点＝该序列线/柱的实色（与 chartFlowSVG 共用 SERIES_COLOR）
-    $("#dashFlowLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.cost}"></i>垫出　<i class="lg-dot" style="background:${SERIES_COLOR.income}"></i>回款`;
-    const flowBuckets = s.months.map((m) => ({ label: `${parseInt(m.month.slice(5), 10)}月` }));
-    const flowStats = s.months.map((m) => ({ cost: m.cost, income: m.income }));
-    $("#dashFlow").innerHTML = chartFlowSVG(flowBuckets, flowStats, 118);
-
-    // v38（报告 C 节）：最右一列补一个短标识「差」——它一直**没有列名**，只有脚注在讲它是什么，
-    // 而脚注在卡片底部、与数字隔了好几行。标识走小字号 + 紧贴数字，金额口径一个字没动。
-    $("#monthList").innerHTML = s.months.map((m) => `
-      <div class="month-row">
-        <span class="month-name">${m.month}</span>
-        <span class="month-cell">垫 ${money(m.cost)}</span>
-        <span class="month-cell">回 ${money(m.income)}</span>
-        <span class="month-cell ${m.diff > 0 ? "pos" : m.diff < 0 ? "neg" : ""}"><i class="mc-tag">差</i>${money(m.diff)}</span>
-      </div>`).join("");
+    // v46：英雄卡里「累计净赚 · 累计垫付 · 回款」那一行与「订单状态 · 近 6 个月」一起删掉（四格 KPI 的 DOM 仍在、照旧隐藏）
   }
 
   // ---- 账本 ----
@@ -1290,7 +1262,8 @@
         // DOM 里（见 styles.css 的 .batch-block.collapsed），所以切态**不需要重渲染**。
         parts.push(`<div class="batch-block${expandedBatches.has(g.id) ? "" : " collapsed"}" data-batch="${escapeHtml(g.id)}">`);
         parts.push(batchHeadHtml(g, orders));
-        b.orders.forEach((o) => parts.push(orderCardHtml(o, "in-batch", false)));
+        // v46：展开后子单是整批卡片里的紧凑行（orderCardHtml 的 row 形态），不再是带竖线的独立大卡片
+        b.orders.forEach((o) => parts.push(orderCardHtml(o, "in-batch", false, { row: true })));
         parts.push("</div>");
         return;
       }
@@ -1363,6 +1336,26 @@
       .filter((m, i) => want.has(m.id) && Math.abs(toCents(m.income) - defCents[i]) > 1)
       .map((m) => m.name || "未命名");
   }
+
+  // v46：待回款「已等 N 天」——从寄出日期算到今天（本地日历日）。寄出日期取 shipDate；老批次没有 shipDate 时
+  // 用批次日期（就是那次寄出的日子）；两样都没有的老散单不知道哪天寄的，不显示。N ≤ 0 不显示。只读显示，不写账。
+  function waitDaysFrom(day) {
+    const d = parseDate(cleanShipDate(day));
+    const t = parseDate(todayStr());
+    if (!d || !t) return 0;
+    const n = Math.round((t - d) / 86400000);
+    return n > 0 ? n : 0;
+  }
+  function orderWaitDays(o) {
+    if (orderStage(o) !== "待回款") return 0;
+    return waitDaysFrom(cleanShipDate(o.shipDate) || (o.batchId ? cleanShipDate(o.batchDate) : ""));
+  }
+  function batchWaitDays(members) {
+    const days = members.filter((m) => orderStage(m) === "待回款")
+      .map((m) => cleanShipDate(m.shipDate) || cleanShipDate(m.batchDate)).filter(Boolean).sort();
+    return days.length ? waitDaysFrom(days[0]) : 0;
+  }
+  const waitHtml = (n) => (n > 0 ? ` <span class="wait-days">· 已等 ${n} 天</span>` : "");
 
   // v45：一批的共同单号——成员里非空单号只有一种时就是它，否则 ""（多个单号的旧数据照旧各卡各写）。
   function batchTrackingOf(batchId) {
@@ -1453,7 +1446,7 @@
         </span>
       </button>
       <div class="bh-meta-row">
-        <div class="bh-meta">${bits.map((b) => `<span class="bh-bit">${b}</span>`).join(" · ")}</div>
+        <div class="bh-meta">${bits.map((b) => `<span class="bh-bit">${b}</span>`).join(" · ")}${payable ? waitHtml(batchWaitDays(members)) : ""}</div>
         ${filterFlag}
         ${warnFlag}
         <button type="button" class="bh-pay${payable && !reported ? "" : " bh-sec"}" data-act="baodan" data-batch="${escapeHtml(g.id)}">报单</button>
@@ -1531,6 +1524,9 @@
   //     批量操作，要整批操作就退出查账回账本页走明确完整范围）。其余动作（回款/改回款、再来一单、
   //     编辑、删除）都是**单笔**语义、范围无歧义，照常保留。
   //   · opts.hit=false —— 这一张是「查看整批」展开后补出来的**未命中**成员，标一句免得看错。
+  //   · opts.row=true（v46）—— 多成员批次**展开后**的子单：画成整批卡片里的一行
+  //     「商品名 · 单价×数量（数量 >1 才有）· 垫付 · ⋯」。⋯ 展开的内容＝原卡片上的明细（状态/日期/备注/回款/利润，
+  //     利润照旧可行内改）+ **同一份**动作按钮（一个不少，data-act 不变）。opts.open=true 时 ⋯ 默认展开。
   // 不传 opts 时行为与以前一字不差（账本页、既有测试全走这条）。
   function orderCardHtml(o, extraClass, soloBatch, opts) {
     const settled = isSettled(o);
@@ -1613,6 +1609,30 @@
     const selBox = selOn
       ? `<label class="sel-box" title="勾选"><input type="checkbox" data-sel="${escapeHtml(selKey)}"${selection.has(selKey) ? " checked" : ""} aria-label="勾选这一单"></label>`
       : "";
+    if (opts && opts.row) {
+      const open = !!opts.open;
+      const pclass = profit > 0 ? "pos" : profit < 0 ? "neg" : "";
+      const roi = roiText(toCents(profit), toCents(o.cost));
+      const detail = [
+        `<span class="status-tag ${STATUS_CLASS[o.status]}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>`,
+        `<span>${escapeHtml(dotDate(o.date))}${o.platform ? " · " + escapeHtml(o.platform) : ""}${cleanTracking(o.tracking) && !hideTrack ? " · " + escapeHtml(cleanTracking(o.tracking)) : ""}</span>`,
+        o.income === null ? "" : `<span>回 <b>${money(o.income)}</b></span>`,
+        pendingIncome ? `<span class="order-income-pending">待记回款</span>` : "",
+        showProfit ? `<span class="order-profit${profitEditable ? " editable" : ""}"><span>利润</span>${profitEditable
+          ? `<button type="button" class="profit-edit" data-act="pedit" data-id="${eid}" title="点一下改这一项的利润（整批总利润不变）"><b class="${pclass}">${money(profit)}</b></button>`
+          : `<b class="${pclass}">${money(profit)}</b>`}${roi ? `<i class="order-roi">${roi}</i>` : ""}</span>` : "",
+        o.note ? `<span class="order-note">${escapeHtml(o.note)}</span>` : "",
+      ].filter(Boolean).join("");
+      return `<div class="order-card ${extraClass || ""} bm-row${open ? " more-open" : ""}" data-id="${eid}">
+      <div class="bm-line">
+        <span class="order-name">${escapeHtml(o.name || "未命名")}</span>
+        ${o.qty > 1 ? `<span class="bm-unit">${escapeHtml(unitPriceText(o))}</span>` : ""}
+        <span class="bm-cost">垫 <b>${money(o.cost)}</b></span>
+        <button class="act more-toggle" data-act="more" aria-expanded="${open}" aria-label="${open ? "收起操作" : "更多操作"}" title="更多操作"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+      </div>
+      <div class="order-more"${open ? "" : " hidden"}><div class="bm-detail">${detail}</div>${primary}${actions.join("")}</div>
+    </div>`;
+    }
     // v31：`order-mid` 末尾补「 · 单号 X」（没填单号的单一个字节都不多）。这一行本来就长，
     // 360px 上多这一截会折行——**属正常**（.order-mid 本来就会折），别为它缩字号或截断单号。
     // v33：利润从金额格里挪到卡片右上的 .order-side（状态下面），金额格只留垫付/回款/邮费三格。
@@ -1633,7 +1653,7 @@
         </div>
       </div>
       ${missFlag}
-      <div class="order-mid"><span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>${escapeHtml(dotDate(o.date))}${o.platform ? " · " + escapeHtml(o.platform) : ""}${cleanTracking(o.tracking) && !hideTrack ? " · " + escapeHtml(cleanTracking(o.tracking)) : ""}${inGroup || (stage === "待寄" && !(toCents(o.fee) > 0)) ? "" : " · 邮费 " + money(o.fee)}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}</div>
+      <div class="order-mid"><span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>${escapeHtml(dotDate(o.date))}${o.platform ? " · " + escapeHtml(o.platform) : ""}${cleanTracking(o.tracking) && !hideTrack ? " · " + escapeHtml(cleanTracking(o.tracking)) : ""}${inGroup || (stage === "待寄" && !(toCents(o.fee) > 0)) ? "" : " · 邮费 " + money(o.fee)}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}${inGroup ? "" : waitHtml(orderWaitDays(o))}</div>
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
       <div class="order-foot">
         <div class="order-money">
@@ -2391,8 +2411,7 @@
   }
 
   function reportStats(startD, endD) {
-    let n = 0, cost = 0, income = 0, profit = 0;
-    const byName = {};
+    let n = 0, cost = 0, income = 0, profit = 0, incomeCount = 0;
     data.orders.forEach((o) => {
       const od = parseDate(o.date);
       const inByDate = od && od >= startD && od < endD;
@@ -2401,31 +2420,19 @@
         cost += o.cost;
       }
 
-      // v33：商品榜与环图沿用顶部利润的记录集合，按回款日期归期。
-      // 回款非空即计入，0 也是回款；不以状态是否“已回款”筛掉记录。
+      // 回款与利润按回款日期归期：回款非空即计入，0 也是回款；不以状态是否“已回款”筛掉记录。
+      // v46：商品榜与环图随「更多统计」删除，按商品名分组（byName）删掉，只留本期回款记录条数。
       if (hasIncome(o)) {
         const id = parseDate(o.incomeDate);
         if (id && id >= startD && id < endD) {
-          const p = orderProfit(o);
           income += o.income;
-          profit += p;
-          const name = o.name || "未命名";
-          let g = Object.prototype.hasOwnProperty.call(byName, name)
-            ? byName[name] : null;
-          if (!g) {
-            g = { count: 0, profit: 0 };
-            Object.defineProperty(byName, name, {
-              value: g, enumerable: true, writable: true, configurable: true,
-            });
-          }
-          g.count += 1;
-          g.profit += p;
+          profit += orderProfit(o);
+          incomeCount += 1;
         }
       }
     });
     profit = displayedAmount(profit);
-    Object.values(byName).forEach((g) => { g.profit = displayedAmount(g.profit); });
-    return { n, cost, income, profit, byName };
+    return { n, cost, income, profit, incomeCount };
   }
 
   function prevReportStats() {
@@ -2434,178 +2441,9 @@
   }
 
   // ---- 报表图表（手写 SVG，无外部依赖）----
-  // v33：环图分片配色。**同一张环图里任意两片的 stroke 必须两两不同**。
-  // 一张环图最多 6 片（利润 Top 5 + 「其他」），原来的 5 色调色板取模后第 6 片会绕回第 0 色，
-  // 于是「其他」与榜首撞成同一个 #14b8a6、分不出来。补第 6 色（琥珀 #b97909，本就是本文件
-  // 图表里在用的色），6 色对 6 片正好取模也不重复。
-  // 分片与图例**必须**共用下面 donutColor() 这一支，别再各写一份 `% length`（那是上一版漏的地方）。
-  const PALETTE = ["#14b8a6", "#7d8fa1", "#c0724f", "#7a5fb5", "#8a8378", "#b97909"];
-  const donutColor = (i) => PALETTE[i % PALETTE.length];
-
-  // v33：**图的实色只此一份**——SVG 里的线/柱与图例点共用这批常量。
-  // 改之前图例的颜色是从渐变里手抄的，而且抄的正是 `stop-opacity="0"` 那一端的色
-  // （垫出抄成 #b97909、回款抄成 #17b26a、亏抄成 #d05f45），于是图例点与线/柱的颜色对不上
-  // （垫出线是 #7d8fa1 的板岩色，图例却点了个琥珀）。渐变那两个 stop 是**渐隐端**、
-  // 只参与面积图的中间过渡，别再把它们当成序列色去用。
-  // v41：赚红亏绿（用户选定）。gain / loss 与 styles.css 的 --gain / --loss 同值
-  const SERIES_COLOR = { cost: "#7d8fa1", income: "#14b8a6", gain: "#d23f31", loss: "#2e8b4e" };
-  let gradSeq = 0;
-
-  // 周期切桶：月视图按天、季视图 3 个月、年视图 12 个月
-  function buildBuckets(mode, range) {
-    const buckets = [];
-    if (mode === "month") {
-      const d = new Date(range.start);
-      let i = 1;
-      while (d < range.end) {
-        const start = new Date(d), end = new Date(d); end.setDate(end.getDate() + 1);
-        buckets.push({ label: String(i), start, end });
-        d.setDate(d.getDate() + 1); i += 1;
-      }
-    } else {
-      const d = new Date(range.start);
-      while (d < range.end) {
-        const start = new Date(d), end = new Date(d); end.setMonth(end.getMonth() + 1);
-        buckets.push({ label: `${pad2(d.getMonth() + 1)}月`, start, end });
-        d.setMonth(d.getMonth() + 1);
-      }
-    }
-    return buckets;
-  }
-
-  function sparseTicks(n) {
-    if (n <= 8) return [...Array(n).keys()];
-    const step = Math.ceil(n / 6);
-    const idx = [];
-    for (let i = 0; i < n; i += step) idx.push(i);
-    if (idx[idx.length - 1] !== n - 1) idx.push(n - 1);
-    return idx;
-  }
-
-  // 垫出 vs 回款：双序列面积图
-  function chartFlowSVG(buckets, stats, H = 158) {
-    const W = 336, padL = 6, padR = 6, padT = 14, padB = 22;
-    const n = buckets.length;
-    const innerW = W - padL - padR, innerH = H - padT - padB;
-    const maxV = Math.max(1, ...stats.map((s) => Math.max(s.cost, s.income)));
-    const minV = Math.min(0, ...stats.map((s) => Math.min(s.cost, s.income)));
-    const x = (i) => padL + (n === 1 ? innerW / 2 : i * innerW / (n - 1));
-    const y = (v) => padT + innerH - ((v - minV) / (maxV - minV)) * innerH;
-    const zeroY = y(0);
-    let grid = "";
-    [0, .5, 1].forEach((f) => {
-      const gy = padT + innerH - f * innerH;
-      grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" style="stroke:var(--line)" stroke-dasharray="3 4"/>`;
-    });
-    grid += `<text x="${padL + 2}" y="${padT + 4}" font-size="9" style="fill:var(--muted)">至多 ${money(maxV)}</text>`;
-    if (minV < 0) {
-      grid += `<line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${W - padR}" y2="${zeroY.toFixed(1)}" style="stroke:var(--muted)"/>`;
-      grid += `<text x="${padL + 2}" y="${(padT + innerH - 3).toFixed(1)}" font-size="9" style="fill:var(--muted)">最低 ${money(minV)}</text>`;
-    }
-    const path = (key) => stats.map((s, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(s[key]).toFixed(1)}`).join(" ");
-    const area = (key, gid) => n === 1 ? "" :
-      `<path d="${path(key)} L${x(n - 1).toFixed(1)},${zeroY.toFixed(1)} L${x(0).toFixed(1)},${zeroY.toFixed(1)} Z" fill="url(#${gid})"/>`;
-    const dots = (key, color) => n <= 14 ? stats.map((s, i) =>
-      `<circle cx="${x(i).toFixed(1)}" cy="${y(s[key]).toFixed(1)}" r="2.6" fill="#fff" stroke="${color}" stroke-width="1.6"/>`).join("") : "";
-    const ticks = sparseTicks(n).map((i) =>
-      `<text x="${x(i).toFixed(1)}" y="${H - 6}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
-    const idA = "gf" + (++gradSeq), idB = "gf" + (++gradSeq);
-    return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <linearGradient id="${idA}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#7d8fa1" stop-opacity=".28"/><stop offset="1" stop-color="#b97909" stop-opacity="0"/>
-        </linearGradient>
-        <linearGradient id="${idB}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#14b8a6" stop-opacity=".32"/><stop offset="1" stop-color="#17b26a" stop-opacity="0"/>
-        </linearGradient>
-      </defs>
-      ${grid}
-      ${area("cost", idA)}${area("income", idB)}
-      <path d="${path("cost")}" fill="none" stroke="${SERIES_COLOR.cost}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="${path("income")}" fill="none" stroke="${SERIES_COLOR.income}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      ${dots("cost", SERIES_COLOR.cost)}${dots("income", SERIES_COLOR.income)}
-      ${ticks}
-    </svg>`;
-  }
-
-  // 净盈亏：零轴发散柱
-  function chartProfitSVG(buckets, stats) {
-    const W = 336, H = 148, padL = 6, padR = 6, padT = 12, padB = 22;
-    const n = buckets.length;
-    const innerW = W - padL - padR, innerH = H - padT - padB;
-    const maxAbs = Math.max(1, ...stats.map((s) => Math.abs(s.profit)));
-    const half = innerH / 2;
-    const zero = padT + half;
-    const slot = innerW / n;
-    const bw = Math.min(26, slot * 0.56);
-    let bars = "";
-    stats.forEach((s, i) => {
-      const h = Math.max(s.profit === 0 ? 0 : 2, Math.abs(s.profit) / maxAbs * (half - 2));
-      const bx = (padL + i * slot + (slot - bw) / 2).toFixed(1);
-      const by = s.profit >= 0 ? (zero - h).toFixed(1) : zero.toFixed(1);
-      bars += `<rect x="${bx}" y="${by}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3, bw / 2).toFixed(1)}"
-        fill="${s.profit >= 0 ? SERIES_COLOR.gain : SERIES_COLOR.loss}" opacity="${s.profit === 0 ? .25 : .9}"/>`;
-      if (n <= 13 && s.profit !== 0) {
-        const ty = s.profit >= 0 ? zero - h - 4 : zero + h + 11;
-        bars += `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${ty.toFixed(1)}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${money(s.profit)}</text>`;
-      }
-    });
-    const ticks = sparseTicks(n).map((i) =>
-      `<text x="${(padL + i * slot + slot / 2).toFixed(1)}" y="${H - 6}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(buckets[i].label)}</text>`).join("");
-    return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">
-      <line x1="${padL}" y1="${zero.toFixed(1)}" x2="${W - padR}" y2="${zero.toFixed(1)}" style="stroke:var(--line)" stroke-width="1"/>
-      ${bars}${ticks}
-    </svg>`;
-  }
-
-  // 商品利润占比环形图
-  // 环形图中心那行金额：可用宽度就是**内圆直径**（2×(r − sw/2)），而金额位数是会长的。
-  // 用户截图的问题：垫付合计 ¥13,159.81 在 15px 字号下约 89px 宽，而内圆只有 71px——数字直接压在圆环上。
-  // 这里按字宽估算自动缩号；缩到下限还放不下就依次退让（先去小数 → 再上万/亿紧凑写法），保证永不压环。
-  // 字宽系数是相对字号的**偏保守**估值（数字 0.62、逗号/点 0.33、负号 0.4、¥ 与汉字按 1 算），
-  // 再只肯用内圆直径的 92%（留 8% 给字体度量误差）——宁可把字缩小一点，也不许压到环上。
-  // 判据侧有几何断言兜底（verify-webapp.mjs 34.x：把字的包围盒四角拿去和内圆半径比）。
-  function fitDonutValue(amount, innerPx) {
-    const MAX = 15, MIN = 9.5, BUDGET = 0.92;
-    const units = (s) => Array.from(s).reduce((a, ch) =>
-      a + (/[0-9]/.test(ch) ? 0.62 : /[.,]/.test(ch) ? 0.33 : ch === "-" ? 0.4 : 1), 0);
-    const n = numberValue(amount);
-    const abs = Math.abs(n);
-    const sign = n < 0 ? "-" : "";
-    const cands = [money(n)];
-    if (!Number.isInteger(abs)) cands.push(money(Math.round(n)));          // 退一步：去掉分位
-    if (abs >= 1e8) cands.push(`${sign}¥${(abs / 1e8).toFixed(1)}亿`);      // 再退：紧凑写法
-    else if (abs >= 1e4) cands.push(`${sign}¥${(abs / 1e4).toFixed(1)}万`);
-    const budget = innerPx * BUDGET;
-    for (const text of cands) {
-      const size = budget / units(text);
-      if (size >= MIN) return { text, size: Math.min(MAX, size) };
-    }
-    return { text: cands[cands.length - 1], size: MIN };
-  }
-
-  function chartDonutSVG(items, total, centerLabel = "已结算利润", colors = PALETTE) {
-    // v30：环细一点（17→13）、半径大一点（44→45）——内圆从 71px 放到 77px，中心那行金额才有地方落脚，
-    // 观感也轻一些（原来那圈 17px 的厚环是「有点丑」的来源之一）
-    const S = 128, r = 45, sw = 13, C = 2 * Math.PI * r;
-    let offset = 0, slices = "";
-    items.forEach((it, i) => {
-      const frac = it.value / total;
-      const gap = items.length > 1 ? 1.5 : 0;
-      const dash = `${Math.max(0.5, frac * C - gap).toFixed(2)} ${(C - Math.max(0.5, frac * C - gap)).toFixed(2)}`;
-      slices += `<circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="${colors[i % colors.length]}"
-        stroke-width="${sw}" stroke-dasharray="${dash}" transform="rotate(${(offset * 360 - 90).toFixed(2)} ${S / 2} ${S / 2})"/>`;
-      offset += frac;
-    });
-    const cv = fitDonutValue(total, 2 * (r - sw / 2) - 4);
-    const labelY = (S / 2 + 5 + cv.size * 0.62).toFixed(1);
-    return `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}">
-      <circle cx="${S / 2}" cy="${S / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${sw}"/>
-      ${slices}
-      <text x="${S / 2}" y="${S / 2 - 2}" font-size="${cv.size.toFixed(1)}" font-weight="700" style="fill:var(--ink);font-variant-numeric:tabular-nums" text-anchor="middle">${cv.text}</text>
-      <text x="${S / 2}" y="${labelY}" font-size="9" style="fill:var(--muted)" text-anchor="middle">${escapeHtml(centerLabel)}</text>
-    </svg>`;
-  }
+  // v46：现金流 / 净盈亏分布 / 环图随「更多统计」删除，只剩每月利润柱状图（renderMonthProfit）。
+  // v33：**图的实色只此一份**——柱子的赚 / 亏色。v41：赚红亏绿（用户选定）。gain / loss 与 styles.css 的 --gain / --loss 同值
+  const SERIES_COLOR = { gain: "#d23f31", loss: "#2e8b4e" };
 
   function renderReport() {
     const range = repRange(reportMode, repCursor);
@@ -2616,8 +2454,8 @@
     const lines = [];
     const feeStats = reportFeeStats(range.start, range.end);
     // v33：空态不再只看「下单数 + 回款总额」——本期只记了批次邮费、或本期回款合计正好为零，
-    // 都会被旧条件误判成「没有记录」。改成同时看本期回款记录（byName 由回款日期归期建组）与本期邮费。
-    const hasPeriodIncome = Object.keys(s.byName).length > 0;
+    // 都会被旧条件误判成「没有记录」。改成同时看本期回款记录（按回款日期归期的条数）与本期邮费。
+    const hasPeriodIncome = s.incomeCount > 0;
     if (s.n === 0 && !hasPeriodIncome && feeStats.totalCents === 0) {
       lines.push(`<b>${escapeHtml(range.label)}</b> 没有记录。`);
     } else {
@@ -2643,95 +2481,13 @@
       <div class="kpi card"><span class="kpi-label">回款</span><span class="kpi-value">${money(s.income)}</span></div>
       <div class="kpi card"><span class="kpi-label">净盈亏</span><span class="kpi-value ${s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : ""}">${money(s.profit)}</span></div>`;
 
-    // 图表
-    const buckets = buildBuckets(reportMode, range);
-    const bucketStats = buckets.map((b) => reportStats(b.start, b.end));
-
-    // v33：图例点＝该序列线/柱的实色（与两支绘图函数共用 SERIES_COLOR）
-    $("#flowLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.cost}"></i>垫出　<i class="lg-dot" style="background:${SERIES_COLOR.income}"></i>回款`;
-    $("#chartFlow").innerHTML = chartFlowSVG(buckets, bucketStats);
-
-    $("#profitLegend").innerHTML = `<i class="lg-dot" style="background:${SERIES_COLOR.gain}"></i>赚　<i class="lg-dot" style="background:${SERIES_COLOR.loss}"></i>亏`;
-    $("#chartProfit").innerHTML = chartProfitSVG(buckets, bucketStats);
-
-    // 邮费统计：整批一起寄的合成一行（含这一批都是哪些货），单寄的合并成一行
-    const feeRows = feeStats.batches.map((b) => {
-      const nums = [`${b.count} 单`, `邮费 ${money(b.feeCents / 100)}`];
-      if (b.incomeCents > 0) nums.push(`回款 ${money(b.incomeCents / 100)}`);
-      if (b.pending > 0) nums.push(`${b.pending} 单在途`);
-      // v24：一起寄的一批只有一笔邮费，整批金额就是这一批的唯一权威值，成员明细按它摊——
-      // 所以正常情况下这两个数必然相等，报表只显示上面那一行。只有在**确实合不上**时才补一句：
-      // 那是「有人单独改过某单」或历史数据留下的痕迹（退出/重组会按份额扣减，合得上）。
-      // 措辞把两个数各自是谁讲清楚，别让人以为同一批有两个邮费（v21 的「整批录入 邮费 ¥1」很容易
-      // 被读成「这一批的邮费是 ¥1」，而上面明明写着成员合计 ¥32）。
-      if (b.conflictFields.length) nums.push("整批口径不一致，请核对；当前邮费按表列日期展示");
-      if (!b.conflictFields.length && b.entryFeeCents !== b.feeCents) {
-        nums.push(`整批录的是 邮费 ${money(b.entryFeeCents / 100)}，与成员合计不同`);
-      }
-      if (!b.conflictFields.length && b.entryIncomeCents !== b.incomeCents) {
-        nums.push(`整批录的是 回款 ${money(b.entryIncomeCents / 100)}，与成员合计不同`);
-      }
-      return `<div class="fee-row">
-        <div class="fee-line">
-          <span class="fee-name">整批 · ${escapeHtml(dotDate(b.date))}</span>
-          <span class="fee-nums">${nums.join(" · ")}</span>
-        </div>
-        <div class="fee-names">${escapeHtml(b.names.join("、"))}</div>
-      </div>`;
-    });
-    if (feeStats.looseCount > 0) {
-      feeRows.push(`<div class="fee-row">
-        <div class="fee-line">
-          <span class="fee-name">单寄（未成批）</span>
-          <span class="fee-nums">${feeStats.looseCount} 单 · 邮费 ${money(feeStats.looseCents / 100)}</span>
-        </div>
-        <div class="fee-names">${escapeHtml(feeStats.looseNames.join("、"))}</div>
-      </div>`);
-    }
-    $("#reportFees").innerHTML = feeRows.length === 0
-      ? `<div class="empty-mini">本期没有邮费记录</div>`
-      : `<div class="fee-total"><span>本期邮费合计</span><b>${money(feeStats.totalCents / 100)}</b></div>${feeRows.join("")}`;
-
-    // 环形图：本期回款里合计利润为正的商品，Top5 + 其他
-    const ranked = Object.entries(s.byName).map(([name, g]) => ({ name, value: g.profit }))
-      .filter((x) => x.value > 0).sort((a, b) => b.value - a.value);
-    const top = ranked.slice(0, 5);
-    const restVal = ranked.slice(5).reduce((a, b) => a + b.value, 0);
-    if (restVal > 0) top.push({ name: "其他", value: restVal });
-    const total = top.reduce((a, b) => a + b.value, 0);
-    if (total <= 0) {
-      $("#chartDonut").innerHTML = `<div class="empty-mini">本期回款中，暂无合计利润为正的商品</div>`;
-    } else {
-      // v33：切片色与图例色**同出一个数组**——分片与图例各写一份取模正是「其他」撞榜首的来路。
-      const sliceColors = top.map((_, i) => donutColor(i));
-      const legend = top.map((it, i) => `
-        <div class="donut-legend-row">
-          <i class="lg-dot" style="background:${sliceColors[i]}"></i>
-          <span class="dl-name">${escapeHtml(it.name)}</span>
-          <span class="dl-val">${money(it.value)} · ${Math.round(it.value / total * 100)}%</span>
-        </div>`).join("");
-      $("#chartDonut").innerHTML = `<div class="donut-wrap">${chartDonutSVG(top, total, "盈利合计", sliceColors)}<div class="donut-legend">${legend}</div></div>`;
-    }
-
-    // v33：本期回款商品榜；与顶部净盈亏共用记录集合。
-    const products = Object.entries(s.byName)
-      .sort((a, b) => b[1].profit - a[1].profit)
-      .slice(0, 5);
-    const maxP = Math.max(1, ...products.map(([, g]) => Math.abs(g.profit)));
-    $("#reportProducts").innerHTML = products.length === 0
-      ? `<div class="empty-mini">本期没有回款记录</div>`
-      : products.map(([name, g]) => `
-        <div class="prod-row">
-          <div class="prod-line">
-            <span class="prod-name">${escapeHtml(name)}</span>
-            <span class="prod-nums">回款 ${g.count} 单 <b class="${g.profit > 0 ? "pos" : g.profit < 0 ? "neg" : ""}">${money(g.profit)}</b></span>
-          </div>
-          <div class="prod-bar-track"><span class="prod-bar ${g.profit >= 0 ? "pos" : "neg"}" style="width:${Math.round(Math.abs(g.profit) / maxP * 100)}%"></span></div>
-        </div>`).join("");    renderMonthProfit();
+    renderMonthProfit();
   }
 
   // v41：每月利润（近 12 个月，按回款月份的净盈亏）。口径与月报**同一个函数** reportStats——
   // 所以点某根柱子切到那个月的月报，看到的「净盈亏」必然与柱子一致。赚红亏绿（SERIES_COLOR）。
+  // v46：图并进周期卡片——当前周期（月 / 季 / 年）覆盖到的柱子一起点亮；
+  // 有回款记录的月份少于 3 个时整张图矮到约 60%（150 → 90），免得一大片空白。
   function renderMonthProfit() {
     const box = $("#monthProfit");
     if (!box) return;
@@ -2741,11 +2497,12 @@
       const d = new Date(now.getFullYear(), now.getMonth() - k, 1);
       const cur = { y: d.getFullYear(), m: d.getMonth() };
       const r = repRange("month", cur);
-      months.push({ cur, label: `${cur.m + 1}月`, ym: r.label, cents: toCents(reportStats(r.start, r.end).profit) });
+      const st = reportStats(r.start, r.end);
+      months.push({ cur, start: r.start, label: `${cur.m + 1}月`, ym: r.label, cents: toCents(st.profit), has: st.incomeCount > 0 });
     }
-    const sel = reportMode === "month" ? repRange("month", repCursor).label : "";
+    const selRange = repRange(reportMode, repCursor);
     const total = months.reduce((a, m) => a + m.cents, 0);
-    const active = months.filter((m) => m.cents !== 0).length;
+    const sparse = months.filter((m) => m.has).length < 3;
     // v42：回报率＝这 12 个月里有回款的单「利润合计 ÷ 垫付合计」（与月报同一归期：按回款日期）
     const winStart = repRange("month", months[0].cur).start, winEnd = repRange("month", months[11].cur).end;
     let roiCost = 0;
@@ -2758,7 +2515,7 @@
     $("#mpSummary").innerHTML = `近 12 个月合计 <b class="${total > 0 ? "pos" : total < 0 ? "neg" : ""}">${money(total / 100)}</b>`
       + (roi ? ` · 回报率 <b class="${total > 0 ? "pos" : total < 0 ? "neg" : ""}">${roi}</b>` : "")
       ;   // v45：去掉「有回款的月份平均」半句（总折到第二行；平均数用处不大）
-    const W = 336, H = 150, top = 22, bottom = 22, gap = 6;
+    const W = 336, H = sparse ? 90 : 150, top = 22, bottom = 22, gap = 6;
     const maxAbs = Math.max(1, ...months.map((m) => Math.abs(m.cents)));
     const hasNeg = months.some((m) => m.cents < 0);
     const hasPos = months.some((m) => m.cents > 0);
@@ -2770,7 +2527,7 @@
       const x = i * (bw + gap);
       const h = Math.max(m.cents === 0 ? 0 : 2, Math.abs(m.cents) * scale);
       const y = m.cents >= 0 ? zeroY - h : zeroY;
-      const on = m.ym === sel;
+      const on = m.start >= selRange.start && m.start < selRange.end;
       const color = m.cents >= 0 ? SERIES_COLOR.gain : SERIES_COLOR.loss;
       // 柱顶数字：上万写成「¥1.2万」；靠左/靠右两端的柱子把文字往里对齐，任何金额都不出图（37.22 抓到过出界）
       const short = Math.abs(m.cents) >= 1000000
@@ -2778,7 +2535,8 @@
         : money(m.cents / 100);
       const anchor = i <= 1 ? "start" : i >= 10 ? "end" : "middle";
       const tx = anchor === "start" ? x : anchor === "end" ? x + bw : x + bw / 2;
-      const val = on || (m.cents !== 0 && Math.abs(m.cents) === maxAbs)
+      // 季 / 年模式下点亮的柱子挨着好几根，只给最高那根写数字（每根都写会叠在一起）
+      const val = (on && reportMode === "month") || (m.cents !== 0 && Math.abs(m.cents) === maxAbs)
         ? `<text x="${tx.toFixed(1)}" y="${(m.cents >= 0 ? y - 5 : y + h + 12).toFixed(1)}" text-anchor="${anchor}" class="mp-val">${escapeHtml(short)}</text>` : "";
       return `<g class="mp-bar${on ? " on" : ""}" data-ym="${m.cur.y}-${m.cur.m}" role="button" tabindex="0" aria-label="${escapeHtml(m.ym)} 利润 ${escapeHtml(money(m.cents / 100))}">
         <rect x="${x.toFixed(1)}" y="${top - 6}" width="${bw.toFixed(1)}" height="${H - top - 2}" fill="transparent"/>
@@ -2786,20 +2544,17 @@
         ${val}
         <text x="${(x + bw / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="mp-lab">${m.label}</text></g>`;
     }).join("");
+    box.dataset.sparse = sparse ? "1" : "0";
     box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="近 12 个月每月利润">
       <line x1="0" x2="${W}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" class="mp-zero"/>${bars}</svg>`;
   }
 
-  // 点某个月 → 下方月报切到那个月（模式切成「月」），并滚到月报
+  // 点某个月 → 周期跳到那个月；v46：季 / 年模式下跳到包含该月的季度 / 年份（模式不变，repRange 按月份算季度与年份）
   function pickProfitMonth(key) {
     const [y, m] = String(key || "").split("-").map(Number);
     if (!Number.isFinite(y) || !Number.isFinite(m)) return;
-    reportMode = "month";
-    $$("#repModes .seg").forEach((c) => c.classList.toggle("on", c.dataset.mode === "month"));
     repCursor = { y, m };
     renderReport();
-    const head = $(".rep-head");
-    if (head && head.scrollIntoView) head.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   // ---- 记单 / 编辑 ----
@@ -4268,7 +4023,9 @@
     if (!blk || !g) { renderList(); return; }
     const orders = filteredOrders();
     const members = orders.filter((o) => o.batchId === batchId);
-    blk.innerHTML = batchHeadHtml(g, orders) + members.map((o) => orderCardHtml(o, "in-batch", false)).join("");
+    // v46：子单是紧凑行，⋯ 展开的那几行重绘后照旧展开（改分项利润后不用再点一次）
+    const open = new Set(Array.from(blk.querySelectorAll(".order-card.more-open")).map((c) => c.dataset.id));
+    blk.innerHTML = batchHeadHtml(g, orders) + members.map((o) => orderCardHtml(o, "in-batch", false, { row: true, open: open.has(o.id) })).join("");
   }
 
   // 写库 + 触发既有 450ms 防抖同步 + 局部重渲染（**不走 saveData**：那会 render() 整页）。
@@ -4322,7 +4079,7 @@
       const hint = document.createElement("div");
       hint.className = "foot-note profit-lock-hint";
       hint.textContent = "钉住只在本次有效；刷新后按现值重算";
-      const top = card.querySelector(".order-top");
+      const top = card.querySelector(".order-top, .bm-detail");
       if (top) top.insertAdjacentElement("afterend", hint);
       else card.appendChild(hint);
     }
@@ -5662,6 +5419,7 @@
     a.download = `luhuo-ledger-${todayStr().replace(/-/g, "")}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    recordExport();   // v46：备份提醒（只写独立键 BACKUP_HINT_KEY）
     toast("已导出备份文件");
   }
 
@@ -5831,6 +5589,7 @@
 
   function openSettings() {
     renderSettings();
+    renderBackupHint();
     openModal("#settingsModal");
   }
   function closeSettings() { closeModal("#settingsModal"); }
@@ -5956,6 +5715,19 @@
     $$(".tabbar button").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
     $("#settingsBtn").addEventListener("click", openSettings);
     $("#fab").addEventListener("click", () => openForm(null));
+    // v46：往下滚时「＋ 记一单」收成圆形「＋」（#fab.mini），往上滚或停下 500ms 后恢复。只切一个类，位置不动。
+    (() => {
+      const fab = $("#fab");
+      let lastY = window.scrollY, idle = null;
+      window.addEventListener("scroll", () => {
+        const y = window.scrollY, dy = y - lastY;
+        lastY = y;
+        if (dy > 2 && y > 40) fab.classList.add("mini");
+        else if (dy < -2) fab.classList.remove("mini");
+        clearTimeout(idle);
+        idle = setTimeout(() => fab.classList.remove("mini"), 500);
+      }, { passive: true });
+    })();
 
     // ---- v41：账本页顶部 ⋯ 菜单、勾选操作条、两条提示 ----
     const moreMenu = $("#listMoreMenu");
@@ -6084,7 +5856,7 @@
       if (ev.target.closest("button, input, label, a, select, textarea, .order-more")) return;
       if (window.getSelection && String(window.getSelection()).length) return;   // 正在选文字（复制单号）时不切
       const card = ev.target.closest(".order-card");
-      const more = card && card.querySelector('.order-actions [data-act="more"]');
+      const more = card && card.querySelector('.order-actions [data-act="more"], .bm-line [data-act="more"]');
       if (more) handleCardAction(more);
     });
 
@@ -6439,7 +6211,19 @@
   }
 
   // ---- 启动 ----
+  // v46：离线缓存（sw.js，网络优先）。相对路径注册（站点在 Pages 子路径下）；不支持或注册失败一律静默，
+  // 页面照常工作。sw.js 只缓存同源 GET 静态文件与页面导航，不读不写 localStorage / 账本。
+  function registerServiceWorker() {
+    try {
+      if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+      window.addEventListener("load", () => {
+        try { navigator.serviceWorker.register("./sw.js").catch(() => {}); } catch { /* 静默 */ }
+      });
+    } catch { /* 静默 */ }
+  }
+
   async function start() {
+    registerServiceWorker();
     loadLocal();
     if (legacyLoaded && !meta.v41FirstSeen) { meta.v41FirstSeen = new Date().toISOString(); persistMeta(); }
     populateSelects();
