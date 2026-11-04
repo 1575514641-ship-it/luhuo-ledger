@@ -2471,9 +2471,14 @@
         lines.push(diff === 0 ? "和上一期持平。"
           : `比上一期${diff > 0 ? "多赚" : "少赚"} <b class="${diff > 0 ? "pos" : "neg"}">${money(Math.abs(diff))}</b>。`);
       }
+      // v47：平均每单——本期利润 ÷ 本期回款单数（同一个 reportStats 集合，按分算、四舍五入到分）
+      if (s.incomeCount > 0) {
+        const avg = Math.round(toCents(s.profit) / s.incomeCount);
+        lines.push(`平均每单${avg < 0 ? "亏" : "赚"} <b class="${avg > 0 ? "pos" : avg < 0 ? "neg" : ""}">${money(Math.abs(avg) / 100)}</b>（${s.incomeCount} 单回款）。`);
+      }
     }
     // v42：「在途」那句与统计页顶部英雄卡重复，打上类名由 CSS 收起（文字仍在 DOM）。
-    $("#reportSummary").innerHTML = lines.map((l) => `<p${l.startsWith("现在还有") ? ' class="rs-out"' : ""}>${l}</p>`).join("");
+    $("#reportSummary").innerHTML = lines.map((l) => `<p${l.startsWith("现在还有") ? ' class="rs-out"' : l.startsWith("平均每单") ? ' class="rs-avg"' : ""}>${l}</p>`).join("");
 
     $("#reportKpis").innerHTML = `
       <div class="kpi card"><span class="kpi-label">单数</span><span class="kpi-value">${s.n}</span></div>
@@ -2482,6 +2487,63 @@
       <div class="kpi card"><span class="kpi-label">净盈亏</span><span class="kpi-value ${s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : ""}">${money(s.profit)}</span></div>`;
 
     renderMonthProfit();
+    renderWaitCard();
+  }
+
+  // v47：「待回款」卡——此刻还在等回款的单按已等天数分三档（不跟随月/季/年周期）。
+  // 天数口径与卡片上的「已等 N 天」同一个来源（散单按寄出日期，整批成员没有寄出日期时用批次日期）；
+  // 整批按成员逐单计入。算不出天数（只有单号、没有日期）的单单列一行，不硬塞进某一档。
+  function waitBuckets() {
+    const tiers = [
+      { key: "late", label: "超过 14 天", test: (n) => n > 14, list: [] },
+      { key: "mid", label: "7–14 天", test: (n) => n >= 7 && n <= 14, list: [] },
+      { key: "new", label: "7 天内", test: (n) => n < 7, list: [] },
+    ];
+    const nodate = { key: "nodate", label: "没记寄出日期", list: [] };
+    data.orders.forEach((o, idx) => {
+      if (orderStage(o) !== "待回款") return;
+      const day = cleanShipDate(o.shipDate) || (o.batchId ? cleanShipDate(o.batchDate) : "");
+      if (!day || !parseDate(day)) { nodate.list.push({ o, idx, days: -1 }); return; }
+      const days = waitDaysFrom(day);
+      tiers.find((t) => t.test(days)).list.push({ o, idx, days });
+    });
+    return { tiers, nodate };
+  }
+  function renderWaitCard() {
+    const box = $("#waitCard");
+    if (!box) return;
+    const { tiers, nodate } = waitBuckets();
+    const total = tiers.reduce((a, t) => a + t.list.length, 0) + nodate.list.length;
+    if (total === 0) {
+      box.innerHTML = `<h2 class="wait-title">待回款</h2><p class="wait-empty">没有在等回款的单子</p>`;
+      return;
+    }
+    const row = (t) => {
+      const n = t.list.length;
+      const cents = t.list.reduce((a, x) => a + toCents(x.o.cost), 0);
+      // 点这一档跳到等得最久的那单（天数最大；同天按账本顺序）
+      const target = n ? t.list.slice().sort((a, b) => (b.days - a.days) || (a.idx - b.idx))[0].o.id : "";
+      return `<button type="button" class="wait-row${t.key === "late" && n ? " urgent" : ""}" data-tier="${t.key}"${n ? ` data-wait-jump="${escapeHtml(target)}"` : " disabled"}>
+        <span class="wr-label">${t.label}</span><span class="wr-val">${n} 单 · <b>${money(cents / 100)}</b></span></button>`;
+    };
+    // 标题旁写合计：只算已寄出在等回款的单（顶部「N 单在途」还含待寄，两个数口径不同，这里写清楚）
+    const all = tiers.flatMap((t) => t.list).concat(nodate.list);
+    const allCents = all.reduce((a, x) => a + toCents(x.o.cost), 0);
+    box.innerHTML = `<h2 class="wait-title">待回款 <span class="wait-total">共 ${all.length} 单 · ${money(allCents / 100)}</span></h2>`
+      + `<p class="wait-sub">已寄出未回款 · 按已等天数分档 · 点一档去看</p>`
+      + tiers.map(row).join("") + (nodate.list.length ? row(nodate) : "");
+  }
+  function jumpToWaiting(id) {
+    switchView("list");
+    const chip = $(`#filterChips button[data-filter="待回款"]`);
+    if (chip && currentFilter !== "待回款") chip.click();
+    // 散单卡片本身不带 data-id，按卡片里任一带这单 id 的按钮反查卡片
+    const hit = $$("#orderList [data-id]").find((el) => el.dataset.id === id);
+    const card = hit && hit.closest(".order-card");
+    if (!card) return;
+    // 收起着的整批里的成员没有包围盒——定位到它所在的批次块
+    const blk = card.closest(".batch-block.collapsed");
+    (blk || card).scrollIntoView({ block: "center" });
   }
 
   // v41：每月利润（近 12 个月，按回款月份的净盈亏）。口径与月报**同一个函数** reportStats——
@@ -3889,7 +3951,10 @@
     // 已回款却没有回款金额的老单（状态是用户在编辑表单里手选成「已回款」的）：填 0 而不是留空，
     // 「留空」会被那个 required 框拦下，点确认像卡住（v24 记过的坑）。0 也正是它在利润口径里的值。
     const curIncome = o.income === null || o.income === undefined ? 0 : o.income;
-    f.income.value = payEditMode ? curIncome : (o.cost || "");
+    // v47：新回款打开时框是空的（用户反馈「每次都要先把预填的成本删掉」），灰字提示垫付价；
+    // 改回款仍预填现值。想按垫付价回款就点「按垫付价」。
+    f.income.value = payEditMode ? curIncome : "";
+    f.income.placeholder = payEditMode ? "" : `垫付 ${money(o.cost)}`;
     // Existing negative member income may keep its amount while correcting its date.
     f.income.readOnly = payEditMode && curIncome < 0;
     if (f.income.readOnly) f.income.removeAttribute("min");
@@ -3927,7 +3992,13 @@
   function updatePayPreview() {
     const o = data.orders.find((x) => x.id === payTargetId);
     if (!o) return;
-    const income = numberValue($("#payForm").income.value);
+    const raw = String($("#payForm").income.value).trim();
+    if (raw === "") {   // v47：还没填就不按 0 算出一个假亏损
+      $("#payPreview").textContent = "填回款后显示利润";
+      $("#paySubmit").textContent = payEditMode ? "确认改回款" : "确认回款";
+      return;
+    }
+    const income = numberValue(raw);
     const profit = income - o.cost - o.fee;
     $("#payPreview").innerHTML = `利润 <b class="${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${profit >= 0 ? "+" : ""}${money(profit)}</b>（垫付 ${money(o.cost)}${o.fee ? "＋邮费 " + money(o.fee) : ""}）`;
     $("#paySubmit").textContent = `${payEditMode ? "确认改回款" : "确认回款"} ${money(income)}`;
@@ -3947,6 +4018,11 @@
     if (paySession && (paySession.generation !== ledgerGeneration
       || paySession.id !== o.id || paySession.snap !== orderSnap(o))) {
       toast("账本已更新，这次回款没保存，请重新打开核对");
+      return;
+    }
+    if (String(f.income.value).trim() === "") {   // v47：空框不提交（0 仍是合法回款）
+      toast("先填回款金额（没回款可以填 0）");
+      f.income.focus();
       return;
     }
     const income = numberValue(f.income.value);
@@ -6057,7 +6133,8 @@
       const o = data.orders.find((x) => x.id === payTargetId);
       const input = $("#payForm").income;
       if (btn.dataset.add === "reset") input.value = o ? o.cost : "";
-      else input.value = numberValue(input.value) + Number(btn.dataset.add);
+      // v47：框空着时「+N」＝垫付价 + N（与 v46 之前预填垫付价时的用法一致）
+      else input.value = (String(input.value).trim() === "" && o ? o.cost : numberValue(input.value)) + Number(btn.dataset.add);
       updatePayPreview();
     });
 
@@ -6132,6 +6209,10 @@
     $("#monthProfit").addEventListener("keydown", (ev) => {
       const g = ev.target.closest("[data-ym]");
       if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); pickProfitMonth(g.dataset.ym); }
+    });
+    $("#waitCard").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-wait-jump]");
+      if (btn) jumpToWaiting(btn.dataset.waitJump);
     });
     $("#repPrev").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, -1); renderReport(); });
     $("#repNext").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, 1); renderReport(); });

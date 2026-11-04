@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=46">
+  <link rel="stylesheet" href="./styles.css?v=47">
 </head>
 <body>
   <header class="topbar">
@@ -139,6 +139,8 @@
         <div id="reportSummary" class="summary"></div>
         <div id="mpSummary" class="mp-summary"></div>
       </div>
+      <!-- v47：此刻还在等回款的单按已等天数分档（不跟随上面的月/季/年），点一档跳到账本「待回款」 -->
+      <div id="waitCard" class="card wait-card"></div>
       <details class="info-note center"><summary aria-label="统计口径">ⓘ 统计口径</summary><p class="foot-note center">口径：单数和垫付按下单日期；回款和利润按回款日期。</p></details>
     </section>
   </main>
@@ -249,8 +251,8 @@
   <div id="payModal" class="modal">
     <form id="payForm" class="sheet">
       <h2 id="payTitle">回款</h2>
-      <!-- v24：回款金额也给了「清空」——这个框是 required，所以清空＝置 0（置空会被浏览器拦下） -->
-      <label class="fld">回款金额<input name="income" type="number" inputmode="decimal" min="0" step="0.01" required><button type="button" class="fld-clear" data-clear="income">清空</button></label>
+      <!-- v24：回款金额也给了「清空」，清空＝置 0。v47：新回款打开时是空框，不再用 required（空框由提交时的提示拦住），「清空」仍置 0 不变 -->
+      <label class="fld">回款金额<input name="income" type="number" inputmode="decimal" min="0" step="0.01"><button type="button" class="fld-clear" data-clear="income">清空</button></label>
       <div class="quick-chips" id="payQuick">
         <button type="button" data-add="reset">按垫付价</button>
         <button type="button" data-add="10">+10</button>
@@ -412,7 +414,7 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置 <small class="app-version">版本 <b id="appVersion">v46</b></small></h2>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v47</b></small></h2>
       <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
       <section class="set-card">
         <h3>两台设备同步</h3>
@@ -465,7 +467,7 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=46"></script>
-  <script src="./app.js?v=46"></script>
+  <script src="./sync.js?v=47"></script>
+  <script src="./app.js?v=47"></script>
 </body>
 </html>

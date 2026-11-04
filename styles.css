@@ -1143,6 +1143,7 @@ button.sync-badge:active { opacity: .7; }
 /* A：列表底部留白——滚到底时最后一张卡片（含展开的整批）的按钮都在悬浮按钮上沿之上。
    悬浮按钮上沿离视口底 ≈ 86 + 48 = 134px，body 已留 84px，这里再补 72px（合计 156px，余 22px）。 */
 #view-list { padding-bottom: 72px; }
+#view-report { padding-bottom: 72px; }   /* v47：统计页滚到底时最后一行也不被悬浮按钮挡住 */
 /* A：往下滚时「＋ 记一单」收成圆形「＋」，往上滚或停下后恢复（位置不变，点击区 48px ≥ 44px） */
 .fab-text { display: inline-block; max-width: 4em; overflow: hidden; white-space: nowrap; transition: max-width .18s ease, opacity .18s ease; }
 #fab { transition: transform .15s, padding .18s ease, gap .18s ease; }
@@ -1192,3 +1193,22 @@ button.sync-badge:active { opacity: .7; }
 
 /* G：「沿用渠道」挪进「更多」后紧贴渠道那一格 */
 .more-body .keep-channel { margin: -2px 0 10px; min-height: 44px; }
+
+/* ===== v47：统计页「待回款」分档卡 ===== */
+.wait-card { padding: 12px 14px 6px; }
+.wait-title { font-size: 15px; margin: 0 0 4px; }
+.wait-title small { font-size: 12px; font-weight: 400; color: var(--muted); }
+.wait-title .wait-total { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; margin-left: 4px; }
+#waitCard .wait-sub { margin: 0 0 2px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+#view-report #reportSummary p.rs-avg { font-size: 13px; color: var(--ink); }   /* v47：平均每单比其它小字醒目一点 */
+.wait-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
+  min-height: 44px; padding: 0 2px; border: 0; border-top: 1px solid var(--line); background: none;
+  font: inherit; font-size: 13.5px; color: var(--ink); text-align: left; cursor: pointer;
+}
+.wait-row:first-of-type { border-top: 0; }
+.wait-row:disabled { cursor: default; color: var(--muted); }
+.wait-row .wr-val { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+.wait-row .wr-val b { color: var(--ink); font-weight: 600; }
+.wait-row.urgent .wr-label, .wait-row.urgent .wr-val b { color: var(--neg); }   /* 与「⚠ 待对账」同一警示色；本项目赚红亏绿，不用 --gain/--loss */
+.wait-empty { margin: 4px 0 8px; font-size: 13px; color: var(--muted); }
