@@ -6,7 +6,7 @@
   --bg: #f3f6f5;
   --card: #ffffff;
   --ink: #152321;
-  --muted: #7a8c88;
+  --muted: #5f716d;   /* v48：原 #7a8c88 配白底 3.54:1，小字不够清楚；加深到约 5:1 */
   --line: #e2eae8;
   --primary: #123b36;
   --accent: #0f857a;
@@ -1212,3 +1212,53 @@ button.sync-badge:active { opacity: .7; }
 .wait-row .wr-val b { color: var(--ink); font-weight: 600; }
 .wait-row.urgent .wr-label, .wait-row.urgent .wr-val b { color: var(--neg); }   /* 与「⚠ 待对账」同一警示色；本项目赚红亏绿，不用 --gain/--loss */
 .wait-empty { margin: 4px 0 8px; font-size: 13px; color: var(--muted); }
+
+/* ---- v48（体验走查）---- */
+/* 断网 / 正在核对：可预期、不丢数据的状态收成一行浅色细条，红框只留给真冲突与本地故障 */
+.ledger-notice.soft {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 14px;
+  border-color: var(--line); color: var(--muted); background: var(--card); font-size: 12px;
+}
+.ledger-notice.soft[hidden] { display: none; }
+.ledger-notice.soft p { margin: 0; flex: 1 1 auto; min-width: 0; }
+.ledger-notice.soft .notice-actions { flex: 0 0 auto; display: flex; gap: 6px; margin: 0; }
+.ledger-notice.soft .btn { width: auto; min-height: 36px; padding: 0 12px; font-size: 12px; }
+/* 统计四格：每格写明按哪个日期算（单数/垫付按下单日，回款/净盈亏按到账日），不用展开「统计口径」也看得懂 */
+.kpi-basis { font-size: 10.5px; color: var(--muted); line-height: 1.2; }
+/* 多选时卡片上的单项按钮先让开（操作只走底部操作条），免得点错对象 */
+body.has-sel #orderList .order-actions,
+body.has-sel #orderList .order-more,
+body.has-sel #orderList .bh-pay { opacity: .35; pointer-events: none; }
+/* 弹窗开着时 toast 挪到屏幕上方，不挡弹窗里的控件（报单面板的「调整」等） */
+body.modal-open .toast { top: calc(14px + env(safe-area-inset-top)); bottom: auto; }
+/* 查账：只留一个「清空」，去掉 search 框自带的小叉 */
+#lookupInput::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; display: none; }
+/* 整批回款的快捷金额与回款日期小字 */
+#batchQuick { margin-top: -4px; }
+#payDateToggle { margin: 0 0 6px; }
+/* 桌面宽屏：「记一单」跟着 560px 内容栏的右边缘走，不再贴在屏幕最右 */
+@media (min-width: 700px) {
+  #fab { right: calc(50% - 264px); }
+}
+/* 柱状图点开的逐单明细（不点不列；再点同一根或点「收起」收回） */
+.mp-bar.picked .mp-lab { fill: var(--accent); font-weight: 700; text-decoration: underline; }
+.mp-detail { margin: 2px 0 10px; border-top: 1px solid var(--line); }
+.mp-detail[hidden] { display: none; }
+.mpd-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0 4px; }
+.mpd-title { font-size: 13.5px; font-weight: 600; }
+.mpd-title small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; }
+.mpd-title small b { font-weight: 600; }
+.mpd-close, .mpd-more { min-height: 36px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px; background: none; font: inherit; font-size: 12px; color: var(--muted); cursor: pointer; }
+.mpd-more { display: block; width: 100%; margin: 6px 0 0; }
+.mpd-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 48px; padding: 6px 2px; border: 0; border-top: 1px solid var(--line); background: none; font: inherit; color: var(--ink); text-align: left; cursor: pointer; }
+.mpd-main { display: flex; flex-direction: column; min-width: 0; }
+.mpd-name { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mpd-name small { color: var(--muted); }
+.mpd-sub { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mpd-profit { flex: 0 0 auto; font-size: 14px; font-variant-numeric: tabular-nums; }
+.mpd-empty { margin: 4px 0 8px; font-size: 13px; color: var(--muted); }
+/* 从统计页跳回账本时，目标卡片闪一下好找 */
+@keyframes mpd-flash { 0%, 60% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+.order-card.flash { animation: mpd-flash 1.6s ease-out; }
+.mpd-profit.pos, .mpd-title b.pos { color: var(--gain); }
+.mpd-profit.neg, .mpd-title b.neg { color: var(--loss); }

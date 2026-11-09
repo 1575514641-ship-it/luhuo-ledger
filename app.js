@@ -307,6 +307,10 @@
     if (!box) return;
     const issue = localIssue || ledgerProblem(data) || syncBlocked;
     box.hidden = !issue;
+    // v48：断网/正在核对这两种「可预期、不丢数据」的状态收成一行浅色细条，红框只留给真冲突与本地故障
+    const soft = !localIssue && !ledgerProblem(data) && /^(离线中|正在核对云端账本)/.test(syncBlocked);
+    box.classList.toggle("soft", soft);
+    $("#noticeExportBtn").hidden = soft;
     $("#ledgerNoticeText").textContent = issue;
     $("#reloadLedgerBtn").hidden = !localIssue;
     $("#retrySyncBtn").hidden = !!localIssue || !!ledgerProblem(data) || !syncBlocked;
@@ -316,7 +320,7 @@
       line.textContent = writeIssue ? `保存已暂停，输入内容仍保留。${writeIssue}` : "";
       line.hidden = !writeIssue;
     });
-    if (issue && window.luhuoSync) window.luhuoSync.setStatus("error", issue);
+    if (issue && window.luhuoSync) window.luhuoSync.setStatus(soft ? "offline" : "error", issue);
   }
 
   function checkWriteBoundary() {
@@ -980,6 +984,7 @@
   // 只暴露读取视图——没有任何写入口，业务代码一律走 profitLocks 本体与 batchProfitInfo。
   window.luhuoPure = {
     ledgerSnapshot: () => clone(data),
+    friendlySyncError,   // v48 只读：同步错误给人看的写法（测试断言网络错误换中文、其它照原文）
     batchProfitSplit,
     profitLockSnapshot: () => [...profitLocks].map(([bid, m]) => [bid, [...m]]),
     // v37 只读探针：状态提示的首判记号（测试断言「每批每会话只首判一次」用；无写入口）
@@ -1045,17 +1050,30 @@
     const a = $("#backupSyncAgo"), b = $("#backupExportAgo"), dot = $("#settingsDot");
     if (a) a.textContent = ago(sync);
     if (b) b.textContent = ago(exp);
-    if (dot) dot.hidden = !(stale(sync) && stale(exp));
+    // v48：空账本没什么可备份的，不亮红点（离线首开时它曾是新用户看到的第一个「警告」）
+    if (dot) dot.hidden = !(data.orders.length > 0 && stale(sync) && stale(exp));
+  }
+
+  // v48：浏览器的网络报错（Failed to fetch / Load failed …）是英文原文，换成用户看得懂的一句；其它错误照原文
+  function isNetworkSyncError(msg) {
+    return /failed to fetch|networkerror|load failed|network request failed|timed? ?out|aborted|ERR_|超时/i.test(String(msg || ""));
+  }
+  function friendlySyncError(msg) {
+    const s = String(msg || "");
+    return isNetworkSyncError(s) ? "连不上云端（可能没网或网络不稳），本机记账不受影响" : s;
   }
 
   function renderSyncBadge() {
     renderBackupHint();
     if (!window.luhuoSync) return;
     if (localIssue || syncBlocked || ledgerProblem(data)) {
-      window.luhuoSync.setStatus("error", localIssue || syncBlocked || ledgerProblem(data));
+      // v48：离线/正在核对不算「失败」——头部徽章写「本地」（灰），和账本顶部那行浅色细条一致
+      const soft = !localIssue && !ledgerProblem(data) && /^(离线中|正在核对云端账本)/.test(syncBlocked);
+      window.luhuoSync.setStatus(soft ? "offline" : "error", localIssue || syncBlocked || ledgerProblem(data));
       return;
     }
-    if (meta.lastSyncError) window.luhuoSync.setStatus("error", meta.lastSyncError);
+    // v48：上传因断网失败也算「离线」——徽章写「本地」（灰），真正的失败（403、格式错等）才是红色「同步失败」
+    if (meta.lastSyncError) window.luhuoSync.setStatus(isNetworkSyncError(meta.lastSyncError) ? "offline" : "error", friendlySyncError(meta.lastSyncError));
     else if (meta.lastSyncedAt) window.luhuoSync.setStatus("online", "上次同步：" + meta.lastSyncedAt);
     else if (data.orders.length === 0) window.luhuoSync.setStatus("offline", "本地空账本");
     else window.luhuoSync.setStatus("offline", "尚未云同步");
@@ -1226,10 +1244,10 @@
     const orders = filteredOrders();
     if (orders.length === 0) {
       const empty = {
-        待寄: "没有待寄的单<br><small>点右下角「记一单」开始</small>",
+        待寄: "没有待寄的单<br><small>点「记一单」开始</small>",
         待回款: "没有等回款的单<br><small>寄出之后会出现在这里</small>",
         已回款: "还没有已回款的单",
-        全部: "还没有单子<br><small>点右下角「记一单」开始</small>",
+        全部: "还没有单子<br><small>点「记一单」开始</small>",
       }[currentFilter] || "没有单子";
       $("#orderList").innerHTML = `<div class="empty">${empty}</div>`;
       return;
@@ -1247,6 +1265,19 @@
       if (o.date > b.date) b.date = o.date;
     });
     blocks.sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? 1 : -1));
+    if (currentFilter === "待回款") {
+      // v48：待回款按「已等天数」从长到短（寄出日期越早越靠上）——最该催的在最上面，和统计页的分档同一个口径；
+      // 块的寄出日取块内最早那单；没记寄出日期的殿后；同一天寄出的保持上面的日期倒序（稳定排序）
+      const shipKey = (o) => cleanShipDate(o.shipDate) || (o.batchId ? cleanShipDate(o.batchDate) : "");
+      const keyOf = (b) => b.orders.map(shipKey).filter(Boolean).sort()[0] || "";
+      blocks.sort((a, b) => {
+        const ka = keyOf(a), kb = keyOf(b);
+        if (ka === kb) return 0;
+        if (!ka) return 1;
+        if (!kb) return -1;
+        return ka < kb ? -1 : 1;
+      });
+    }
     // v32：顺手清掉已经不存在的批次 id（批次随删单/重组消失）。不清理也能跑，
     // 但一个长会话里来回重组批次会让这个 Set 一直涨；它只是内存里的一串 id，清理是幂等的。
     expandedBatches.forEach((id) => { if (!groups.has(id)) expandedBatches.delete(id); });
@@ -1653,7 +1684,7 @@
         </div>
       </div>
       ${missFlag}
-      <div class="order-mid"><span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>${escapeHtml(dotDate(o.date))}${o.platform ? " · " + escapeHtml(o.platform) : ""}${cleanTracking(o.tracking) && !hideTrack ? " · " + escapeHtml(cleanTracking(o.tracking)) : ""}${inGroup || (stage === "待寄" && !(toCents(o.fee) > 0)) ? "" : " · 邮费 " + money(o.fee)}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 已寄出（无单号）" : ""}${inGroup ? "" : waitHtml(orderWaitDays(o))}</div>
+      <div class="order-mid"><span class="status-tag ${STATUS_CLASS[o.status]}${stage === "待寄" ? " st-toship" : ""}">${escapeHtml(o.status === "在途" ? stage : statusLabel(o.status))}</span>${escapeHtml(dotDate(o.date))}${o.platform ? " · " + escapeHtml(o.platform) : ""}${cleanTracking(o.tracking) && !hideTrack ? " · " + escapeHtml(cleanTracking(o.tracking)) : ""}${inGroup || (stage === "待寄" && !(toCents(o.fee) > 0)) ? "" : " · 邮费 " + money(o.fee)}${soloBatch ? " · 单独一批寄出" : ""}${o.shipDate && !cleanTracking(o.tracking) && !o.batchId ? " · 无单号" : ""}${inGroup ? "" : waitHtml(orderWaitDays(o))}</div>
       ${o.note ? `<div class="order-note">${escapeHtml(o.note)}</div>` : ""}
       <div class="order-foot">
         <div class="order-money">
@@ -1701,13 +1732,22 @@
 
   // 命中判据：商品名 / 快递单号 / 备注 / 渠道 四个字段的**包含**匹配（忽略大小写与首尾空白）。
   // 单号过 cleanTracking：账本里存的本来就是规范值，这里再过一道只为对齐"界面上显示的那个值"。
-  // 暂不做金额、拼音、AI 猜测（规格）。页面里这些值一律经 escapeHtml 作文本显示。
+  // v48：纯数字的关键词再按金额**精确**比一遍（垫付 / 单价 / 回款 / 邮费，按「分」比，¥ 与千分位可带可不带）；
+  // 文字字段的包含匹配照旧（「iPhone 16」里的 16 仍能搜到）。暂不做拼音、AI 猜测（规格）。页面里这些值一律经 escapeHtml 作文本显示。
+  function lookupAmountHit(order, token) {
+    const t = token.replace(/^[¥￥]/, "").replace(/,/g, "");
+    if (!/^\d+(\.\d{1,2})?$/.test(t)) return false;
+    const want = toCents(t);
+    const amounts = [order.cost, order.income, order.fee];
+    if (order.qty > 1) amounts.push(Math.round(toCents(order.cost) / order.qty) / 100);
+    return amounts.some((v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v)) && toCents(v) === want);
+  }
   function lookupHit(order) {
     const tokens = lookupTokens();
     if (tokens.length === 0) return true;
     const fields = [order.name, cleanTracking(order.tracking), order.note, order.channel]
       .map((v) => String(v === null || v === undefined ? "" : v).toLowerCase());
-    return tokens.every((t) => fields.some((f) => f.includes(t)));
+    return tokens.every((t) => fields.some((f) => f.includes(t)) || lookupAmountHit(order, t));
   }
 
   // 日期范围判据。分类全部由现有 order.date 现算派生，**不创建年份/月度业务字段**。
@@ -1895,8 +1935,9 @@
       : lookup.focusBatchId ? "从核对清单定位到这一批（含全部成员）"
       : `${lookup.status} · ${lookupDateLabel()}`;
     $("#lookupDateBtn").textContent = lookupDateLabel() + (lookup.panel ? " ▴" : " ▾");
+    // v48：没命中时下面的空状态已经写了「没有找到」，这里不再重复，只报账本总数
     $("#lookupMeta").innerHTML = matched.length === 0
-      ? `没有找到符合的单子`
+      ? `命中 0 单 · 本账本共 ${data.orders.length} 单`
       : (isAll
         ? `本账本共 <b>${matched.length}</b> 单`
         : `命中 <b>${matched.length}</b> 单 · 本账本共 ${data.orders.length} 单`);
@@ -2203,6 +2244,14 @@
     setTimeout(() => { try { $("#shipTracking").focus({ preventScroll: true }); } catch { /* 无所谓 */ } }, 30);
   }
 
+  function updatePayDateToggle() {
+    const t = $("#payDateToggle");
+    if (!t) return;
+    const v = $("#payForm").incomeDate.value;
+    t.hidden = !$("#payDateRow").hidden;
+    t.textContent = v === todayStr() ? `到账日期：今天 ${dotDate(v.slice(5))} · 改` : `到账日期：${v ? dotDate(v) : "未填"} · 改`;
+  }
+
   function updateShipDateToggle() {
     const t = $("#shipDateToggle");
     if (!t) return;
@@ -2283,9 +2332,10 @@
       ids.forEach((id) => selection.delete("o:" + id));
       closeShipForm();
       renderList();
-      offerUndo(separate ? `已标记 ${n} 单寄出` : `已寄出 ${n} 单`, undoBefore);
       // v45：寄出时不再自动报单——报单要等到货以后，在待回款的卡片/批次上点「报单」
+      // v48：先 toast 再挂撤销条——offerUndo 会把同文案的 toast 并进撤销条，屏幕上只留一条
       toast(separate ? `已标记 ${n} 单寄出` : `已寄出 ${n} 单`);
+      offerUndo(separate ? `已标记 ${n} 单寄出` : `已寄出 ${n} 单`, undoBefore);
       return true;
     });
   }
@@ -2481,10 +2531,10 @@
     $("#reportSummary").innerHTML = lines.map((l) => `<p${l.startsWith("现在还有") ? ' class="rs-out"' : l.startsWith("平均每单") ? ' class="rs-avg"' : ""}>${l}</p>`).join("");
 
     $("#reportKpis").innerHTML = `
-      <div class="kpi card"><span class="kpi-label">单数</span><span class="kpi-value">${s.n}</span></div>
-      <div class="kpi card"><span class="kpi-label">垫付</span><span class="kpi-value">${money(s.cost)}</span></div>
-      <div class="kpi card"><span class="kpi-label">回款</span><span class="kpi-value">${money(s.income)}</span></div>
-      <div class="kpi card"><span class="kpi-label">净盈亏</span><span class="kpi-value ${s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : ""}">${money(s.profit)}</span></div>`;
+      <div class="kpi card"><span class="kpi-label">单数</span><span class="kpi-value">${s.n}</span><span class="kpi-basis">按下单日</span></div>
+      <div class="kpi card"><span class="kpi-label">垫付</span><span class="kpi-value">${money(s.cost)}</span><span class="kpi-basis">按下单日</span></div>
+      <div class="kpi card"><span class="kpi-label">回款</span><span class="kpi-value">${money(s.income)}</span><span class="kpi-basis">按到账日</span></div>
+      <div class="kpi card"><span class="kpi-label">净盈亏</span><span class="kpi-value ${s.profit > 0 ? "pos" : s.profit < 0 ? "neg" : ""}">${money(s.profit)}</span><span class="kpi-basis">按到账日</span></div>`;
 
     renderMonthProfit();
     renderWaitCard();
@@ -2537,13 +2587,18 @@
     switchView("list");
     const chip = $(`#filterChips button[data-filter="待回款"]`);
     if (chip && currentFilter !== "待回款") chip.click();
+    scrollToOrderCard(id);
+  }
+  // 当前账本列表里找到这一单的卡片、滚到视口中间（v48 起也给统计页柱子明细用，返回卡片或 null）
+  function scrollToOrderCard(id) {
     // 散单卡片本身不带 data-id，按卡片里任一带这单 id 的按钮反查卡片
     const hit = $$("#orderList [data-id]").find((el) => el.dataset.id === id);
     const card = hit && hit.closest(".order-card");
-    if (!card) return;
+    if (!card) return null;
     // 收起着的整批里的成员没有包围盒——定位到它所在的批次块
     const blk = card.closest(".batch-block.collapsed");
     (blk || card).scrollIntoView({ block: "center" });
+    return card;
   }
 
   // v41：每月利润（近 12 个月，按回款月份的净盈亏）。口径与月报**同一个函数** reportStats——
@@ -2609,14 +2664,70 @@
     box.dataset.sparse = sparse ? "1" : "0";
     box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="近 12 个月每月利润">
       <line x1="0" x2="${W}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" class="mp-zero"/>${bars}</svg>`;
+    // v48：明细只对还在这 12 根柱子里的月份展开（日子跨月后旧月份滚出图外就收起）
+    if (mpDetailYm && !months.some((mo) => `${mo.cur.y}-${mo.cur.m}` === mpDetailYm)) mpDetailYm = "";
+    $$("#monthProfit .mp-bar").forEach((g) => g.classList.toggle("picked", g.dataset.ym === mpDetailYm));
+    renderMpDetail();
   }
 
   // 点某个月 → 周期跳到那个月；v46：季 / 年模式下跳到包含该月的季度 / 年份（模式不变，repRange 按月份算季度与年份）
+  // v48：同时在图下面展开**这根柱子**的逐单明细（再点同一根＝收起；不点就不列）
   function pickProfitMonth(key) {
     const [y, m] = String(key || "").split("-").map(Number);
     if (!Number.isFinite(y) || !Number.isFinite(m)) return;
     repCursor = { y, m };
+    mpDetailYm = mpDetailYm === `${y}-${m}` ? "" : `${y}-${m}`;
+    mpDetailAll = false;
     renderReport();
+  }
+
+  // v48：柱子明细——这个月**按回款日期**归进来的每一单（与柱子同一口径：reportStats 的回款集合），
+  // 合计行直接用 reportStats 的利润，所以必然等于柱子上的数。只读：点一行跳到账本里那一单。
+  let mpDetailYm = "", mpDetailAll = false;
+  const MP_DETAIL_FIRST = 20;
+  function renderMpDetail() {
+    const box = $("#mpDetail");
+    if (!box) return;
+    const [y, m] = mpDetailYm.split("-").map(Number);
+    if (!mpDetailYm || !Number.isFinite(y) || !Number.isFinite(m)) { box.hidden = true; box.innerHTML = ""; return; }
+    const r = repRange("month", { y, m });
+    const st = reportStats(r.start, r.end);
+    const rows = [];
+    data.orders.forEach((o, idx) => {
+      if (!hasIncome(o)) return;
+      const d = parseDate(o.incomeDate);
+      if (d && d >= r.start && d < r.end) rows.push({ o, idx, d });
+    });
+    rows.sort((a, b) => (b.d - a.d) || (a.idx - b.idx));   // 最近到账的在上；同日按账本顺序
+    const cents = toCents(st.profit);
+    const cls = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "");
+    const shown = mpDetailAll ? rows : rows.slice(0, MP_DETAIL_FIRST);
+    const line = ({ o }) => {
+      const p = Math.round(toCents(orderProfit(o)));
+      const q = qtyOf(o);
+      const fee = toCents(o.fee);
+      return `<button type="button" class="mpd-row" data-mpd-jump="${escapeHtml(o.id)}">
+        <span class="mpd-main"><span class="mpd-name">${escapeHtml(o.name || "未命名")}${q > 1 ? ` <small>×${q}</small>` : ""}</span>
+        <span class="mpd-sub">${escapeHtml(mdShort(o.incomeDate))} 到账 · 垫付 ${money(o.cost)} · 回款 ${money(o.income)}${fee ? ` · 邮费 ${money(fee / 100)}` : ""}</span></span>
+        <b class="mpd-profit ${cls(p)}">${money(p / 100)}</b></button>`;
+    };
+    box.hidden = false;
+    box.innerHTML = `<div class="mpd-head"><span class="mpd-title">${y}年${m + 1}月回款明细 <small>${rows.length} 单 · 合计 <b class="${cls(cents)}">${money(cents / 100)}</b></small></span>`
+      + `<button type="button" class="mpd-close" data-mpd-close>收起</button></div>`
+      + (rows.length === 0 ? `<p class="mpd-empty">这个月没有回款记录</p>` : shown.map(line).join(""))
+      + (rows.length > shown.length ? `<button type="button" class="mpd-more" data-mpd-more>再显示剩下 ${rows.length - shown.length} 单</button>` : "");
+  }
+  // 跳到账本里某一单：切到它所在阶段的页签（没有对应页签的旧「自留」单去「全部」），滚到它并闪一下
+  function jumpToOrder(id) {
+    const o = data.orders.find((x) => x.id === id);
+    if (!o) return;
+    switchView("list");
+    const stage = orderStage(o);
+    const chip = $(`#filterChips button[data-filter="${stage}"]`) || $(`#filterChips button[data-filter="全部"]`);
+    if (chip && currentFilter !== chip.dataset.filter) chip.click();
+    const card = scrollToOrderCard(id);
+    if (!card) return;
+    card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash");
   }
 
   // ---- 记单 / 编辑 ----
@@ -3828,6 +3939,7 @@
         reportedAt: "",                              // v45：收入单不报单
         createdAt: new Date().toISOString(),
       };
+      const undoBefore = clone(data.orders);   // v48：新记的单也能撤（撤＝删掉刚记的这一单）
       data.orders.push(order);
       if (!saveData()) return;
       clearTimeout(draftTimer);
@@ -3838,6 +3950,7 @@
       closeForm(true);
       toast("已记账");
       switchView("list");
+      offerUndo(`已记账「${name}」`, undoBefore);
       return;
     }
     // 03 期：只有「新建货单」这条路可能要求连续录入（收入单/编辑都不给那个入口，这里再兜一道）
@@ -3909,6 +4022,7 @@
       reportedAt: existing ? (existing.reportedAt || "") : "",   // v45：编辑不改报单日期；新单为空
       createdAt: existing ? existing.createdAt : new Date().toISOString(),
     };
+    const undoBefore = existing ? null : clone(data.orders);   // v48：只有新记的单给撤销（编辑不变）
     if (existing) Object.assign(existing, order, { id: existing.id });
     else data.orders.push(order);
     if (!saveData()) return;
@@ -3922,11 +4036,13 @@
       switchView("list");
       startNextOrder();
       toast("已记账，接着记下一单");
+      offerUndo(`已记账「${name}」`, undoBefore);   // 表单还开着时撤销条不计时，关掉表单后还能撤最后这一单
       return;
     }
     closeForm(true);
     toast(existing ? "已更新" : "已记账");
     switchView("list");
+    if (!existing) offerUndo(`已记账「${name}」`, undoBefore);
   }
 
   // ---- 快捷动作 ----
@@ -3963,6 +4079,9 @@
     $("#payForm [data-clear='income']").hidden = f.income.readOnly;
     $("#payNegativeHint").hidden = !f.income.readOnly;
     f.incomeDate.value = payEditMode ? (o.incomeDate || todayStr()) : todayStr();
+    // v48：新回款的到账日期几乎总是今天——和记一单/寄出一样只露一行小字，点了才展开；改回款照旧直接露出日期框
+    $("#payDateRow").hidden = !payEditMode;
+    updatePayDateToggle();
     $("#payTitle").textContent = `${payEditMode ? "改回款" : "回款"} · ${o.name}`;
     updatePayPreview();
     openModal("#payModal");
@@ -4486,6 +4605,10 @@
         : "这几单一起回款，会合成一批：填对方打过来的总数，按垫付占比摊到每一单。")
       : "勾选本次一起寄出的在途单，邮费和回款按垫付占比分摊";
     $("#batchSubmit").textContent = pay ? "确认回款" : "结算";
+    // v48：整批回款与单笔回款同一种填法——灰字提示整批垫付、给一排快捷金额（空框时从垫付起加）
+    const payTotalCents = batchItems.filter((it) => it.checked).reduce((a, it) => a + toCents(it.cost), 0);
+    $("#batchIncome").placeholder = pay ? `垫付 ${money(payTotalCents / 100)}` : "如 520";
+    $("#batchQuick").hidden = !pay;
     const paidIn = pay ? batchItems.map((it) => data.orders.find((o) => o.id === it.id))
       .filter((o) => o && o.status !== "在途") : [];
     const warn = $("#batchPayWarn");
@@ -5115,7 +5238,7 @@
       snaps: new Map(baodanCandidates.map((o) => [o.id, orderSnap(o)])),
     };
     const head = baodanCandidates[0];
-    if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : fromIds ? (head.shipDate || head.batchDate || "") : "";
+    if (head) baodanScope.headDate = fromBatch ? (head.batchDate || head.date) : fromIds ? (head.shipDate || head.batchDate || "") : commonShipDay(baodanCandidates);
     baodanScope.title = fromBatch
       ? `一起寄出 · ${head ? (head.batchDate || head.date) : ""} · ${baodanCandidates.length} 单`
       : fromIds ? `寄出 · ${head ? (head.shipDate || head.batchDate || todayStr()) : ""} · ${baodanCandidates.length} 单`
@@ -5139,6 +5262,15 @@
     toast(copy.trackingKinds > 1
       ? `已复制报单 · ${copy.qty} 件 / ${copy.kinds} 种 · 单号有 ${copy.trackingKinds} 种，先核对面板里的提示再报`
       : `已复制报单 · ${copy.qty} 件 / ${copy.kinds} 种 · 直接去微信粘贴`);
+  }
+
+  // v48：工具条「报单」（按当前页签）——范围里的单若都是同一天寄出的（散单看寄出日期，整批成员看批次日期），
+  // 抬头就写那天；日子不齐或都没寄出才回落今天（以前一律写今天，单成员批次走工具条时首行日期就错了）
+  function commonShipDay(list) {
+    const days = new Set(list.map((o) => cleanShipDate(o.shipDate) || (o.batchId ? cleanShipDate(o.batchDate) : "")));
+    if (days.size !== 1) return "";
+    const d = [...days][0];
+    return d && parseDate(d) ? d : "";
   }
 
   function closeBaodan() {
@@ -5317,7 +5449,7 @@
     if (result.kind === "stale") return result;
     if (!checkWriteBoundary()) return { kind: "stale" };
     if (result.kind === "failed") {
-      syncBlocked = "尚未确认云端账本，已暂停上传。本机可继续记账，联网后请重试同步。";
+      syncBlocked = "离线中：本机照常记账，联网后点「重试同步」。";
       meta.lastSyncError = result.error;
       renderSyncBadge(); renderLedgerNotice();
       return result;
@@ -5347,9 +5479,14 @@
       let merged = 0, declined = 0;
       if (localOnly.length && !suppressPullMerge) {
         const names = localOnly.slice(0, 3).map((o) => o.name || "未命名").join("、");
-        const keep = confirm(`云端有更新的账本，本机还有 ${localOnly.length} 单是云端没有的：\n${names}${localOnly.length > 3 ? "…" : ""}\n\n点「确定」＝把它们并进账本（推荐）；点「取消」＝放弃这几单，改用云端版本。`);
+        const keep = confirm(`云端有更新的账本，本机还有 ${localOnly.length} 单是云端没有的：\n${names}${localOnly.length > 3 ? "…" : ""}\n\n点「确定」＝把它们并进账本（推荐）；点「取消」＝不并入，改用云端版本（这几单另存一份核对副本，可在设置导出找回）。`);
         if (keep) { incoming.orders = incoming.orders.concat(localOnly); merged = localOnly.length; }
-        else declined = localOnly.length;
+        else {
+          // v48（走查 P1）：放弃之前先把本机原账另存一份核对副本——这几单只在本机有，丢了就再也找不回；
+          // 存不下就整次不放弃（preserveConflict 失败时已暂停同步并提示先导出）。
+          if (!preserveConflict(clone(result.data), `放弃并入的本机独有订单（${localOnly.length} 单）`)) return { kind: "blocked" };
+          declined = localOnly.length;
+        }
       }
       const remoteBase = clone(result.data);
       const updatedAt = merged ? new Date().toISOString() : result.updatedAt;
@@ -5357,7 +5494,7 @@
       markLegacyLedger(result.rawVersion, incoming.orders);
       rememberSyncBase(remoteBase, result.identity);
       if (merged) toast(`已并入本机 ${merged} 单，正在安排同步`);
-      else if (declined) toast(`已采用云端版本（本机 ${declined} 单未并入）`);
+      else if (declined) toast(`已采用云端版本（本机 ${declined} 单未并入，副本可在设置导出）`);
       else toast("已从云端取回最新账本");
     } else {
       rememberSyncBase(incoming, result.identity);
@@ -5373,7 +5510,7 @@
   function renderSettings() {
     $("#syncEndpoint").textContent = window.luhuoSync ? window.luhuoSync.endpointLabel() : "-";
     $("#syncLast").textContent = meta.lastSyncedAt || "还没同步过";
-    $("#syncErrLine").textContent = meta.lastSyncError || "";
+    $("#syncErrLine").textContent = friendlySyncError(meta.lastSyncError);
     try { $("#syncCodeText").value = window.luhuoSync.getSyncCode(); } catch { $("#syncCodeText").value = ""; }
     $("#exportRecoveryBtn").hidden = !localStorage.getItem(RECOVERY_KEY) && !localIssue;
     let canRestore = false;
@@ -5572,6 +5709,7 @@
   function refreshModalAccess() {
     const top = topModal();
     $$("main, header, .tabbar, #fab").forEach((node) => { node.inert = !!top; });
+    document.body.classList.toggle("modal-open", !!top);   // v48：弹窗开着时 toast 挪到上方（styles.css）
     $$(".modal").forEach((node) => {
       node.inert = !!top && node !== top;
       node.setAttribute("aria-hidden", node.classList.contains("show") ? "false" : "true");
@@ -5614,7 +5752,7 @@
     window.scrollTo(0, 0);
   }
 
-  // ---- v42：撤销（回款 / 整批回款与结算 / 寄出 / 删除 / 退出本批 / 改回待寄 之后 6 秒内） ----
+  // ---- v42：撤销（回款 / 整批回款与结算 / 寄出 / 删除 / 退出本批 / 改回待寄 之后 6 秒内；v48 起含新记一单） ----
   // 只在**账本此刻仍与那次操作刚完成时一模一样**时才允许撤销：期间有任何别的改动（另一笔记账、
   // 云端拉取换包、导入）都不撤——不在新账上硬套旧快照。撤销本身也走同一个写入事务与保存路径。
   let undoState = null, undoTimer = null;
@@ -5624,6 +5762,15 @@
     const bar = $("#undoBar");
     if (!bar) return;
     $("#undoText").textContent = label;
+    // v48：刚弹的 toast 若说的是同一件事（「已寄出 4 单」/「已回款 ¥448，利润 ¥50」），并进撤销条只留一条反馈
+    const t = $("#toast");
+    // （新记一单：toast「已记账」是撤销条「已记账「名称」」的前半句，同样并掉，留长的那句）
+    const tt = t ? t.textContent : "";
+    if (t && t.classList.contains("show") && tt && (tt.startsWith(label) || label.startsWith(tt))) {
+      $("#undoText").textContent = tt.length > label.length ? tt : label;
+      t.classList.remove("show");
+      clearTimeout(toastTimer);
+    }
     bar.hidden = false;
     document.body.classList.add("has-undo");
     clearTimeout(undoTimer);
@@ -5855,6 +6002,17 @@
       applyShipTogetherUi();
     }));
     $("#batchIncome").addEventListener("input", updateBatchSummary);
+    $("#batchQuick").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-add]");
+      if (!btn || batchMode !== "pay") return;
+      const totalCents = batchItems.filter((it) => it.checked).reduce((a, it) => a + toCents(it.cost), 0);
+      const input = $("#batchIncome");
+      const raw = String(input.value).trim();
+      const base = raw === "" || !Number.isFinite(Number(raw)) ? totalCents : toCents(raw);
+      const cents = btn.dataset.add === "reset" ? totalCents : base + Math.round(Number(btn.dataset.add) * 100);
+      input.value = String(cents / 100);
+      updateBatchSummary();
+    });
     $("#formDateToggle").addEventListener("click", () => {
       const f = $("#orderForm");
       f.querySelector(".fld-date").classList.add("open");
@@ -5868,6 +6026,32 @@
       setTimeout(() => { try { $("#shipDate").focus(); if ($("#shipDate").showPicker) $("#shipDate").showPicker(); } catch { /* 有的浏览器不让程序弹日期选择器 */ } }, 30);
     });
     $("#shipDate").addEventListener("change", updateShipDateToggle);
+    $("#payDateToggle").addEventListener("click", () => {
+      $("#payDateRow").hidden = false;
+      updatePayDateToggle();
+      const d = $("#payForm").incomeDate;
+      setTimeout(() => { try { d.focus(); if (d.showPicker) d.showPicker(); } catch { /* 有的浏览器不让程序弹日期选择器 */ } }, 30);
+    });
+    $("#payForm").incomeDate.addEventListener("change", updatePayDateToggle);
+    // v48：必填项没填时，不用浏览器原生气泡（各浏览器长得不一样、和 app 其它提示不一致），改成同一种 toast；
+    // 仍由浏览器拦住提交（required 不动），只接管提示。一次提交只提示第一个没填的格子。
+    let invalidShown = false;
+    const onInvalid = (ev) => {
+      ev.preventDefault();
+      if (invalidShown) return;
+      invalidShown = true;
+      setTimeout(() => { invalidShown = false; }, 0);
+      const el = ev.target;
+      const label = el.closest("label");
+      // 标签名＝label 里第一段文字（或像「单价」那样包在 span 里的第一段）
+      const head = label && [...label.childNodes].find((n) => (n.nodeType === 3 && n.textContent.trim()) || (n.nodeType === 1 && n.tagName === "SPAN"));
+      const name = (head && head.textContent.trim()) || "这一格";
+      toast(el.validity && el.validity.valueMissing ? `先填${name}` : `${name}填写有误`);
+      if (el.closest("[hidden]") || el.getClientRects().length === 0) return;
+      try { el.focus(); } catch { /* 拿不到焦点就算了 */ }
+    };
+    $("#orderForm").addEventListener("invalid", onInvalid, true);
+    $("#payForm").addEventListener("invalid", onInvalid, true);
     $$("#orderForm .stepper button").forEach((b) => b.addEventListener("click", () => {
       const q = $("#orderForm").qty;
       const next = Math.max(1, (Math.round(numberValue(q.value)) || 1) + Number(b.dataset.step));
@@ -6197,6 +6381,7 @@
       const btn = ev.target.closest("button[data-mode]");
       if (!btn) return;
       reportMode = btn.dataset.mode;
+      mpDetailYm = "";
       $$("#repModes .seg").forEach((c) => c.classList.toggle("on", c.dataset.mode === reportMode));
       const now = new Date();
       repCursor = { y: now.getFullYear(), m: now.getMonth() };
@@ -6210,12 +6395,19 @@
       const g = ev.target.closest("[data-ym]");
       if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); pickProfitMonth(g.dataset.ym); }
     });
+    $("#mpDetail").addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-mpd-close]")) { mpDetailYm = ""; renderMonthProfit(); return; }
+      if (ev.target.closest("[data-mpd-more]")) { mpDetailAll = true; renderMpDetail(); return; }
+      const row = ev.target.closest("[data-mpd-jump]");
+      if (row) jumpToOrder(row.dataset.mpdJump);
+    });
     $("#waitCard").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button[data-wait-jump]");
       if (btn) jumpToWaiting(btn.dataset.waitJump);
     });
-    $("#repPrev").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, -1); renderReport(); });
-    $("#repNext").addEventListener("click", () => { repCursor = shiftCursor(reportMode, repCursor, 1); renderReport(); });
+    // v48：换周期（箭头 / 月季年）时收起柱子明细——明细说的是点的那根柱子，周期变了还挂着会对不上
+    $("#repPrev").addEventListener("click", () => { mpDetailYm = ""; repCursor = shiftCursor(reportMode, repCursor, -1); renderReport(); });
+    $("#repNext").addEventListener("click", () => { mpDetailYm = ""; repCursor = shiftCursor(reportMode, repCursor, 1); renderReport(); });
 
     // 设置
     $("#copySyncCode").addEventListener("click", async () => {

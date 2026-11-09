@@ -12,7 +12,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="./icon.png">
-  <link rel="stylesheet" href="./styles.css?v=47">
+  <link rel="stylesheet" href="./styles.css?v=48">
 </head>
 <body>
   <header class="topbar">
@@ -133,8 +133,9 @@
             <button id="repNext" class="nav-btn" aria-label="下一期">›</button>
           </div>
         </div>
-        <p class="mp-cap">每月利润 <small>按回款月份 · 已扣垫付和邮费</small></p>
+        <p class="mp-cap">每月利润 <small>按回款月份 · 已扣垫付和邮费 · 点柱子看明细</small></p>
         <div id="monthProfit" class="mp-chart"></div>
+        <div id="mpDetail" class="mp-detail" hidden></div>
         <div id="reportKpis" class="kpi-grid"></div>
         <div id="reportSummary" class="summary"></div>
         <div id="mpSummary" class="mp-summary"></div>
@@ -261,7 +262,9 @@
         <button type="button" data-add="100">+100</button>
       </div>
       <p id="payNegativeHint" class="foot-note" hidden>本单回款为负数，本次可修正日期；金额保留原值，需要调整时请回到批次的分项利润。</p>
-      <label class="fld">回款日期<input name="incomeDate" type="date" required></label>
+      <!-- v48：新回款时到账日期只露一行小字（#payDateToggle），点了才展开；改回款时直接露出 -->
+      <button type="button" id="payDateToggle" class="date-toggle" hidden></button>
+      <label class="fld" id="payDateRow">回款日期<input name="incomeDate" type="date" required></label>
       <p class="profit-preview" id="payPreview"></p>
       <div class="sheet-actions">
         <button type="button" id="payCancel" class="btn ghost">取消</button>
@@ -281,6 +284,14 @@
       <div class="row2">
         <label class="fld batch-fee-fld">本批邮费（整批合计）<input id="batchFee" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0"></label>
         <label class="fld">对方总回款 <small class="full-only">留空＝先只分摊邮费</small><input id="batchIncome" type="number" inputmode="decimal" min="0" step="0.01" placeholder="如 520"></label>
+      </div>
+      <!-- v48：回款模式的快捷金额（与单笔回款同一种填法；空框时从整批垫付起加）。结算模式不显示 -->
+      <div class="quick-chips" id="batchQuick" hidden>
+        <button type="button" data-add="reset">按垫付价</button>
+        <button type="button" data-add="50">+50</button>
+        <button type="button" data-add="100">+100</button>
+        <button type="button" data-add="200">+200</button>
+        <button type="button" data-add="500">+500</button>
       </div>
       <!-- 这一批现在记着多少钱 + 这三条规矩（填数字＝改成这个数 / 留空＝不动 / 填 0＝删掉）。
            v24 起没有「覆盖 / 追加」的选择，由 app.js 决定显不显示这一行 -->
@@ -351,7 +362,7 @@
       </div>
       <div id="lkSearchPane">
       <div class="lk-search">
-        <input id="lookupInput" type="search" autocomplete="off" maxlength="60" placeholder="搜商品名 / 快递单号 / 备注 / 渠道">
+        <input id="lookupInput" type="search" autocomplete="off" maxlength="60" placeholder="搜商品名 / 单号 / 备注 / 渠道 / 金额">
         <button type="button" id="lookupClear" class="lk-x">清空</button>
       </div>
       <div class="lk-bar">
@@ -414,7 +425,7 @@
   <!-- 设置 -->
   <div id="settingsModal" class="modal">
     <div class="sheet">
-      <h2>设置 <small class="app-version">版本 <b id="appVersion">v47</b></small></h2>
+      <h2>设置 <small class="app-version">版本 <b id="appVersion">v48</b></small></h2>
       <!-- v42：设置按用途分三组卡片；同步码、技术信息、危险操作默认收起（控件与 id 一个没变） -->
       <section class="set-card">
         <h3>两台设备同步</h3>
@@ -467,7 +478,7 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="./sync.js?v=47"></script>
-  <script src="./app.js?v=47"></script>
+  <script src="./sync.js?v=48"></script>
+  <script src="./app.js?v=48"></script>
 </body>
 </html>
