@@ -9,7 +9,7 @@
 // Cache Storage 是共用的，别人的缓存一个都不碰。
 // 出问题时的应急办法：用 docs/sw-自我注销版.js 替换本文件上线（见 docs/v46-离线缓存说明.md）。
 
-const CACHE = "luhuo-v48";
+const CACHE = "luhuo-v49";
 const PREFIX = "luhuo-";
 const STATIC_RE = /\.(?:html|js|css|png|svg|ico|webmanifest)$/i;
 
